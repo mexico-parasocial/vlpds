@@ -1,6 +1,7 @@
 //! Port of atproto/packages/pds/tests/server.test.ts: 404s, JSON input size
 //! limit, response compression, health check; plus XRPC error envelope basics.
 use crate::common::*;
+use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preserves_404s() {
@@ -153,4 +154,61 @@ async fn incorrect_http_method_is_400() {
     let r = s.xrpc.get("com.atproto.repo.createRecord", &[], &Auth::None).await;
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("Incorrect HTTP method (GET) expected POST"), "{}", r.text());
+}
+
+/// An HTTP/1.1 response head and body, read off `c` by its Content-Length.
+async fn read_response(c: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut b = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            let len: usize =
+                head.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+            if buf.len() >= end + 4 + len {
+                return String::from_utf8_lossy(&buf[..end + 4 + len]).into_owned();
+            }
+        }
+        let n = tokio::time::timeout(Duration::from_secs(10), c.read(&mut b))
+            .await
+            .expect("no answer")
+            .expect("the connection failed");
+        assert!(n > 0, "the server closed the connection: {}", String::from_utf8_lossy(&buf));
+        buf.extend_from_slice(&b[..n]);
+    }
+}
+
+/// A request refused from its head (importRepo without a token) is answered
+/// while the client is still sending its body. The server reads the rest
+/// of the body rather than closing on it, so the client can finish sending,
+/// read the answer and reuse the connection: closing with the body unread
+/// resets the connection, and a client still writing saw a broken pipe
+/// instead of the 401. A client that asked for `100-continue` gets the
+/// answer without the 100, and isn't asked for the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_early_answer_reads_the_rest_of_the_body() {
+    use tokio::io::AsyncWriteExt;
+    let s = TestServer::spawn().await;
+    let body = vec![0u8; 2 << 20];
+    let head = |expect: &str| {
+        format!(
+            "POST /xrpc/com.atproto.repo.importRepo HTTP/1.1\r\nHost: {}\r\nContent-Type: application/vnd.ipld.car\r\nContent-Length: {}\r\n{expect}\r\n",
+            s.addr,
+            body.len()
+        )
+    };
+    let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    c.write_all(head("").as_bytes()).await.unwrap();
+    let r = read_response(&mut c).await;
+    assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+    c.write_all(&body).await.expect("the server closed on the unread body");
+    c.write_all(format!("GET /xrpc/_health HTTP/1.1\r\nHost: {}\r\n\r\n", s.addr).as_bytes()).await.unwrap();
+    let r = read_response(&mut c).await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+
+    let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    c.write_all(head("Expect: 100-continue\r\n").as_bytes()).await.unwrap();
+    let r = read_response(&mut c).await;
+    assert!(r.starts_with("HTTP/1.1 401"), "{r}");
 }

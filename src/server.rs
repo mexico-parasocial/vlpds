@@ -1002,7 +1002,8 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
                     if let Some(id) = id.get() {
                         req.extensions_mut().insert(id.clone());
                     }
-                    req
+                    let linger = Linger::of(&req);
+                    req.map(|body| Lingering { body: Some(body), linger })
                 },
             ),
             active: active.clone(),
@@ -1092,6 +1093,104 @@ where
             drop(guard);
             r
         })
+    }
+}
+
+/// Whether an HTTP/1 request body its handler dropped part way is read on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Linger {
+    No,
+    /// `Expect: 100-continue` and nothing read yet: the client waits for
+    /// the 100 before it sends the body, and hyper sends none once the
+    /// body is dropped.
+    IfRead,
+    Yes,
+}
+
+impl Linger {
+    fn of<B>(req: &axum::http::Request<B>) -> Linger {
+        if req.version() >= axum::http::Version::HTTP_2 {
+            // h2 ends the stream with RST_STREAM(NO_ERROR), which clients
+            // take as an early answer
+            return Linger::No;
+        }
+        let expect = req.headers().get(axum::http::header::EXPECT);
+        if expect.is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue")) {
+            Linger::IfRead
+        } else {
+            Linger::Yes
+        }
+    }
+}
+
+/// A request body that, dropped before its end on HTTP/1, is read on and
+/// discarded: at most [`LINGER_BYTES`] more, each chunk within
+/// [`LINGER_IDLE`], for [`LINGER_TIME`] in all. A handler that refuses a
+/// request from its head or the body's first bytes (importRepo's block
+/// caps) answers while the client is still sending, and hyper closes a
+/// connection with unread body bytes: the kernel resets it, and a client
+/// still writing sees a broken pipe instead of the answer. Reading on
+/// (the lingering close of nginx and Apache) lets it finish the body and
+/// read the answer; the connection stays usable once the body ends.
+/// A body declared longer than the cap is left at once, as before.
+struct Lingering {
+    body: Option<hyper::body::Incoming>,
+    linger: Linger,
+}
+
+const LINGER_BYTES: u64 = 8 << 20;
+const LINGER_IDLE: Duration = Duration::from_secs(2);
+const LINGER_TIME: Duration = Duration::from_secs(10);
+
+impl hyper::body::Body for Lingering {
+    type Data = bytes::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, hyper::Error>>> {
+        if self.linger == Linger::IfRead {
+            self.linger = Linger::Yes;
+        }
+        let Some(body) = self.body.as_mut() else { return std::task::Poll::Ready(None) };
+        let r = std::pin::Pin::new(body).poll_frame(cx);
+        if let std::task::Poll::Ready(None) = r {
+            self.body = None;
+        }
+        r
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.as_ref().is_none_or(|b| b.is_end_stream())
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.as_ref().map_or_else(|| hyper::body::SizeHint::with_exact(0), |b| b.size_hint())
+    }
+}
+
+impl Drop for Lingering {
+    fn drop(&mut self) {
+        use hyper::body::Body as _;
+        let Some(body) = self.body.take() else { return };
+        if self.linger != Linger::Yes || body.is_end_stream() || body.size_hint().lower() > LINGER_BYTES {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        rt.spawn(async move {
+            let mut body = std::pin::pin!(body);
+            let deadline = tokio::time::Instant::now() + LINGER_TIME;
+            let mut left = LINGER_BYTES;
+            loop {
+                let by = (tokio::time::Instant::now() + LINGER_IDLE).min(deadline);
+                let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx));
+                let Ok(Some(Ok(frame))) = tokio::time::timeout_at(by, frame).await else { return };
+                let n = frame.data_ref().map_or(0, |d| d.len() as u64);
+                let Some(l) = left.checked_sub(n) else { return };
+                left = l;
+            }
+        });
     }
 }
 

@@ -2,7 +2,8 @@
 //!
 //! - `noop_polls_read_nothing`: a listRepoOps poll at the head answers from
 //!   memory. A run of polls loads no space head, fills neither the account
-//!   nor the takedown-set cache from SlateDB, and sends no bucket request.
+//!   nor the takedown-set cache from SlateDB, and needs nothing from the
+//!   bucket: every one answers while the bucket's reads are held.
 //! - `space_writes_add_no_bucket_puts`: a space write rides its node-log
 //!   segment, outbox and all. Sequential writes into a self-governed space
 //!   and a remote authority's space PUT at most one segment each and nothing
@@ -22,12 +23,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Bucket requests by kind: the node log, the shard DBs, everything else.
-#[derive(Debug, Default)]
+/// While `held`, reads wait (and are listed in `held_reads`).
+#[derive(Debug)]
 struct Counts {
     log_puts: AtomicU64,
     state_puts: AtomicU64,
     other_puts: AtomicU64,
-    gets: AtomicU64,
+    held: tokio::sync::watch::Sender<bool>,
+    held_reads: std::sync::Mutex<Vec<String>>,
+}
+
+impl Counts {
+    fn new() -> Counts {
+        Counts {
+            log_puts: AtomicU64::new(0),
+            state_puts: AtomicU64::new(0),
+            other_puts: AtomicU64::new(0),
+            held: tokio::sync::watch::channel(false).0,
+            held_reads: Default::default(),
+        }
+    }
+
+    async fn read(&self, what: String) {
+        let mut rx = self.held.subscribe();
+        if *rx.borrow_and_update() {
+            self.held_reads.lock().unwrap().push(what);
+            let _ = rx.wait_for(|held| !*held).await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -76,7 +99,7 @@ impl object_store::ObjectStore for Counting {
         self.inner.put_multipart_opts(location, opts).await
     }
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
-        self.n.gets.fetch_add(1, Ordering::Relaxed);
+        self.n.read(format!("get {location}")).await;
         self.inner.get_opts(location, options).await
     }
     fn delete_stream(
@@ -86,11 +109,17 @@ impl object_store::ObjectStore for Counting {
         self.inner.delete_stream(locations)
     }
     fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.n.gets.fetch_add(1, Ordering::Relaxed);
-        self.inner.list(prefix)
+        use futures::StreamExt;
+        let (n, inner, prefix) = (self.n.clone(), self.inner.clone(), prefix.cloned());
+        futures::stream::once(async move {
+            n.read(format!("list {prefix:?}")).await;
+            inner.list(prefix.as_ref())
+        })
+        .flatten()
+        .boxed()
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.n.gets.fetch_add(1, Ordering::Relaxed);
+        self.n.read(format!("list {prefix:?}")).await;
         self.inner.list_with_delimiter(prefix).await
     }
     async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
@@ -100,7 +129,7 @@ impl object_store::ObjectStore for Counting {
 }
 
 async fn counted_node() -> (TestServer, Arc<Counts>) {
-    let n = Arc::new(Counts::default());
+    let n = Arc::new(Counts::new());
     let store: Arc<dyn object_store::ObjectStore> =
         Arc::new(Counting { inner: Arc::new(object_store::memory::InMemory::new()), n: n.clone() });
     let s = TestServer::spawn_with(move |c| {
@@ -128,6 +157,11 @@ fn note(collection: &str, i: usize) -> J {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn noop_polls_read_nothing() {
+    // The account and takedown caches a poll answers from are fresh for 60 s
+    // (ACCT_TTL, LOCAL_RELOAD_SECS), then a poll rightly reloads them. The run
+    // ends 40 s after they were filled: counted from before the setup, or,
+    // after a setup that took most of that, from a poll once they've expired.
+    let mut filled = std::time::Instant::now();
     let (s, n) = counted_node().await;
     let (st, coll) = names();
     let a = SpaceClient::new(&s, &unique_name("acn"), &scope(&st, &coll)).await;
@@ -142,22 +176,39 @@ async fn noop_polls_read_nothing() {
         .unwrap()
         .to_string();
     let since = [("space", space.as_str()), ("repo", a.did.as_str()), ("since", head.as_str())];
+    if filled.elapsed() > Duration::from_secs(20) {
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        filled = std::time::Instant::now();
+    }
     // the first poll may fill the caches
     a.signed_get(&s.url, "com.atproto.space.listRepoOps", &since, &cred, &a.did).await.ok();
 
     let sp = s.app.spaces.as_ref().unwrap();
     let loads = || sp.heads.loads.load(Ordering::Relaxed);
     let fills = || sp.cache_fills.load(Ordering::Relaxed);
-    let gets = || n.gets.load(Ordering::Relaxed);
-    let (l0, f0, g0) = (loads(), fills(), gets());
-    for _ in 0..100 {
-        let r = a.signed_get(&s.url, "com.atproto.space.listRepoOps", &since, &cred, &a.did).await.ok();
+    let (l0, f0) = (loads(), fills());
+    // Not a count of the bucket's reads around the polls: the node's own
+    // loops (SlateDB's manifest polls and GC, the cluster's and config's)
+    // read it on their clocks, dozens of times over 100 polls on a slow
+    // runner. Holding every read instead stalls those loops and any poll
+    // that needs one, so a poll that answers needed nothing from the bucket.
+    n.held.send_replace(true);
+    let mut polls = 0;
+    while polls < 100 && filled.elapsed() < Duration::from_secs(40) {
+        polls += 1;
+        let poll = a.signed_get(&s.url, "com.atproto.space.listRepoOps", &since, &cred, &a.did);
+        let Ok(r) = tokio::time::timeout(Duration::from_secs(10), poll).await else {
+            let held = n.held_reads.lock().unwrap().clone();
+            panic!("a poll at the head waited on the bucket; reads held meanwhile: {held:#?}");
+        };
+        let r = r.ok();
         assert_eq!(r["ops"], json!([]));
         assert_eq!(r["commit"]["rev"], json!(head));
     }
+    n.held.send_replace(false);
+    assert!(polls > 0, "no poll within 40 s of the caches' fill");
     assert_eq!(loads(), l0, "a poll at the head loaded the space head from SlateDB");
     assert_eq!(fills(), f0, "a poll at the head read the account or its takedowns from SlateDB");
-    assert_eq!(gets(), g0, "a poll at the head read the bucket");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

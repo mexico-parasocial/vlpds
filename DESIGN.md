@@ -809,6 +809,13 @@ request bytes and concurrent requests per connection scale with these. At
 most `--max-connections` (50,000) connections per listener: at the cap the
 listener stops accepting (new ones wait in the accept queue); an upgraded
 subscribeRepos connection gives its slot back (the firehose caps those).
+An HTTP/1 request answered before its body was read (a refusal from the
+head, importRepo's block caps) has the rest of its body read and discarded
+(`server::Lingering`: at most 8 MiB more, 2 s between chunks, 10 s in all;
+not past a declared length over that, not for an unanswered
+`100-continue`), as nginx's lingering close does: closing with the body
+unread resets the connection, and a client still writing it saw a broken
+pipe instead of the answer. h2 needs none (RST_STREAM(NO_ERROR)).
 An accept error (EMFILE, ENFILE, ...) is logged, counted
 (`vlpds_http_server_accept_errors_total`) and retried after 50 ms, as
 axum::serve does; it used to end the server and the process, without a
