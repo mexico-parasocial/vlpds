@@ -1,0 +1,29 @@
+# Mantiene este fork al día con jazware/vlpds: cada día trae lo nuevo de
+# upstream (también se puede correr a mano desde Actions).
+#
+# No pongas cambios de PARA en main: lo propio vive fuera (para-platform), así
+# cada sincronización es limpia y vlpds se actualiza cambiando de imagen.
+#
+# El token automático de Actions no puede modificar archivos de workflows. Si
+# upstream cambia los suyos, la sincronización falla hasta que agregues el
+# secreto SYNC_TOKEN: un token fine-grained de esta cuenta, solo para este
+# repo, con permisos Contents y Workflows en escritura.
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository == 'mexico-parasocial/vlpds'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Traer jazware/vlpds main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main
