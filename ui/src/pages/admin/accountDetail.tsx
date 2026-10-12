@@ -1,12 +1,13 @@
 import { useState, type ReactNode } from 'react'
 import { registerDetail, type DetailMode } from '../../components/console/Drawer'
-import { Banners, Chip, Copy, ErrorState, Json, KV, Loading, Meter, NeedsVersion, RRow, Sec, Spinner, Src, Strip, type BannerSpec, type ChipKind, type KVRow } from '../../components/console/kit'
+import { Banners, Chip, Copy, ErrorState, Json, KV, Loading, Meter, NeedsVersion, RRow, Sec, Spinner, Src, Strip, Toggle, type BannerSpec, type ChipKind, type KVRow } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
 import { toast } from '../../components/console/toast'
 import * as api from '../../lib/adminApi'
 import type { AccountRow, AccountSecurity, MailEntry, RepoOpsResult, Session, SignInFailure } from '../../lib/adminApi'
 import { withAdmin } from '../../lib/console/adminAdapter'
+import { overrideCfgQ } from '../../lib/console/appviewOverride'
 import { useClusterView } from '../../lib/console/cluster'
 import { ago, authName, dur, factorName, fmtBytes, fmtNum, plural, shortDid } from '../../lib/console/fmt'
 import { K } from '../../lib/console/keys'
@@ -19,6 +20,7 @@ import { admin, call, errText } from '../../lib/xrpc'
 import * as act from './accountActions'
 import { type Who } from './accountActions'
 import { accountState, TwoFactor } from './Accounts'
+import { toggleAccount } from './AppviewOverride'
 import { AuditAction } from './auditUi'
 import { NodeTag } from './clusterUi'
 import { addOverrideDialog, overrideFor } from './limitsUi'
@@ -652,6 +654,61 @@ function Blobs({ a, row, mode }: { a: Who; row?: AccountRow | null; mode: Detail
   )
 }
 
+/** Whether this account's AppView calls go to the AppView override, with a toggle. */
+function AppviewOv({ a }: { a: Who }) {
+  const l = overrideCfgQ.use()
+  if (l.error && isUnsupported(l.error)) return null
+  const d = l.data
+  const doc = d?.config ?? d?.flags
+  const listed = !!doc?.accounts.includes(a.did)
+  const enabled = doc?.enabled ?? true
+  const ready = !!doc?.url && !!doc?.did && (doc?.methods.length ?? 0) > 0
+  const digest = !d ? '…' : listed ? (enabled ? `${plural(doc!.methods.length, 'method')} to the override` : 'listed, override off') : 'default AppView'
+  return (
+    <Sec title="AppView override" digest={digest} right={<Src>getAppviewOverride · updateAppviewOverride</Src>}>
+      {l.error && !d ? (
+        <ErrorState error={l.error} retry={l.reload} />
+      ) : !d ? (
+        <Loading />
+      ) : (
+        <KV
+          rows={[
+            [
+              'AppView calls',
+              listed ? (
+                <span>
+                  {enabled ? 'the listed methods go to' : 'listed, but the override is off:'} <span className="mono sm">{doc!.url}</span>
+                </span>
+              ) : (
+                'all go to the default AppView'
+              ),
+              {
+                chip: listed ? <Chip k={enabled ? 'info' : 'idle'}>{enabled ? 'override' : 'off'}</Chip> : undefined,
+                act: (
+                  <Toggle
+                    on={listed}
+                    label={listed ? 'Take this account off the AppView override' : 'Send this account’s AppView calls to the override'}
+                    onChange={(on) => {
+                      if (on && !ready) {
+                        toast('Set the override’s URL, DID and methods first (AppView override page)', { err: true })
+                        return
+                      }
+                      void toggleAccount(a.did, a.handle, on)
+                    }}
+                  />
+                ),
+              },
+            ],
+            ...(listed || ready
+              ? [['Methods', <Link to="/admin/appview">{doc ? plural(doc.methods.length, 'method') : '—'} · see the AppView override page</Link>] as KVRow]
+              : [['Set up', <Link to="/admin/appview">Choose the override’s URL and methods first</Link>] as KVRow]),
+          ]}
+        />
+      )}
+    </Sec>
+  )
+}
+
 function Invites({ a, info }: { a: Who; info?: AccountInfo }) {
   const codes = info?.invites ?? []
   return (
@@ -1002,6 +1059,7 @@ registerDetail('account', {
     const ops = <Ops did={did} mode={mode} />
     const blobs = <Blobs a={a} row={r} mode={mode} />
     const invites = <Invites a={a} info={i} />
+    const appview = <AppviewOv a={a} />
     const spaces = <Spaces did={did} />
     const moder = <Moderation did={did} status={status.data} mode={mode} />
     const dev = i?.email ? <DevMail did={did} email={i.email} /> : null
@@ -1043,6 +1101,7 @@ registerDetail('account', {
               <div>
                 {apppw}
                 {invites}
+                {appview}
                 {mailSec}
                 {moder}
                 {dev}
@@ -1062,6 +1121,7 @@ registerDetail('account', {
             {ops}
             {blobs}
             {invites}
+            {appview}
             {spaces}
             {mailSec}
             {moder}

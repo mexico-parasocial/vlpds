@@ -480,14 +480,17 @@ fn notifies_in(result: &str) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_rev_notifies_with_made_up_hashes_are_dropped() {
     let t = td().await;
-    t.bob_writes("one", "one").await;
-    let rev = repo_state(&t.bob, &t.space).await.unwrap().0;
     let stub = super::hooks::StubDid::spawn().await;
     let acred = t.net.credential_for(&t.alice, &t.space).await;
     let reg = json!({"space": t.space, "service": format!("{}#atproto_space_syncer", stub.did)});
     acred.post(&t.net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    t.bob_writes("one", "one").await;
+    let rev = repo_state(&t.bob, &t.space).await.unwrap().0;
     let held = listed(&t.net.pds[1].url, &acred, &t.space, &t.bob.did).await;
     authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&held), "bob's write").await;
+    // the real write's forward leaves after listRepos shows it: counted
+    // before the fakes, so a late one can't pass for a fake's
+    forwarded(&stub, &t.bob.did, &rev, &set_hash(&held), "bob's write").await;
     let forwards = stub.seen().len();
     let (unverified, capped) = (notifies_in("same_rev_unverified"), notifies_in("same_rev_capped"));
 

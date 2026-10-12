@@ -94,6 +94,8 @@ async fn push_target<'a>(app: &'a App, service_did: &str, lxm: &str) -> XResult<
             did: Cow::Borrowed(av_did),
             service_id: Cow::Borrowed("bsky_notif"),
             trusted: true,
+            fallback: None,
+            overridden: false,
         });
     }
     let doc = resolve_did(app, service_did)
@@ -106,6 +108,8 @@ async fn push_target<'a>(app: &'a App, service_did: &str, lxm: &str) -> XResult<
         did: Cow::Owned(service_did.to_string()),
         service_id: Cow::Borrowed("bsky_notif"),
         trusted: false,
+        fallback: None,
+        overridden: false,
     })
 }
 

@@ -212,11 +212,13 @@ The sidebar has the Overview and ten sections in three groups (Cluster, People a
 | Firehose & relays | Every subscribeRepos connection on every node, every 5 s: subscribers, live vs backfilling, this PDS's events/s and the bytes/s sent, emit delay · per connection its `#conn` number and node, client address with its AS, the relay it matched, user agent, how long it's been connected, start cursor, state, lag, and its events/s drawn against the PDS's · the last 50 disconnects per node with their reason · the relays asked to crawl this PDS (`--crawlers`, or a list stored from here), each one's last ask and result, whether it's subscribed now and how far behind, and the minimum interval · the merged live tail, filtered by kind, text or node | Disconnect a connection (`kickSubscriber`, type its `#conn` to confirm, and it can reconnect with its cursor) · add or remove relays, reset to the flag's list, change the interval, request a crawl now. A live connection well under the PDS's events/s is falling behind. See [Relays and crawling](relays-and-crawling.md#crawl-requests). |
 | Spaces (alpha) | Spaces whose authority is an account here, with members, writers, records and last write · each node's notify outbox, fan-out, revocation list and credential cache · a space's writers, members, notify registrations, taken-down records and audit entries | Take down or restore a space or one of its records, with a reason · remove a notify registration · read a writer's records after giving a reason (each page is an audited read). |
 | Mail | Each node's queue, the mail budgets (`mail-cluster-day`, `mail-node-hour`, the per-recipient ones) and how much of each is spent, mail by purpose, and the recent mail log: purpose, the account it was for, the recipient's domain, node and result, filtered by purpose, domain or account | Read only. Budgets are rate-limit buckets: change them on the Limits & lockouts page. |
+| AppView override | Where the override sends calls (URL, service DID, fallback) and the default AppView · the accounts on it · a checklist of the AppView methods the app reads most, plus any added by name · requests, fallbacks, errors and the time to the response head across the cluster, every 5 s · the config's change history · each node's config version, accounts and traffic | Turn it on or off · change the URL and DID · turn the fallback on or off · add or remove accounts (also from an account's page) · change which methods move. Every change is shown as a diff and saved with your name. See [AppView override](../proxying.md#appview-override). |
 | Config | Every flag each node runs with and where its value came from (flag, env, default, unset or a `-file` secret), with its help · secrets as set or unset with a fingerprint · settings stored in the bucket · each node's build · any setting that differs between nodes, apart from their addresses and `--node-id` | Read only. Filter by name, value or help, or show only what's set or only what differs. |
 
 The rate-limit config lives in the bucket (`config/ratelimits.json`), so it survives restarts and
 every node reads the same one. `{}` means the built-in defaults. The relay list lives next to it in
-`config/crawlers.json`, and the added handle domains in `config/handle-domains.json`.
+`config/crawlers.json`, the added handle domains in `config/handle-domains.json`, and the AppView
+override in `config/appview_override.json`.
 
 Each node serves its own firehose subscribers, so the Firehose page calls
 `vlpds.admin.listFirehoseSubscribers` on the node you opened and that node asks its peers over the
@@ -319,8 +321,9 @@ data: {"kind":"audit","id":"00063f…-9a1b2c3d","version":1791234568012,"node":"
 | `shard`, `node` | its id | an operator splits, merges or aborts a shard, or acts on a node |
 | `domain` | the domain | a handle domain is added or removed |
 | `invite` | `*` | invite codes are created, disabled or used by a sign-up |
-| `config` | `ratelimits`, `crawlers` or `featureLevel` | an operator changes the setting |
+| `config` | `ratelimits`, `appview-override`, `crawlers` or `featureLevel` | an operator changes the setting |
 | `ratelimits` | node id | a node applied a new rate-limit config |
+| `appview-override` | node id | a node applied a new AppView override config |
 | `space` | the space's URI | an operator acts on the space or a record in it |
 | `resync` | empty, or the peer whose stream broke | changes may have been missed: refetch everything |
 
@@ -346,7 +349,7 @@ admin write has neither an entry nor a reason it goes without.
 | A shard (`id`) | `shard.split`, `shard.merge`, `shard.abort` |
 | A node (`id`) | `secrets.rewrap`, `plc.rotate_keys`, `plc.recovery_key` (each node's run over its own shards), `firehose.kick` |
 | A handle domain (`id`) | `domain.add`, `domain.remove` |
-| A setting (`id`) | `ratelimits.update`, `crawlers.set`, `crawlers.request`, `feature_level.set` |
+| A setting (`id`) | `ratelimits.update`, `appviewOverride.update`, `crawlers.set`, `crawlers.request`, `feature_level.set` |
 | A space | `space.read`, `space.registration.remove`, and `takedown` and `restore` of a space |
 | None | `case.create`, `case.update` (with the case), `storage.backfill` |
 
@@ -359,6 +362,7 @@ nothing. Two writes go unaudited on purpose: `bulkCreate` (simulation only, refu
 
 Some actions point at a fuller record. A `ratelimits.update` entry has the config's new version
 and how many limits changed, and the change itself is in that version of the rate-limit history.
+An `appviewOverride.update` entry works the same way with the AppView override's history.
 A `mail.send` entry links to the account's mail log. A `deleteAccount` is audited before anything
 is deleted, and `splitShard` and `mergeShards` before the op is planned. Each is audited again,
 with the error, if it fails.

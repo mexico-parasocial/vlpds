@@ -167,6 +167,8 @@ async fn a_stalled_import_body_fails() {
         assert_eq!(r.status, 400, "{}", r.text());
         assert!(r.text().contains("stalled"), "{}", r.text());
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
-        assert_eq!(s.app.imports.reserved(), 0);
+        // the body reader and the parse hold the reservation until they see
+        // the failure, which can be just after the response went out
+        wait_until("the reservation given back", Duration::from_secs(5), || s.app.imports.reserved() == 0).await;
     }
 }

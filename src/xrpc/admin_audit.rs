@@ -55,6 +55,7 @@ pub const AUDITED: &[(&str, &[&str])] = &[
     ("vlpds.admin.splitShard", &["shard.split"]),
     ("vlpds.admin.updateCase", &["case.update"]),
     ("vlpds.admin.updateRateLimits", &["ratelimits.update"]),
+    ("vlpds.admin.updateAppviewOverride", &["appviewOverride.update"]),
 ];
 
 /// Admin writes left out of the audit log on purpose.

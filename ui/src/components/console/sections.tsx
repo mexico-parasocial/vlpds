@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 // The console's information architecture: one entry per sidebar item, in order. `key` is the
 // letter after `g`; `aliases` are older paths that still land in the section.
 
-export type SectionId = 'overview' | 'nodes' | 'storage' | 'firehose' | 'accounts' | 'moderation' | 'limits' | 'domains' | 'spaces' | 'mail' | 'config'
+export type SectionId = 'overview' | 'nodes' | 'storage' | 'firehose' | 'accounts' | 'moderation' | 'limits' | 'domains' | 'spaces' | 'mail' | 'appview' | 'config'
 
 export type Section = { id: SectionId; label: string; short?: string; key: string; group: '' | 'Cluster' | 'People' | 'System'; path: string; aliases?: string[]; icon: ReactNode; alpha?: boolean }
 
@@ -137,6 +137,22 @@ export const SECTIONS: Section[] = [
       <>
         <rect x="1.5" y="3" width="13" height="10" rx="1.5" {...s} />
         <path d="m2 4 6 5 6-5" {...s} />
+      </>,
+    ),
+  },
+  {
+    id: 'appview',
+    label: 'AppView override',
+    short: 'AppView',
+    key: 'v',
+    group: 'System',
+    path: '/admin/appview',
+    aliases: ['/admin/appview-override'],
+    icon: svg(
+      <>
+        <circle cx="4" cy="8" r="2.3" {...s} />
+        <path d="M6.3 8h3.2M9.5 8l3-4.5M9.5 8l3 4.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        <circle cx="13" cy="3.5" r="1.4" fill="currentColor" />
       </>,
     ),
   },

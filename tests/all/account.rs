@@ -224,7 +224,7 @@ async fn allows_administrative_email_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_account_emits_identity_and_account_events() {
     let s = TestServer::spawn().await;
-    let mut sub = s.subscribe(None).await;
+    let mut sub = s.subscribe_from_now().await;
     let a = s.create_account("fh").await;
     let did = a.did.clone();
     let frames = sub

@@ -31,7 +31,9 @@ lazy!(HTTP_SERVER_ACTIVE: IntGaugeVec = register_int_gauge_vec!("vlpds_http_serv
 lazy!(RATE_LIMITED: IntCounter = register_int_counter!("vlpds_rate_limited_total", "Requests rejected with 429 RateLimitExceeded"));
 lazy!(WRITES_SHED: IntCounter = register_int_counter!("vlpds_writes_shed_total", "Write requests rejected by admission control (503)"));
 lazy!(ARGON2_SHED: IntCounter = register_int_counter!("vlpds_argon2_shed_total", "Password checks/hashes (createSession, createAccount, OAuth sign-in, password changes) answered 503 Overloaded: every Argon2 permit stayed busy for 2 s"));
-lazy!(PROXY_REJECTED: IntCounterVec = register_int_counter_vec!("vlpds_proxy_rejected_total", "Proxied (AppView/service) requests refused before forwarding, by reason (account_cap: 429 at 64 in flight for one account on its owner)", &["reason"]));
+lazy!(APPVIEW_OVERRIDE_FALLBACKS: IntCounterVec = register_int_counter_vec!("vlpds_appview_override_fallbacks_total", "GETs the AppView override answered MethodNotImplemented, resent to the default AppView, by the status it answered (501, or 400 with that error)", &["status"]));
+lazy!(APPVIEW_OVERRIDE_CONFIG_ERRORS: IntCounter = prometheus::register_int_counter!("vlpds_appview_override_config_errors_total", "AppView override config objects this node rejected (it keeps its last good config)"));
+lazy!(PROXY_REJECTED:IntCounterVec = register_int_counter_vec!("vlpds_proxy_rejected_total", "Proxied (AppView/service) requests refused before forwarding, by reason (account_cap: 429 at 64 in flight for one account on its owner)", &["reason"]));
 lazy!(HTTP_STALLED_BODIES: IntCounter = register_int_counter!("vlpds_http_stalled_bodies_total", "Proxied/forwarded response bodies dropped because the client stopped reading for 30 s (write-progress deadline, src/http.rs stall)"));
 
 lazy!(COMMITS: IntCounter = register_int_counter!("vlpds_commits_total", "Commits built"));
@@ -91,7 +93,7 @@ lazy!(RETENTION_DELETED_OBJECTS: IntCounterVec = register_int_counter_vec!("vlpd
 lazy!(RETENTION_DELETED_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_bytes_total", "Log bytes deleted by retention, by log (own, dead)", &["log"]));
 lazy!(RETENTION_PRUNED_SEQ: IntGauge = register_int_gauge!("vlpds_retention_pruned_seq", "Highest seq this node has deleted from any log (older cursors get OutdatedCursor)"));
 lazy!(RETENTION_REPLAY_HOLD: IntGauge = register_int_gauge!("vlpds_retention_replay_hold_segments", "Segments of our log kept only because a crash replay could still need them (durable ordinal - replay floor)"));
-lazy!(RETENTION_LISTS_SKIPPED: IntCounterVec = register_int_counter_vec!("vlpds_retention_lists_skipped_total", "Retention LISTs a pass skipped because nothing could be due yet (own: our log's first segment is inside the window or held by the replay floor; dead: no dead logs but retired ones whose fences aren't due, live set unchanged); each still runs at least hourly", &["list"]));
+lazy!(RETENTION_LISTS_SKIPPED: IntCounterVec = register_int_counter_vec!("vlpds_retention_lists_skipped_total", "Retention LISTs a pass skipped because nothing could be due yet (own: our log's first segment is inside the window or held by the replay floor; dead: every dead log waits for a known time (a retired one for its fence, a pruning one for its next segment to age), live set unchanged); each still runs at least hourly", &["list"]));
 lazy!(RETENTION_TICKS: IntCounterVec = register_int_counter_vec!("vlpds_retention_ticks_total", "Retention passes by result", &["result"]));
 
 lazy!(PROXY_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_cache_total", "Proxy fast-path cache lookups", &["result"]));
@@ -220,7 +222,7 @@ lazy!(BLOB_QUOTA_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_bl
 lazy!(BLOB_QUARANTINE: IntCounterVec = register_int_counter_vec!("vlpds_blob_quarantine_total", "Taken-down blobs: quarantined (bytes moved to blob-quarantine/ by a takedown), restored (moved back by a reversal), purged (deleted after --blob-quarantine-days)", &["event"]));
 lazy!(BLOB_UPLOAD_BYTES: IntCounter = register_int_counter!("vlpds_blob_upload_bytes_total", "Bytes of blobs stored by uploadBlob"));
 lazy!(REPORTS: IntCounterVec = register_int_counter_vec!("vlpds_reports_total", "Moderation reports (com.atproto.moderation.createReport) passed on to the moderation service, by result (ok; failed: the service refused it or was unreachable)", &["result"]));
-lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstream_requests_total", "Requests proxied for users to other services, by service (appview: the Bluesky AppView, chat, moderation, other) and result (ok: 2xx/3xx; client_error: 4xx; server_error: 5xx; unreachable: connection failure or timeout)", &["service", "result"]));
+lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstream_requests_total", "Requests proxied for users to other services, by service (appview: the Bluesky AppView, appview_override: --appview-override, chat, moderation, other) and result (ok: 2xx/3xx; client_error: 4xx; server_error: 5xx; unreachable: connection failure or timeout)", &["service", "result"]));
 lazy!(UPSTREAM_DURATION: HistogramVec = register_histogram_vec!("vlpds_upstream_request_seconds", "Proxied request time until the upstream service's response head, by service (unreachable ones included)", &["service"], latency_buckets()));
 lazy!(HANDLE_RESOLUTIONS: IntCounterVec = register_int_counter_vec!("vlpds_handle_resolutions_total", "Custom-domain handle lookups by result (dns: TXT _atproto record; http: /.well-known/atproto-did; not_found: neither answered with a DID)", &["result"]));
 lazy!(REQUEST_CRAWL: IntCounterVec = register_int_counter_vec!("vlpds_request_crawl_total", "requestCrawl calls to relays (the slot-0 leader's startup/after-activity asks, and vlpds.admin.requestCrawl) by relay and result (ok; rejected: non-2xx answer; failed: unreachable)", &["relay", "result"]));
@@ -284,6 +286,7 @@ pub fn blob_kind(mime: &str) -> &'static str {
 pub fn upstream_service(service_id: &str) -> &'static str {
     match service_id {
         "bsky_appview" => "appview",
+        "appview_override" => "appview_override",
         "bsky_chat" => "chat",
         "atproto_labeler" | "bsky_moderation" => "moderation",
         _ => "other",

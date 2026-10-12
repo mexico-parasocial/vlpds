@@ -395,6 +395,26 @@ struct Args {
     /// Default AppView for proxied requests: "<url>,<service did>".
     #[arg(long, env = "VLPDS_APPVIEW")]
     appview: Option<String>,
+    /// Another AppView for the accounts in --appview-override-accounts, for
+    /// the methods in --appview-override-methods: "<url>,<service did>". The
+    /// DID is the service-auth audience and isn't resolved. Like --appview's,
+    /// the URL is trusted, so it may be a private address. Only calls that
+    /// would go to --appview are moved (docs/proxying.md "AppView override").
+    #[arg(long, env = "VLPDS_APPVIEW_OVERRIDE")]
+    appview_override: Option<String>,
+    /// DIDs whose calls --appview-override applies to (comma-separated).
+    /// Empty: the override is off.
+    #[arg(long, env = "VLPDS_APPVIEW_OVERRIDE_ACCOUNTS", value_delimiter = ',')]
+    appview_override_accounts: Vec<String>,
+    /// The app.bsky.* methods (exact NSIDs, comma-separated) that go to
+    /// --appview-override; every other method stays on --appview.
+    #[arg(long, env = "VLPDS_APPVIEW_OVERRIDE_METHODS", value_delimiter = ',')]
+    appview_override_methods: Vec<String>,
+    /// Resend to --appview a GET that --appview-override answers
+    /// MethodNotImplemented (501, or 400 with that error). Procedures are
+    /// never resent.
+    #[arg(long, env = "VLPDS_APPVIEW_OVERRIDE_FALLBACK", default_value_t = true, action = clap::ArgAction::Set)]
+    appview_override_fallback: bool,
     /// Moderation service for createReport: "<url>,<service did>".
     #[arg(long, env = "VLPDS_REPORT_SERVICE")]
     report_service: Option<String>,
@@ -1521,6 +1541,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
         disk_cache_bytes: args.disk_cache_mb.map(|m| m << 20),
         disk_cache_shard_bytes: args.disk_cache_shard_mb.map(|m| m << 20),
         appview: url_did(&args.appview)?,
+        appview_override: vlpds::server::AppviewOverride::from_flags(
+            url_did(&args.appview_override)?,
+            &args.appview_override_accounts,
+            &args.appview_override_methods,
+            args.appview_override_fallback,
+            url_did(&args.appview)?.as_ref(),
+        )?,
         report_service: url_did(&args.report_service)?,
         appview_cdn_url_pattern: args.bsky_app_view_cdn_url_pattern.clone().filter(|p| !p.is_empty()),
         crawlers: args.crawlers.clone(),

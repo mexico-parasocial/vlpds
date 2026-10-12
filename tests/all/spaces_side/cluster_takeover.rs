@@ -134,7 +134,7 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
 
     // the vlpds authority catches up with every writer's head
     let t0 = Instant::now();
-    let fin = eventually(CATCH_UP, || async {
+    eventually(CATCH_UP, || async {
         let repos = list_repos(&auth, &local, &cred).await.ok()?;
         let rows = by_did(&repos);
         writers
@@ -143,11 +143,14 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
                 let c = &heads[&(w.did.clone(), local.as_str())];
                 rows.get(&w.did).is_some_and(|r| r["repoRev"] == json!(c.rev) && bytes_field(&r["hash"]) == c.hash)
             })
-            .then_some(repos)
+            .then_some(())
     })
     .await
     .expect("the vlpds authority never caught up");
     eprintln!("the vlpds authority caught up {:?} after the burst", t0.elapsed());
+    // listRepos pages by spaceRev, so a listing that raced a late write's
+    // sequencing shows that repo twice; once caught up nothing moves
+    let fin = list_repos(&auth, &local, &cred).await.expect("listRepos once caught up");
     let mut sequenced: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut last: BTreeMap<String, (String, String)> = BTreeMap::new();
     let polls = std::mem::take(&mut *polls.lock());

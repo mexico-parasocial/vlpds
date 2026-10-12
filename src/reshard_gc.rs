@@ -544,7 +544,7 @@ fn rewrite_spec(m: &VersionedManifest, full: bool) -> Option<CompactionSpec> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::partition::{clone_db, open_db};
 
@@ -874,7 +874,7 @@ mod tests {
 
     /// Counts LISTs and GETs on top of another store.
     #[derive(Debug)]
-    struct Counting {
+    pub(crate) struct Counting {
         inner: Arc<dyn object_store::ObjectStore>,
         lists: std::sync::atomic::AtomicU64,
         gets: std::sync::atomic::AtomicU64,
@@ -888,7 +888,7 @@ mod tests {
 
     impl Counting {
         /// (LISTs, GETs) since the last call.
-        fn take(&self) -> (u64, u64) {
+        pub(crate) fn take(&self) -> (u64, u64) {
             use std::sync::atomic::Ordering::Relaxed;
             (self.lists.swap(0, Relaxed), self.gets.swap(0, Relaxed))
         }
@@ -959,7 +959,7 @@ mod tests {
         }
     }
 
-    fn counting_store(prefix: &str) -> (Store, Arc<Counting>) {
+    pub(crate) fn counting_store(prefix: &str) -> (Store, Arc<Counting>) {
         let c =
             Arc::new(Counting { inner: Store::memory(None).raw, lists: Default::default(), gets: Default::default() });
         (Store { prefix: prefix.into(), raw: c.clone(), ..Store::memory(None) }, c)

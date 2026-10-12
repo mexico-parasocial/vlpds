@@ -72,6 +72,10 @@ pub struct Job {
     pub seq: Sequenced,
     /// The lease epoch of the authority's shard that sequenced it.
     pub epoch: u64,
+    /// A shard open's catch-up (`Spaces::catch_up_registrations`), read
+    /// while the shard already takes writes: it may be behind one they
+    /// sequenced, whose forward can be out before this reaches its lane.
+    pub catch_up: bool,
 }
 
 type LaneKey = (Arc<str>, SpaceId, String);
@@ -309,6 +313,20 @@ impl Fanout {
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 let Some(a) = app.upgrade() else { return };
+                // a catch-up behind a newer write would reach the service
+                // after it (that one's lane may be gone, and its memory). A
+                // write sequenced after this check queues behind this job.
+                if job.catch_up {
+                    match super::newest_space_rev(&a, &job.authority, &job.sid).await {
+                        Ok(newest) if newest.is_some_and(|t| t > job.seq.space_rev) => continue,
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(space = %hex::encode(job.sid), "space catch-up unreadable: {e:#}");
+                            crate::metrics::space_notify("fanout", "error");
+                            continue;
+                        }
+                    }
+                }
                 match crate::xrpc::space::space_sid_takendown(&a, &job.authority, &job.sid).await {
                     Ok(false) => {}
                     Ok(true) => {

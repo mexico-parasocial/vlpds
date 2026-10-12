@@ -179,6 +179,8 @@ edges:
 - Lanes live in memory. When a shard opens on a new owner, each of its spaces with a live
   registration sends one catch-up forward of its newest writer, naming the spaceRev before it. A
   syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listRepos`.
+  A catch-up that a newer write has passed by the time it's sent is dropped, so forwards stay in
+  spaceRev order.
 - A taken-down space forwards nothing, catch-ups included.
 
 The reference sends each forward as it's sequenced, with no order. Its syncers see about 3–5

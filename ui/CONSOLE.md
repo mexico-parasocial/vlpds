@@ -81,7 +81,7 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 
 One client cache (TanStack Query, `lib/console/query.ts`) holds everything the console reads, so every panel, drawer, chip and strip that shows a thing shows the same copy, and an action shows everywhere at once.
 
-- Every read is a query with a key from `keys.ts`. An entity's reads share its prefix: `['account', did, 'row' | 'info' | 'status' | 'security' | 'sessions' | 'subject' …]`, `['case', id]`, `['auditEntry', id]`. Lists and aggregates have their own roots: `['accounts', {q, filter}]`, `['cases', {status, did}]`, `['audit', {limit, did}]`, `['takedowns']`, `['lockouts']`, `['mail', {did}]`, `['subscribers']`, `['domains']`, `['invites']`, `['ratelimits']`, `['cluster']`.
+- Every read is a query with a key from `keys.ts`. An entity's reads share its prefix: `['account', did, 'row' | 'info' | 'status' | 'security' | 'sessions' | 'subject' …]`, `['case', id]`, `['auditEntry', id]`. Lists and aggregates have their own roots: `['accounts', {q, filter}]`, `['cases', {status, did}]`, `['audit', {limit, did}]`, `['takedowns']`, `['lockouts']`, `['mail', {did}]`, `['subscribers']`, `['domains']`, `['invites']`, `['ratelimits']`, `['appviewOverride']`, `['cluster']`.
 - `useAdminQuery({ key, fn, poll, version, keep, enabled })` reads one in a component and returns `Load<T>` (`data`, `error`, `loading`, `at`, `reload`), keeping the last data while it refetches. `shared({ … })` is a query several parts of the console read: `.use()`, `.get()` for code outside React (the palette, the shell's attention list), `.refresh()`, `.prefetch()` and `.fresh()` (an edit that must start from the server's current answer). `observe` keeps one fetched for a store outside React (`metrics.ts`).
 - A list fetch writes each row into the entity's own query (`hydrate`): `listAccounts` fills `['account', did, 'row']`, `listCases` fills `['case', id]`, `getAuditLog` fills `['auditEntry', id]`. The Accounts table draws each row from its per-account copy, so a drawer's refetch or an action's answer shows in the table at once, and a drawer opens on the row it was clicked from.
 - Versions: a response is dropped when the cache already holds something newer (`guarded`). By the entity's own version where it has one (a case's `updatedAt`, the cluster's and the rate limits' `time`), else by when it was read: data an action wrote, or a row a list read, after this request started wins. `hydrate` follows the same rule.
@@ -125,6 +125,7 @@ One client cache (TanStack Query, `lib/console/query.ts`) holds everything the c
 | Domains & invites | `/admin/domains` | Built. Detail kinds `domain`, `invite` |
 | Spaces | `/admin/spaces` | Built. Detail kind `space` (id: the space URI), and `/admin/spaces/space?uri=` shows its full page |
 | Mail | `/admin/mail` | Built. Detail kind `mail` (id `node:id`). Budgets from getRateLimits' `mail-*` buckets. `?purpose=`, `?domain=` and `?did=` filter the log |
+| AppView override | `/admin/appview` | Built (`AppviewOverride.tsx`). Every edit goes through `editOverride` (diff, then updateAppviewOverride with ifVersion). An account's page toggles it with `toggleAccount` |
 | Config | `/admin/config` | Built. Detail kind `cfg` (id: the flag). getConfig from every node, relayed by `x-vlpds-node` |
 
 ## Trying it

@@ -10,6 +10,8 @@ use std::time::Duration;
 use vlsync_firehose::firehose::Firehose;
 use vlsync_store::store::{S3Config, Store};
 
+pub use crate::appview_override::AppviewOverride;
+
 /// No Debug: it holds secrets (tokens, S3/SMTP credentials, KEK config).
 #[derive(Clone)]
 pub struct Config {
@@ -66,6 +68,10 @@ pub struct Config {
     pub disk_cache_shard_bytes: Option<u64>,
     /// (url, service DID)
     pub appview: Option<(String, String)>,
+    /// Some accounts' AppView calls for some methods go here instead of
+    /// `appview` ([`AppviewOverride`]): the flags' value, in force until the
+    /// bucket's config object exists (`crate::appview_override`).
+    pub appview_override: Option<AppviewOverride>,
     /// (url, service DID)
     pub report_service: Option<(String, String)>,
     /// None: the PDS's own getBlob URL.
@@ -299,6 +305,7 @@ impl Default for Config {
             disk_cache_bytes: None,
             disk_cache_shard_bytes: None,
             appview: None,
+            appview_override: None,
             report_service: None,
             appview_cdn_url_pattern: None,
             crawlers: Vec::new(),
@@ -607,6 +614,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         did_resolver: Arc::new(crate::caches::did_resolver(&cfg.plc_url, cfg.dev_mode)),
         http,
         ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
+        appview_override: Arc::new(crate::appview_override::Runtime::new(cfg.appview_override.clone())),
         crawlers: Arc::new(xrpc::crawlers::Crawlers::new(&cfg.crawlers, cfg.crawl_interval)),
         ptr: crate::ptr::PtrCache::new(cfg.ptr_resolver.as_ref()),
         asn: crate::asn::AsnCache::with(cfg.asn_whois.clone(), cfg.asn_debounce, crate::asn::MAX_ENTRIES),

@@ -1487,11 +1487,25 @@ net:
   floor held it, the next LIST waits for the floor to move. If the log ran
   out, it waits one window, since later segments are younger.
 - Dead logs (`LIST log/`): skipped while the live log set is the one the
-  last full scan saw, and that scan found no dead logs, or only retired
-  ones whose fences aren't due (until the earliest fence turns older than
-  `--fence-retention`). A log dies as a live one, which changes the set.
-  A log never seen live (a joiner that died before anyone listed it) waits
-  up to an hour; nobody can prune it before someone fences it anyway.
+  last full scan saw, and that scan found no dead logs, or only ones
+  waiting for a known time: retired ones whose fences aren't due (until
+  the fence turns older than `--fence-retention`) and ones pruned up to a
+  segment inside the window (nobody writes a dead log, so nothing is due
+  before that segment ages). A log dies as a live one, which changes the
+  set. A log never seen live (a joiner that died before anyone listed it)
+  waits up to an hour; nobody can prune it before someone fences it
+  anyway. A scan LISTs only the dead logs that are due. A retired log's
+  fence is immutable, so it skips the hourly safety net too.
+
+A log's next LIST waits until its next segment is older than the window
+plus a slack of window ÷ 72, at most 1 h (1 h at the default 72 h). One
+LIST then deletes an hour of segments instead of one per pass, and
+segments live up to an hour past the window, which only lengthens
+backfill. Before this, a leader LISTed every retired log and every
+pruning dead log (twice), plus `assign/` and `retain/`, on every pass
+while any dead log was pruning: 44 LISTs a minute on a production node
+in Oct 2026 (35 retired, 3 pruning), about $9/month in R2 Class A and
+four fifths of the node's Class A requests.
 
 So an idle node's passes make no requests. A longer interval only delays
 deletes and retirements, by up to one interval. Metric:
@@ -3932,6 +3946,29 @@ tallies and lists each node's config version, error and load times.
 Requests without rate limits (`--no-rate-limits`, non-XRPC paths) are
 unchanged.
 
+## AppView override: runtime config
+
+The AppView override (docs/proxying.md "AppView override",
+`src/appview_override.rs`, `src/xrpc/appview_override.rs`, console page
+"AppView override") moves chosen accounts' calls for chosen `app.bsky.*`
+methods to a second AppView. It reuses the rate-limit config's machinery:
+- `{prefix}/config/appview_override.json` is a versioned object, saved by
+  `vlpds.admin.updateAppviewOverride` with `ifVersion` and an `If-Match`
+  (or create-if-absent) PUT, audited, with the last 50 changes in it.
+- The saving node installs it and POSTs `/internal/v1/appview-override/reload`
+  to every peer. Each node re-reads it every 60 s with `If-None-Match` (a
+  minute, not the rate limits' 10 s: it changes by hand, and the nudge is
+  what makes a save take effect).
+- An object that fails parsing or validation is reported and the node keeps
+  its last good override.
+- Unknown fields are refused on save and dropped on read.
+
+The flags are the boot default. A node runs them until it reads an object,
+and the object wins from then on, whatever the flags say. The routing reads
+an `Arc` behind a lock, skipped through an `AtomicBool` while nothing is in
+force, so a node with no override does no more work per proxied call than
+before.
+
 ## Secrets at rest (`src/secrets.rs`)
 
 Everything durable is in one bucket (and its log segments, SSTs, backups
@@ -5519,7 +5556,9 @@ one domain can't multiply what a write sends one machine. Sends go through the p
 client. Lanes are best effort and in memory. When a shard opens, each of
 its spaces with a live registration sends one forward of its newest writer,
 naming its true predecessor from `sQ`, so a syncer that missed one sees the gap and
-pulls `listRepos`. A taken-down space forwards nothing.
+pulls `listRepos`. The shard takes writes meanwhile, so the dispatcher drops a catch-up
+that a newer sequenced write has passed: it would reach the syncer after that write's
+forward. A taken-down space forwards nothing.
 
 ### Revocations, retention and operator reads
 

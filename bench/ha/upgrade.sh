@@ -67,10 +67,21 @@ if [[ "${SKIP_BUILD:-}" != 1 ]]; then
     echo "building the previous release $REV ($SHA)"
     src="$VLPDS_UPGRADE_DIR/prev-src"
     rm -rf "$src" && mkdir -p "$src"
-    # (from the repo root: in a subdirectory git archive limits a tree to it)
-    git -C "$(git -C "$PKG" rev-parse --show-toplevel)" archive "$SHA:$(git -C "$PKG" rev-parse --show-prefix)" | tar -x -C "$src"
+    # In a monorepo the release takes its sibling crates by path
+    # (vlsync, vlatproto), so they come from the same rev, laid out
+    # as in the repo; standalone, the package is the whole tree.
+    top="$(git -C "$PKG" rev-parse --show-toplevel)"
+    prefix="$(git -C "$PKG" rev-parse --show-prefix)"
+    paths=("${prefix:-.}")
+    if [[ -n "$prefix" ]]; then
+      parent="$(dirname "$prefix")"
+      for sib in vlsync vlatproto; do
+        if git -C "$top" cat-file -e "$SHA:$parent/$sib" 2>/dev/null; then paths+=("$parent/$sib"); fi
+      done
+    fi
+    git -C "$top" archive "$SHA" -- "${paths[@]}" | tar -x -C "$src"
     # (no .git in the archive: name the rev for vlpds_build_info / leases)
-    (cd "$src" && VLPDS_GIT_REV="${SHA:0:9}" cargo build --profile dev-release --bin vlpds)
+    (cd "$src/$prefix" && VLPDS_GIT_REV="${SHA:0:9}" cargo build --profile dev-release --bin vlpds)
     cp "$CARGO_TARGET_DIR/dev-release/vlpds" "$VLPDS_UPGRADE_DIR/prev/vlpds"
     echo "$SHA" > "$VLPDS_UPGRADE_DIR/prev/REV"
     rm -rf "$src"

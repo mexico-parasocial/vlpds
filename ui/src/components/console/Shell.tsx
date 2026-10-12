@@ -251,7 +251,7 @@ function useCorePalette() {
     const off = registerPalette({
       items: () => {
         const live = getLive()
-        const goto: PalItem[] = SECTIONS.map((s) => ({ group: 'Go to', glyph: s.icon, title: s.label, keys: ['g', s.key], always: s.id !== 'mail' && s.id !== 'config', run: () => navigate(s.path) }))
+        const goto: PalItem[] = SECTIONS.map((s) => ({ group: 'Go to', glyph: s.icon, title: s.label, keys: ['g', s.key], always: s.id !== 'mail' && s.id !== 'appview' && s.id !== 'config', run: () => navigate(s.path) }))
         const acts: PalItem[] = [
           { group: 'Actions', title: live.paused ? 'Resume live updates' : 'Pause live updates', keys: ['space'], always: true, run: togglePaused },
           { group: 'Actions', title: 'Toggle light / dark', keys: ['t'], always: true, run: () => toggleRef.current() },

@@ -177,7 +177,7 @@ async fn token_and_commit_key_track_signing_key_rotation() {
     let a = s.create_account("alice").await;
     let pds = s.pds_did().await;
     let old = s.signing_key(&a.did).await;
-    let mut sub = s.subscribe(None).await;
+    let mut sub = s.subscribe_from_now().await;
     let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     let new_did_key = r["signingKey"].as_str().expect("signingKey in response").to_string();
     let new = decode_did_key_k256(&new_did_key).unwrap();

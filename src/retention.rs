@@ -46,8 +46,15 @@ pub const DEFAULT_MAX_DELETES: usize = 10_000;
 pub const DEFAULT_FENCE_RETENTION: Duration = Duration::from_secs(7 * 86400);
 /// A pass LISTs a log (or `log/`) at least this often even when what it
 /// learned says nothing can be due yet: a safety net for anything the
-/// skip rules don't foresee (see `Retention::pass`).
+/// skip rules don't foresee (see `Retention::pass`). A retired log's fence
+/// is the exception (`DeadDue::Fence`).
 pub const RELIST_EVERY: Duration = Duration::from_secs(3600);
+/// A log whose next segment turns older than the window at `t` is next
+/// LISTed at `t` plus this, capped at 1/72 of the window (1 h at the
+/// default 72 h), so one LIST deletes every segment that aged meanwhile
+/// instead of one per pass. Segments stay up to this long past the window:
+/// more backfill, never less.
+pub const PRUNE_SLACK: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -137,6 +144,23 @@ struct State {
     /// logs it saw, when (if ever) a retired log's fence comes due, and
     /// when it ran. None: nothing is known (the next pass scans).
     dead_next: Option<DeadNext>,
+    /// Dead logs whose last LIST found nothing due before a known time: a
+    /// scan skips their LISTs until then (and the whole pass, if every dead
+    /// log is waiting).
+    dead_due: HashMap<String, DeadDue>,
+}
+
+/// See `State::dead_due`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeadDue {
+    /// Retired: its fence turns older than `--fence-retention` then (None:
+    /// never). The fence is immutable, and before then `delete_fence` keeps
+    /// it whatever else the log holds, so this outlives RELIST_EVERY.
+    Fence(Option<chrono::DateTime<chrono::Utc>>),
+    /// Pruned up to a segment inside the window. Nobody writes a dead log,
+    /// so nothing is due before `at` (its `Due::At`, slack included);
+    /// `segments` are left below the fence; `listed` is when this was seen.
+    Pruning { at: chrono::DateTime<chrono::Utc>, segments: u64, listed: std::time::Instant },
 }
 
 /// See `State::dead_next`.
@@ -210,11 +234,13 @@ impl Retention {
     ///   the last LIST stopped at is still the first. Nothing is due before
     ///   it turns older than the window or, if the replay floor held it,
     ///   before the floor moves.
-    /// - Dead logs: the last full scan found none, or only retired ones
-    ///   whose fences aren't due yet, and the live log set hasn't changed.
-    ///   A log dies as a live one (the set changes). One never seen live (a
-    ///   joiner that died before we listed it) waits for RELIST_EVERY; it
-    ///   has nothing to prune before someone fences it anyway.
+    /// - Dead logs: the last full scan found none, or only ones waiting for
+    ///   a known time (retired ones whose fences aren't due, or ones pruned
+    ///   up to a segment inside the window), and the live log set hasn't
+    ///   changed. A log dies as a live one (the set changes). One never
+    ///   seen live (a joiner that died before we listed it) waits for
+    ///   RELIST_EVERY; it has nothing to prune before someone fences it
+    ///   anyway. A scan LISTs only the dead logs that are due (`DeadDue`).
     pub async fn pass(&self) -> anyhow::Result<Pass> {
         let now = chrono::Utc::now();
         let cutoff = now - chrono::Duration::from_std(self.cfg.window)?;
@@ -234,7 +260,7 @@ impl Retention {
         };
         if own_due {
             let listed = std::time::Instant::now();
-            let (n, due) = self.prune(&self.log.log_id, floor, cutoff, &mut budget, "own").await?;
+            let (n, due, _) = self.prune(&self.log.log_id, floor, cutoff, &mut budget, "own").await?;
             self.state.lock().own_next = Some((due, listed));
             pass.objects += n.objects;
             pass.bytes += n.bytes;
@@ -244,7 +270,10 @@ impl Retention {
         self.publish().await?;
         if !(self.members.leader)() {
             // another node prunes (and reports) dead logs
-            self.state.lock().dead_next = None;
+            let mut st = self.state.lock();
+            st.dead_next = None;
+            st.dead_due.clear();
+            drop(st);
             DeadLogs::default().export();
         } else if budget > 0 {
             let live = (self.members.live_logs)();
@@ -291,7 +320,8 @@ impl Retention {
     /// Deletes `log_id`'s oldest segments: ordinals below `limit` last
     /// modified before `cutoff`, at most `budget` of them.
     /// Also returns when the next LIST of the log can find something (see
-    /// `Due`; this assumes nobody else deletes from the log meanwhile).
+    /// `Due`; this assumes nobody else deletes from the log meanwhile), and
+    /// the lowest ordinal it left (None: none).
     async fn prune(
         &self,
         log_id: &str,
@@ -299,12 +329,14 @@ impl Retention {
         cutoff: chrono::DateTime<chrono::Utc>,
         budget: &mut usize,
         kind: &str,
-    ) -> anyhow::Result<(Pass, Due)> {
+    ) -> anyhow::Result<(Pass, Due, Option<u64>)> {
         let prefix = Path::from(format!("{}/log/{}", self.store.prefix, log_id));
         let window = chrono::Duration::from_std(self.cfg.window)?;
+        let late = window + chrono::Duration::from_std(PRUNE_SLACK.min(self.cfg.window / 72))?;
         let mut doomed: Vec<(u64, Path, u64)> = Vec::new();
         // the log ran out: a segment written from now on is younger
-        let mut due = Due::At(chrono::Utc::now() + window);
+        let mut due = Due::At(chrono::Utc::now() + late);
+        let mut left = None;
         {
             // listings are in key order and ordinals zero-padded: oldest first
             let mut list = self.store.raw.list(Some(&prefix));
@@ -312,21 +344,20 @@ impl Retention {
                 let m = m?;
                 let Some(ord) = ordinal_of(&m.location) else { continue };
                 if m.last_modified >= cutoff {
-                    due = Due::At(m.last_modified + window);
-                    break;
-                }
-                if ord >= limit {
+                    due = Due::At(m.last_modified + late);
+                } else if ord >= limit {
                     due = Due::Floor(limit);
-                    break;
-                }
-                if doomed.len() >= *budget {
+                } else if doomed.len() >= *budget {
                     due = Due::Now;
-                    break;
+                } else {
+                    doomed.push((ord, m.location, m.size));
+                    continue;
                 }
-                doomed.push((ord, m.location, m.size));
+                left = Some(ord);
+                break;
             }
         }
-        let Some((last, ..)) = doomed.last() else { return Ok((Pass::default(), due)) };
+        let Some((last, ..)) = doomed.last() else { return Ok((Pass::default(), due, left)) };
         // Below a replay floor (or a fence) every object is a segment. One
         // already gone was deleted by another node, which raised its own
         // floor first.
@@ -336,7 +367,7 @@ impl Retention {
             self.raise_floor(h.last_seq).await?;
         }
         let pass = self.delete(doomed.into_iter().map(|(_, p, n)| (p, n)).collect(), budget, kind).await?;
-        Ok((pass, due))
+        Ok((pass, due, left))
     }
 
     async fn delete(&self, objs: Vec<(Path, u64)>, budget: &mut usize, kind: &str) -> anyhow::Result<Pass> {
@@ -376,28 +407,52 @@ impl Retention {
         let mut pass = Pass::default();
         let mut known: Option<Known> = None;
         let mut stats = DeadLogs::default();
-        // the next scan may be skipped if only retired logs whose fences
-        // aren't due are left (`quiet`), until the earliest fence comes due
+        // the next scan may be skipped if every dead log left is waiting
+        // for a known time (`quiet`), until the earliest of those
         let (mut quiet, mut until) = (true, None::<chrono::DateTime<chrono::Utc>>);
+        let mut wait = |t: chrono::DateTime<chrono::Utc>| until = Some(until.map_or(t, |u| u.min(t)));
         // objects left below `end` in log `x` (one LIST page)
         let held = |x: String, end: u64| async move {
             anyhow::Ok(
                 end.saturating_sub(vlsync_firehose::backfill::first_ordinal(&self.store, &x).await?.unwrap_or(end)),
             )
         };
+        let now = chrono::Utc::now();
+        self.state.lock().dead_due.retain(|x, _| dead.contains(x));
         for x in dead {
             if *budget == 0 {
                 // stopped early: the gauges keep the last full count
                 return Ok(pass);
             }
+            match self.state.lock().dead_due.get(&x).copied() {
+                Some(DeadDue::Fence(t)) if t.is_none_or(|t| now < t) => {
+                    stats.fenced += 1;
+                    if let Some(t) = t {
+                        wait(t);
+                    }
+                    continue;
+                }
+                Some(DeadDue::Pruning { at, segments, listed }) if now < at && listed.elapsed() < RELIST_EVERY => {
+                    stats.pruning += 1;
+                    stats.segments += segments;
+                    wait(at);
+                    continue;
+                }
+                _ => {}
+            }
+            self.state.lock().dead_due.remove(&x);
             if self.state.lock().retired.contains(&x) {
                 match self.delete_fence(&x, &mut known, budget).await? {
                     FenceDue::Deleted => pass.objects += 1,
                     FenceDue::At(t) => {
                         stats.fenced += 1;
-                        until = Some(until.map_or(t, |u| u.min(t)));
+                        wait(t);
+                        self.state.lock().dead_due.insert(x, DeadDue::Fence(Some(t)));
                     }
-                    FenceDue::Never => stats.fenced += 1,
+                    FenceDue::Never => {
+                        stats.fenced += 1;
+                        self.state.lock().dead_due.insert(x, DeadDue::Fence(None));
+                    }
                     FenceDue::Held => {
                         stats.fenced += 1;
                         quiet = false;
@@ -405,9 +460,6 @@ impl Retention {
                 }
                 continue;
             }
-            // anything else may change by the next pass (fenced, opened by
-            // a successor, pruned, retired)
-            quiet = false;
             let cached = self.state.lock().fenced.get(&x).copied();
             let fence = match cached {
                 Some(f) => f,
@@ -415,6 +467,7 @@ impl Retention {
                     // not fenced: its owner may be alive but unseen (joining),
                     // or dead with its shards not taken yet
                     (end, false) => {
+                        quiet = false;
                         stats.unfenced += 1;
                         stats.segments += held(x.clone(), end).await?;
                         continue;
@@ -428,16 +481,19 @@ impl Retention {
             let (assigns, reports) = load_known(&self.store, &mut known).await?;
             if let Some(s) = needed_by(&x, assigns, reports) {
                 tracing::debug!(log = %x, shard = s.0, "dead log still needed for replay");
+                quiet = false;
                 stats.needed += 1;
                 stats.segments += held(x.clone(), fence).await?;
                 continue;
             }
-            let (n, _) = self.prune(&x, fence, cutoff, budget, "dead").await?;
+            let listed = std::time::Instant::now();
+            let (n, due, first) = self.prune(&x, fence, cutoff, budget, "dead").await?;
             pass.objects += n.objects;
             pass.bytes += n.bytes;
-            // everything below the fence gone: retire it
-            let first = vlsync_firehose::backfill::first_ordinal(&self.store, &x).await?;
+            // everything below the fence gone: retire it (its fence's age is
+            // learned next pass)
             if first == Some(fence) {
+                quiet = false;
                 let n = self.retire(&x, fence, cutoff, budget).await?;
                 pass.objects += n.objects;
                 pass.bytes += n.bytes;
@@ -445,8 +501,16 @@ impl Retention {
                     stats.fenced += 1;
                 }
             } else {
+                let segments = fence.saturating_sub(first.unwrap_or(fence));
                 stats.pruning += 1;
-                stats.segments += fence.saturating_sub(first.unwrap_or(fence));
+                stats.segments += segments;
+                match due {
+                    Due::At(at) => {
+                        wait(at);
+                        self.state.lock().dead_due.insert(x, DeadDue::Pruning { at, segments, listed });
+                    }
+                    Due::Floor(_) | Due::Now => quiet = false,
+                }
             }
         }
         stats.export();
@@ -986,6 +1050,116 @@ mod tests {
         r.pass().await.unwrap();
         assert_eq!(r.state.lock().dead_next.as_ref().unwrap().2, at, "skipped");
         assert_eq!(ordinals(&store, "D").await, vec![1]);
+    }
+
+    /// The LISTs a leader's passes make with dead logs around, as on a
+    /// node restarted a few times a day: retired logs waiting for their
+    /// fences and dead logs being pruned, their next segment inside the
+    /// window. A pass used to LIST `log/`, every retired log, every pruning
+    /// log twice, `assign/` and `retain/` (prod, 35 retired and 3 pruning:
+    /// 44 LISTs a minute). Now nothing until a log comes due, and then only
+    /// that log.
+    #[tokio::test]
+    async fn dead_log_passes_list_only_what_is_due() {
+        let (store, n) = crate::reshard_gc::tests::counting_store("rl");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ncfg = NodeLogConfig {
+            log_id: "B".into(),
+            writer: 2,
+            max_segment_bytes: 1 << 20,
+            hedge_after: Duration::from_secs(10),
+            lease_ok: None,
+        };
+        let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
+        let fence = || PutPayload::from_bytes(fence_object("B"));
+        // R*: pruned down to their fences; P*: three segments, then the fence
+        for i in 0..5 {
+            store.raw.put(&segment_path(&store, &format!("R{i}"), 0), fence()).await.unwrap();
+        }
+        for i in 0..3 {
+            let x = format!("P{i}");
+            for ord in 0..3 {
+                put_seg(&store, &x, ord, ord, ShardId(i), 1, 100 * i as i64 + ord as i64).await;
+            }
+            store.raw.put(&segment_path(&store, &x, 3), fence()).await.unwrap();
+        }
+        let window = Duration::from_secs(3);
+        let r = Retention::new(
+            store.clone(),
+            log.clone(),
+            Config { fence_retention: Some(Duration::from_secs(3600)), ..cfg(window) },
+            members(&["B"], true),
+        );
+        let written = std::time::Instant::now();
+        let dead = |r: &Retention| r.state.lock().dead.unwrap();
+        // the first pass fences (from the store) and retires R*; the second
+        // learns their fences' ages
+        n.take();
+        r.pass().await.unwrap();
+        r.pass().await.unwrap();
+        assert!(r.state.lock().dead_next.is_some(), "every dead log waits for a known time");
+        assert_eq!(dead(&r), DeadLogs { fenced: 5, pruning: 3, segments: 9, ..Default::default() });
+        n.take();
+        for _ in 0..20 {
+            r.pass().await.unwrap();
+        }
+        assert_eq!(n.take().0, 0, "idle passes: no LISTs");
+        // the rescan when the live set changes LISTs only `log/`
+        r.state.lock().dead_next.as_mut().unwrap().0.insert("gone".into());
+        r.pass().await.unwrap();
+        assert_eq!(n.take().0, 1);
+        assert_eq!(dead(&r), DeadLogs { fenced: 5, pruning: 3, segments: 9, ..Default::default() });
+        // P*'s segments age out: one pass prunes and retires them (`log/`,
+        // each P twice, `assign/` and `retain/`, and our own empty log, due
+        // a window after the last look), the next learns their fences'
+        // ages, and then it's quiet again
+        let late = window + PRUNE_SLACK.min(window / 72);
+        tokio::time::sleep((late + Duration::from_millis(200)).saturating_sub(written.elapsed())).await;
+        let p = r.pass().await.unwrap();
+        assert_eq!(p.objects, 9);
+        assert_eq!(n.take().0, 1 + 3 * 2 + 2 + 1);
+        r.pass().await.unwrap();
+        assert_eq!(n.take().0, 1 + 3);
+        assert_eq!(dead(&r), DeadLogs { fenced: 8, ..Default::default() });
+        for _ in 0..20 {
+            r.pass().await.unwrap();
+        }
+        assert_eq!(n.take().0, 0);
+        // a new leader knows nothing yet: it LISTs everything once
+        r.state.lock().dead_due.clear();
+        r.state.lock().dead_next = None;
+        r.pass().await.unwrap();
+        assert_eq!(n.take().0, 1 + 8);
+        r.pass().await.unwrap();
+        assert_eq!(n.take().0, 0);
+    }
+
+    /// A firehose backfill seeks every log in `log/`, retired ones (just a
+    /// fence) included: one LIST each (it used to be two), plus `log/` and
+    /// one at the end of each live log.
+    #[tokio::test]
+    async fn backfill_lists_a_retired_log_once() {
+        let (store, n) = crate::reshard_gc::tests::counting_store("bf");
+        for i in 0..5 {
+            store
+                .raw
+                .put(&segment_path(&store, &format!("R{i}"), 0), PutPayload::from_bytes(fence_object("B")))
+                .await
+                .unwrap();
+        }
+        for ord in 0..4 {
+            put_seg(&store, "L", ord, ord, ShardId(0), 1, 10 + ord as i64).await;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        n.take();
+        assert_eq!(vlsync_firehose::backfill::backfill(&store, 0, i64::MAX, &tx).await.unwrap(), 13);
+        assert_eq!(n.take().0, 1 + 5 + 2);
+        drop(tx);
+        let mut seqs = Vec::new();
+        while let Some((s, _)) = rx.recv().await {
+            seqs.push(s);
+        }
+        assert_eq!(seqs, vec![10, 11, 12, 13]);
     }
 
     #[test]

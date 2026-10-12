@@ -106,7 +106,7 @@ export const findBucket = (d: RateLimits | undefined, name: string) => (d ? buck
 
 // ---------------------------------------------------------------- editing
 
-function DiffList({ diff }: { diff: [string, string, string][] }) {
+export function DiffList({ diff }: { diff: [string, string, string][] }) {
   return (
     <div className="cxp-diff">
       {diff.map(([what, a, b], i) => (

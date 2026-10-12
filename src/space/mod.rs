@@ -477,12 +477,9 @@ impl Spaces {
             if !space.live() {
                 continue;
             }
-            let prefix = state::space_prefix(state::SPACE_SEQ_FAMILY, &authority, &sid);
-            let desc = slatedb::config::ScanOptions::default().with_order(slatedb::IterationOrder::Descending);
-            let mut it = db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &desc).await?;
-            let Some(last) = it.next().await? else { continue };
-            let Some(space_rev) = rows::seq_rev(&last.key) else { continue };
-            let rows::SeqRow { prev, writer } = rows::SeqRow::decode(&last.value)?;
+            let Some((space_rev, rows::SeqRow { prev, writer })) = newest_seq(db, &authority, &sid).await? else {
+                continue;
+            };
             let Some(w) = db.get(state::space_writer_key(&authority, &sid, &writer)).await? else { continue };
             let w = rows::WriterRow::decode(&w)?;
             self.fanout.notify(fanout::Job {
@@ -494,6 +491,7 @@ impl Spaces {
                 hash: w.hash,
                 seq: repo::Sequenced { space_rev, prev },
                 epoch,
+                catch_up: true,
             });
             sent += 1;
         }
@@ -520,6 +518,30 @@ impl Spaces {
         }
         Ok(n)
     }
+}
+
+/// A space's newest spaceRev and its `sQ` row (None: nothing sequenced).
+async fn newest_seq(
+    db: &slatedb::Db,
+    authority: &str,
+    sid: &crate::state::SpaceId,
+) -> anyhow::Result<Option<(vlatproto::tid::Tid, rows::SeqRow)>> {
+    let prefix = crate::state::space_prefix(crate::state::SPACE_SEQ_FAMILY, authority, sid);
+    let desc = slatedb::config::ScanOptions::default().with_order(slatedb::IterationOrder::Descending);
+    let mut it = db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &desc).await?;
+    let Some(last) = it.next().await? else { return Ok(None) };
+    let Some(space_rev) = rows::seq_rev(&last.key) else { return Ok(None) };
+    Ok(Some((space_rev, rows::SeqRow::decode(&last.value)?)))
+}
+
+/// The newest spaceRev `authority` sequenced in `sid`, from its shard here.
+pub(crate) async fn newest_space_rev(
+    app: &crate::xrpc::App,
+    authority: &str,
+    sid: &crate::state::SpaceId,
+) -> anyhow::Result<Option<vlatproto::tid::Tid>> {
+    let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    Ok(newest_seq(&p.db, authority, sid).await?.map(|(t, _)| t))
 }
 
 impl Default for Spaces {

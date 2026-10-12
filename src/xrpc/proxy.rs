@@ -133,6 +133,10 @@ struct Target<'a> {
     service_id: Cow<'a, str>,
     /// Operator-configured: exempt from SSRF checks.
     trusted: bool,
+    /// `--appview-override`: where a GET it doesn't implement goes instead.
+    fallback: Option<Box<Target<'a>>>,
+    /// `--appview-override` (its own metrics label).
+    overridden: bool,
 }
 
 impl Target<'_> {
@@ -158,7 +162,33 @@ fn configured<'a>(svc: &'a Option<(String, String)>, service_id: &'static str) -
         did: Cow::Borrowed(did),
         service_id: Cow::Borrowed(service_id),
         trusted: true,
+        fallback: None,
+        overridden: false,
     })
+}
+
+/// The AppView override (`crate::appview_override`): `target` itself unless
+/// it is the default AppView and the override names this account and
+/// method. The override's URL and DID come only from operator config (flags
+/// or the admin-written bucket object), so it is trusted like `--appview`.
+fn appview_override<'a>(app: &'a App, target: Target<'a>, did: &str, lxm: &str) -> Target<'a> {
+    let Some(o) = app.appview_override.active().filter(|o| o.applies(did, lxm)) else {
+        return target;
+    };
+    let default_appview = target.trusted
+        && target.service_id == "bsky_appview"
+        && app.config.appview.as_ref().is_some_and(|(url, av)| *url == target.url && *av == target.did);
+    if !default_appview {
+        return target;
+    }
+    Target {
+        url: Cow::Owned(o.url.clone()),
+        did: Cow::Owned(o.did.clone()),
+        service_id: Cow::Borrowed("bsky_appview"),
+        trusted: true,
+        fallback: o.fallback.then(|| Box::new(target)),
+        overridden: true,
+    }
 }
 
 /// For a method without an atproto-proxy header. Ok(None): not proxyable.
@@ -203,6 +233,8 @@ async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<
         did: Cow::Owned(did.into()),
         service_id: Cow::Owned(service_id.into()),
         trusted: false,
+        fallback: None,
+        overridden: false,
     })
 }
 
@@ -747,8 +779,54 @@ fn passthrough(parts: axum::http::response::Parts, body: Body) -> Response {
     out
 }
 
-/// The upstream response, whatever its status.
+/// The upstream response, whatever its status. A GET the AppView override
+/// doesn't implement is sent to its fallback.
 async fn send(
+    app: &App,
+    target: &Target<'_>,
+    f: Forward<'_>,
+    acct: Option<&CachedAcct>,
+) -> XResult<(axum::http::response::Parts, Body)> {
+    let Some(default) = target.fallback.as_deref().filter(|_| f.method == Method::GET && f.body.is_none()) else {
+        return send_to(app, target, f, acct).await;
+    };
+    let again = Forward { method: Method::GET, body: None, accept_encoding: f.accept_encoding.clone(), ..f };
+    let (parts, body) = send_to(app, target, f, acct).await?;
+    let status = parts.status;
+    if let Some(r) = implemented(parts, body).await {
+        return Ok(r);
+    }
+    crate::metrics::APPVIEW_OVERRIDE_FALLBACKS.with_label_values(&[status.as_str()]).inc();
+    tracing::debug!(lxm = again.lxm, "appview override: method not implemented there, sent to the default");
+    send_to(app, default, again, acct).await
+}
+
+/// None when the upstream doesn't implement the method (501, or 400
+/// `MethodNotImplemented`); else its response, with the body intact.
+async fn implemented(parts: axum::http::response::Parts, body: Body) -> Option<(axum::http::response::Parts, Body)> {
+    match parts.status.as_u16() {
+        501 => None,
+        400 => {
+            let json =
+                parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_none_or(is_json_content_type);
+            let Some(codings) = read_after_write::codings(&parts.headers).filter(|_| json) else {
+                return Some((parts, body));
+            };
+            // an error body past the cap loses its name either way (UpstreamError::read)
+            let Ok(buf) = axum::body::to_bytes(body, MAX_ERROR_BYTES).await else {
+                return Some((parts, Body::empty()));
+            };
+            let unimplemented = read_after_write::decode(buf.clone(), &codings, MAX_ERROR_BYTES)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<J>(&b).ok())
+                .is_some_and(|v| v.get("error").and_then(|e| e.as_str()) == Some("MethodNotImplemented"));
+            (!unimplemented).then(|| (parts, Body::from(buf)))
+        }
+        _ => Some((parts, body)),
+    }
+}
+
+async fn send_to(
     app: &App,
     target: &Target<'_>,
     f: Forward<'_>,
@@ -813,7 +891,8 @@ async fn send(
             }
         }
     };
-    observe_upstream(&target.service_id, started, sent.as_ref().ok().map(|(p, _)| p.status), report);
+    let service = if target.overridden { "appview_override" } else { &target.service_id };
+    observe_upstream(service, started, sent.as_ref().ok().map(|(p, _)| p.status), report);
     sent.map_err(|e| {
         tracing::warn!(endpoint = %target.url, path = f.path_and_query, "proxy upstream error: {e}");
         upstream_failure("Upstream service unreachable")
@@ -1030,10 +1109,13 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
         Some(t) => t,
         None => parse_proxy_header(app, header.as_deref().expect("no default without a header")).await?,
     };
-    creds.need_rpc(&lxm, &target.scope_aud())?;
+    // scopes name the AppView the client asked for, not an override
+    let scope_aud = target.scope_aud();
+    creds.need_rpc(&lxm, &scope_aud)?;
     if matches!(creds, Credentials::AppPassword { privileged: false, .. }) && lxm_in(PRIVILEGED_METHODS, &lxm) {
         return Err(XrpcError::bad("InvalidToken", "Bad token method"));
     }
+    let target = appview_override(app, target, did, &lxm);
     let acct = check_takedown(app, did, lxm == APPEAL_ACTIONED_SUBJECT).await?;
     *slot = Some(admit(did)?);
 
@@ -1046,7 +1128,7 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
     if fwd.method == Method::GET && app.config.appview.is_some() {
         if lxm == GET_FEED {
             // the token is for the feed generator, which the AppView calls with it
-            creds.need_rpc(GET_FEED_SKELETON, &target.scope_aud())?;
+            creds.need_rpc(GET_FEED_SKELETON, &scope_aud)?;
             feed_did = feed_generator_did(app, pq).await?;
             fwd.aud = Some(&feed_did);
             fwd.lxm = GET_FEED_SKELETON;

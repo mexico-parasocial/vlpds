@@ -301,29 +301,7 @@ pub(crate) fn verify_sig_malleable(multibase: &str, msg: &[u8], sig: &[u8]) -> R
 }
 
 fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) -> Result<bool, String> {
-    let raw = bs58::decode(multibase.strip_prefix('z').ok_or("unsupported multibase")?)
-        .into_vec()
-        .map_err(|e| e.to_string())?;
-    match raw.as_slice() {
-        [0xe7, 0x01, key @ ..] => if allow_high_s {
-            vlatproto::crypto::verify_k256_malleable(key, msg, sig)
-        } else {
-            vlatproto::crypto::verify_k256(key, msg, sig)
-        }
-        .map_err(|e| e.to_string()),
-        [0x80, 0x24, key @ ..] => {
-            use p256::ecdsa::signature::Verifier;
-            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key).map_err(|e| e.to_string())?;
-            let s = p256::ecdsa::Signature::from_slice(sig).map_err(|e| e.to_string())?;
-            // `p256` itself accepts both forms; a different low-S form = it was high-S
-            let low = s.normalize_s();
-            if low != s && !allow_high_s {
-                return Ok(false);
-            }
-            Ok(vk.verify(msg, &low).is_ok())
-        }
-        _ => Err("unsupported key type".into()),
-    }
+    vlatproto::crypto::verify_multikey(multibase, msg, sig, allow_high_s)
 }
 
 async fn permission_set_cached(app: &Arc<App>, nsid: &str) -> Result<J, String> {

@@ -11,6 +11,7 @@ import { useAdminUnlock } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { basic, call, setAdminOperator, setAdminToken, XrpcError } from '../../lib/xrpc'
 import { Accounts } from './Accounts'
+import { AppviewOverride } from './AppviewOverride'
 import { Cluster } from './Cluster'
 import './clusterDetails'
 import { Config } from './Config'
@@ -76,6 +77,9 @@ function route(p: string): Route {
       return { section: S.spaces, page: <SpaceByUri />, crumbs: crumb(S.spaces, 'Space') }
     case '/admin/mail':
       return { section: S.mail, page: <Mail /> }
+    case '/admin/appview':
+    case '/admin/appview-override':
+      return { section: S.appview, page: <AppviewOverride /> }
     case '/admin/config':
       return { section: S.config, page: <Config /> }
   }

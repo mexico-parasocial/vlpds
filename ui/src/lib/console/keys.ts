@@ -34,6 +34,8 @@ export const K = {
   // limits, mail, relays, domains, invites
   lockouts: ['lockouts'] as const,
   ratelimits: ['ratelimits'] as const,
+  appviewOverride: ['appviewOverride'] as const,
+  appviewOverrideCfg: ['appviewOverride', 'cfg'] as const,
   mail: (p?: { limit?: number; did?: string }) => (p ? (['mail', p] as const) : (['mail'] as const)),
   subscribers: ['subscribers'] as const,
   crawlers: ['crawlers'] as const,

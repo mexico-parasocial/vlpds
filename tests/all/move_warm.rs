@@ -35,7 +35,8 @@ async fn prewarmed_handback_serves_moved_repos() {
         .await
         .expect("a owns every shard");
     let mut accts = Vec::new();
-    for _ in 0..6 {
+    // each lands on b's half with p = 1/2: with 6, none did 1 run in 64
+    for _ in 0..14 {
         let acct = a.create_account("mw").await;
         for i in 0..5 {
             a.post(&acct, &format!("before {i}")).await;

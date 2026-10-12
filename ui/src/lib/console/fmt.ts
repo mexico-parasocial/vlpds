@@ -83,6 +83,7 @@ export const AUDIT_ACTIONS: Record<string, { label: string; tone: AuditTone }> =
   'crawlers.set': { label: 'Relays changed', tone: 'info' },
   'crawlers.request': { label: 'Crawl requested', tone: 'info' },
   'ratelimits.update': { label: 'Rate limits changed', tone: 'warn' },
+  'appviewOverride.update': { label: 'AppView override changed', tone: 'warn' },
   'domain.add': { label: 'Domain added', tone: 'info' },
   'domain.remove': { label: 'Domain removed', tone: 'err' },
 }

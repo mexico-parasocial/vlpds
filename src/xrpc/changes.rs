@@ -51,8 +51,9 @@ pub const KINDS: &[(&str, &str)] = &[
     ("node", "a node an operator acted on"),
     ("domain", "a handle domain added or removed"),
     ("invite", "`*`: invite codes created, disabled or used"),
-    ("config", "a cluster setting: `ratelimits`, `crawlers` or `featureLevel`"),
+    ("config", "a cluster setting: `ratelimits`, `appview-override`, `crawlers` or `featureLevel`"),
     ("ratelimits", "a node applied a new rate-limit config"),
+    ("appview-override", "a node applied a new AppView override config"),
     ("space", "a space's URI"),
     ("resync", "missed changes: refetch everything"),
 ];
@@ -131,7 +132,11 @@ pub fn from_audit(e: &AuditEntry) -> Vec<(&'static str, String, u64)> {
             "node" => out.push(("node", id, at)),
             "domain" => out.push(("domain", id, at)),
             "config" => {
-                let v = e.detail.as_ref().and_then(|d| d["version"].as_u64()).filter(|_| id == "ratelimits");
+                let v = e
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d["version"].as_u64())
+                    .filter(|_| id == "ratelimits" || id == "appview-override");
                 out.push(("config", id, v.unwrap_or(at)));
             }
             "space" | "spaceRepo" => out.push(("space", s.uri.clone().unwrap_or_default(), at)),

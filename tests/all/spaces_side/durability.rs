@@ -557,20 +557,23 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         (ws.did.clone(), latest(&ws, &space, "survivor writer").await),
     ];
     let t = Instant::now();
-    let fin = loop {
+    loop {
         let repos = list_repos(&auth, &space, &cred).await.unwrap_or_default();
         let rows = by_did(&repos);
         let caught_up = heads.iter().all(|(did, c)| {
             rows.get(did).is_some_and(|r| r["repoRev"] == json!(c.rev) && bytes_field(&r["hash"]) == c.hash)
         });
         if caught_up {
-            break repos;
+            break;
         }
         // the outbox's first retry is 30-60 s out if a send failed mid-move
         assert!(t.elapsed() < Duration::from_secs(90), "the authority never caught up: {repos:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    }
     eprintln!("authority caught up {:?} after the burst", t.elapsed());
+    // listRepos pages by spaceRev, so a listing that raced a late write's
+    // sequencing shows that repo twice; once caught up nothing moves
+    let fin = list_repos(&auth, &space, &cred).await.expect("listRepos once caught up");
 
     // the authority sequenced each (repo, repoRev) once, and spaceRevs only
     // moved forward

@@ -203,7 +203,7 @@ async fn backfilled_events_rebuild_repos() {
 async fn commit_ops_match_rpc_results() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let mut sub = s.subscribe(None).await;
+    let mut sub = s.subscribe_from_now().await;
     let r = s
         .xrpc
         .post(

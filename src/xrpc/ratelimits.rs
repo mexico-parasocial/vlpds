@@ -207,7 +207,7 @@ struct UpdateIn {
 }
 
 /// The caller's address for the audit entry.
-pub struct PeerIp(Option<std::net::IpAddr>);
+pub struct PeerIp(pub Option<std::net::IpAddr>);
 
 impl axum::extract::FromRequestParts<Arc<App>> for PeerIp {
     type Rejection = std::convert::Infallible;

@@ -5,6 +5,7 @@ mod account_stats;
 mod admin;
 pub mod admin_audit;
 mod admin_tools;
+mod appview_override;
 pub mod authn;
 mod blob_quota;
 pub mod blobs;
@@ -131,6 +132,8 @@ pub struct App {
     pub log: Arc<crate::nodelog::NodeLog>,
     pub node: Arc<crate::node::Node>,
     pub ratelimit: Arc<crate::ratelimit::Limiter>,
+    /// `--appview-override` until the bucket's config object says otherwise.
+    pub appview_override: Arc<crate::appview_override::Runtime>,
     pub crawlers: Arc<crawlers::Crawlers>,
     /// Firehose subscribers' reverse DNS and origin AS, for the console.
     pub ptr: Arc<crate::ptr::PtrCache>,
@@ -315,6 +318,7 @@ pub fn router(app: Arc<App>) -> Router {
         })
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
+        .merge(appview_override::routes())
         .merge(firehose_subs::routes())
         .merge(changes::routes())
         .merge(console::routes())
@@ -330,6 +334,7 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
         .fallback(proxy::fallback);
     ratelimits::start(&app);
+    appview_override::start(&app);
     crawlers::start(&app);
     handle_domains::start(&app);
     let r = oauth::with_dpop_layer(r, &app);

@@ -42,5 +42,6 @@ export function auditLinks(e: { action: string; subject?: { kind: string; did?: 
   const did = e.subject?.kind === 'account' ? e.subject.did : undefined
   if (e.action === 'mail.send' && did) return [[`/admin/mail?did=${encodeURIComponent(did)}`, 'Mail log for this account']]
   if (e.action === 'ratelimits.update' && e.detail?.version != null) return [['/admin/limits', `Version ${e.detail.version} in the rate-limit history`]]
+  if (e.action === 'appviewOverride.update' && e.detail?.version != null) return [['/admin/appview', `Version ${e.detail.version} in the AppView override history`]]
   return []
 }

@@ -363,6 +363,18 @@ async fn every_audited_admin_write_names_its_operator() {
                 assert_eq!(e[0]["reason"], "raise for an import");
                 assert_eq!(e[0]["detail"], json!({"version": r["version"], "changes": 1}));
             }
+            "vlpds.admin.updateAppviewOverride" => {
+                let v =
+                    s.xrpc.get("vlpds.admin.getAppviewOverride", &[], &Auth::Admin).await.ok()["configVersion"].clone();
+                let body = json!({
+                    "config": {"methods": ["app.bsky.feed.getTimeline"]},
+                    "ifVersion": v, "note": "methods first, accounts later",
+                });
+                let (r, e) = audited(&s, "appviewOverride.update", 1, "admin", post(&s, nsid, body)).await;
+                assert_eq!(e[0]["subject"], other("config", "appview-override"));
+                assert_eq!(e[0]["reason"], "methods first, accounts later");
+                assert_eq!(e[0]["detail"], json!({"version": r["version"], "changes": 1}));
+            }
             other => panic!("{other} is in AUDITED with no case here: add one"),
         }
     }

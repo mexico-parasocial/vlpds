@@ -985,6 +985,63 @@ async fn shard_open_sends_registrations_a_catch_up() {
     assert_ne!(catch_up["prevSpaceRev"], before["spaceRev"], "{catch_up}");
 }
 
+/// A shard open reads its catch-up while the shard already takes writes,
+/// so a write can be sequenced and forwarded (its lane drained and gone)
+/// before the catch-up reaches the dispatcher. The catch-up is then behind
+/// what the service heard and is dropped: forwards stay in spaceRev order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_behind_a_newer_write_is_not_sent() {
+    let s = spawn().await;
+    let owner = SpaceClient::new(&s, "shbo", OWNER).await;
+    let member = SpaceClient::new(&s, "shbm", ANY).await;
+    let space = owner.create_space(TYPE, "main").await;
+    put_member(&owner, &space, &member.did, true, true).await.ok();
+    let syncer = stub("atproto_space_syncer").await;
+    let cred = owner.credential(&space).await;
+    let reg = json!({"space": space, "service": syncer.service("atproto_space_syncer")});
+    owner.signed_post(&s.url, "com.atproto.space.registerNotify", reg, &cred, &owner.did).await.ok();
+    let notifies = || syncer.calls("/xrpc/com.atproto.space.notifyWrite");
+    let heard = |rev: String| async move {
+        let hit = || notifies().into_iter().find(|n| n.body["repoRev"] == json!(rev));
+        assert!(eventually(Duration::from_secs(10), || async { hit().is_some() }).await, "not forwarded");
+        hit().unwrap().body
+    };
+    member.create_record(&space, COLL, Some("1"), rec("one")).await.ok();
+    let old = heard(head(&member, &space).await).await;
+    member.create_record(&space, COLL, Some("2"), rec("two")).await.ok();
+    let new = heard(head(&member, &space).await).await;
+    let fanout = s.app.spaces.as_ref().unwrap().fanout.clone();
+    wait_until("the lane drains", Duration::from_secs(10), || fanout.lanes() == 0).await;
+    let sent = notifies().len();
+
+    // a catch-up read before the second write sequenced
+    let tid = |v: &J| v.as_str().map(|t| Tid::parse(t).unwrap());
+    fanout.notify(vlpds::space::fanout::Job {
+        authority: owner.did.as_str().into(),
+        uri: space.as_str().into(),
+        sid: vlpds::state::space_id(&space),
+        writer: member.did.clone(),
+        repo_rev: tid(&old["repoRev"]).unwrap(),
+        hash: [7; 32],
+        seq: vlpds::space::repo::Sequenced {
+            space_rev: tid(&old["spaceRev"]).unwrap(),
+            prev: tid(&old["prevSpaceRev"]),
+        },
+        epoch: s.app.partition(&owner.did).ok().expect("local partition").epoch,
+        catch_up: true,
+    });
+    // then a real one: the dispatcher takes a space's jobs in order, so once
+    // it is heard the stale one was dealt with
+    let p = s.app.partition(&owner.did).ok().expect("local partition");
+    let table = std::sync::Arc::downgrade(&s.app.partitions);
+    s.app.spaces.clone().unwrap().spawn_outbox_rescan(table, vec![(p.id, p.db.clone())], false);
+    assert!(eventually(Duration::from_secs(10), || async { notifies().len() > sent }).await, "no catch-up");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let late: Vec<J> = notifies()[sent..].iter().map(|n| n.body.clone()).collect();
+    assert_eq!(late.len(), 1, "only the current catch-up: {late:?}");
+    assert_eq!(late[0]["spaceRev"], new["spaceRev"], "{late:?}");
+}
+
 /// What one authority account can make its writes fan out to is bounded:
 /// its live spaces, its registrations across them, and how fast it makes
 /// spaces and a credential registers (each over its own bucket).
