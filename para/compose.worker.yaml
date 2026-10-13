@@ -1,0 +1,67 @@
+# Máquina worker de AppView (PARA_ROLE=appview-worker en .env). Ver
+# overrides/worker.yaml y docs/ESCALADO.md. Solo levanta bsky, dataplane y un
+# Redis local; el estado sigue en el Postgres de la máquina principal.
+
+name: para-worker
+
+include:
+  - path:
+      - ${WATZAPPA_DIR:-../WatZappa}/docker-compose.prod.yaml
+      - overrides/core.yaml
+      - overrides/worker.yaml
+
+# Las mismas definiciones que compose.yaml; Compose solo exige los archivos de
+# los servicios que levanta (postgres_url y los de bsky).
+secrets:
+  postgres_password:
+    file: ${PARA_SECRETS_DIR:-secrets}/postgres_password
+  postgres_url:
+    file: ${PARA_SECRETS_DIR:-secrets}/postgres_url
+  postgres_url_bridge:
+    file: ${PARA_SECRETS_DIR:-secrets}/postgres_url_bridge
+  s3_access_key_id:
+    file: ${PARA_SECRETS_DIR:-secrets}/s3_access_key_id
+  s3_secret_access_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/s3_secret_access_key
+  pds_jwt_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_jwt_secret
+  pds_dpop_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_dpop_secret
+  pds_admin_password:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_admin_password
+  pds_plc_rotation_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_plc_rotation_key
+  pds_rate_limit_bypass_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_rate_limit_bypass_key
+  bsky_service_signing_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/bsky_service_signing_key
+  bsky_admin_passwords:
+    file: ${PARA_SECRETS_DIR:-secrets}/bsky_admin_passwords
+  ozone_signing_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/ozone_signing_key
+  ozone_admin_password:
+    file: ${PARA_SECRETS_DIR:-secrets}/ozone_admin_password
+  authority_service_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/authority_service_token
+  civic_delegation_resolver_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/civic_delegation_resolver_secret
+  m8_jwt_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_jwt_secret
+  m8_app_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_app_key
+  m8_cookie_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_cookie_secret
+  m8_curp_pepper:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_curp_pepper
+  m8_civic_vote_proof_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_civic_vote_proof_secret
+  m8_issuer_private_jwk:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_issuer_private_jwk
+  m8_issuer_public_jwk:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_issuer_public_jwk
+  matrix_admin_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/matrix_admin_token
+  matrix_appservice_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/matrix_appservice_token
+  matrix_hs_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/matrix_hs_token

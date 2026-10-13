@@ -1,0 +1,175 @@
+---
+# La plataforma PARA en una máquina: repos fijados, .env, secretos como
+# archivos, preflight, `make up` y `make verify`. Repetirlo es seguro: Compose
+# solo recrea lo que cambió.
+
+- name: Revisar el inventario
+  ansible.builtin.assert:
+    that:
+      - para_env.PARA_DOMAIN is defined and para_env.PARA_DOMAIN not in ['', 'example.org']
+      - para_role == 'appview-worker' or (para_env.S3_BUCKET | default('')) | length > 0
+      - (para_env.WATZAPPA_VERSION | default('local')) not in ['local', 'main', 'latest']
+      - para_role == 'appview-worker' or (para_env.MUBEZ_VERSION | default('local')) not in ['local', 'main', 'latest']
+      - para_role == 'primary' or (para_primary_ip | length > 0 and para_private_ip is defined)
+      - para_repos | dict2items | map(attribute='value.url') | select('equalto', '') | list | length == 0
+    fail_msg: >-
+      Faltan datos en el inventario: PARA_DOMAIN, S3_BUCKET y versiones fijadas
+      (sha-<commit> o X.Y.Z) en para_env; para un worker, para_private_ip en
+      él y en la principal; la URL de cada repo en para_repos.
+    quiet: true
+
+- name: Directorio de la plataforma
+  ansible.builtin.file:
+    path: "{{ para_root }}"
+    state: directory
+    mode: "0750"
+
+- name: Llave de despliegue
+  ansible.builtin.copy:
+    content: "{{ para_git_deploy_key }}\n"
+    dest: /root/.ssh/para_deploy_key
+    mode: "0600"
+  when: para_git_deploy_key | length > 0
+  no_log: true
+
+- name: Repos en su revisión fijada
+  ansible.builtin.git:
+    repo: "{{ item.value.url }}"
+    version: "{{ item.value.version }}"
+    dest: "{{ para_root }}/{{ item.key }}"
+    key_file: "{{ '/root/.ssh/para_deploy_key' if para_git_deploy_key | length > 0 else omit }}"
+    accept_newhostkey: true
+    # Si alguien editó algo a mano en el servidor, mejor fallar que pisarlo.
+    force: false
+  loop: "{{ para_repos | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}@{{ item.value.version }}"
+
+- name: .env de la plataforma
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ para_root }}/para-platform/.env"
+    mode: "0640"
+
+- name: Configuración no secreta de los servicios
+  ansible.builtin.template:
+    src: kv.env.j2
+    dest: "{{ para_root }}/para-platform/env/{{ item.name }}.env"
+    mode: "0640"
+  vars:
+    kv: "{{ item.kv }}"
+  loop:
+    - {name: identity, kv: "{{ para_identity_env }}"}
+    - {name: core, kv: "{{ para_core_env }}"}
+  loop_control:
+    label: "env/{{ item.name }}.env"
+  when: item.kv | length > 0
+
+# --- secretos -----------------------------------------------------------------
+
+- name: Directorio de secretos
+  ansible.builtin.file:
+    path: "{{ para_root }}/para-platform/secrets"
+    state: directory
+    owner: root
+    group: "{{ para_secrets_gid }}"
+    mode: "0750"
+
+# Un worker solo recibe lo que bsky usa, y su postgres_url apunta a la
+# principal por la red privada.
+- name: Secretos que van a esta máquina
+  ansible.builtin.set_fact:
+    para_host_secrets: >-
+      {{
+        para_secrets
+        if para_role == 'primary'
+        else (para_secrets
+              | dict2items
+              | selectattr('key', 'in', ['bsky_service_signing_key', 'bsky_admin_passwords',
+                                         'authority_service_token', 'civic_delegation_resolver_secret'])
+              | items2dict)
+             | combine({'postgres_url': 'postgres://' ~ (para_env.POSTGRES_USER | default('pg')) ~ ':'
+                        ~ para_secrets.postgres_password ~ '@' ~ para_primary_ip ~ ':5432/'
+                        ~ (para_env.POSTGRES_DB | default('para'))})
+      }}
+  no_log: true
+
+- name: Un archivo por secreto (root:{{ para_secrets_gid }}, 0440)
+  ansible.builtin.copy:
+    content: "{{ item.value }}"
+    dest: "{{ para_root }}/para-platform/secrets/{{ item.key }}"
+    owner: root
+    group: "{{ para_secrets_gid }}"
+    mode: "0440"
+  loop: "{{ para_host_secrets | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: para_secret_files
+  no_log: true
+
+# postgres_url y postgres_url_bridge salen de postgres_password.
+# Solo deriva: el servidor nunca inventa un secreto que falte (una llave
+# generada aquí no estaría respaldada offline). Si falta uno, preflight falla.
+- name: URLs de Postgres derivadas
+  ansible.builtin.command: ./scripts/secrets.sh derive
+  args:
+    chdir: "{{ para_root }}/para-platform"
+  register: para_derived
+  changed_when: false
+  when: para_role == 'primary'
+
+# --- Matrix (una vez) ---------------------------------------------------------
+
+- name: ¿Ya hay configuración de Synapse?
+  ansible.builtin.stat:
+    path: "{{ para_root }}/WatZappa/deploy/matrix/synapse"
+  register: para_synapse_config
+
+- name: Generar la configuración de Synapse y MAS
+  ansible.builtin.command: make matrix-init
+  args:
+    chdir: "{{ para_root }}/para-platform"
+  when:
+    - para_role == 'primary'
+    - "'matrix' in (para_env.PROFILES | default('core,matrix,identity,edge'))"
+    - not para_synapse_config.stat.exists
+  changed_when: true
+
+# --- levantar -----------------------------------------------------------------
+
+- name: Preflight (configuración, secretos, bucket, DNS)
+  ansible.builtin.command: make preflight
+  args:
+    chdir: "{{ para_root }}/para-platform"
+  register: para_preflight_out
+  changed_when: false
+  failed_when: para_preflight_out.rc != 0
+  when: para_preflight and para_role == 'primary'
+
+# Compose no ve cambios en el contenido de un archivo de secreto: si alguno
+# cambió, se recrean los contenedores para que lo lean.
+- name: make up
+  ansible.builtin.command: >-
+    make up {{ 'UP_ARGS=--force-recreate' if para_secret_files is changed else '' }}
+  args:
+    chdir: "{{ para_root }}/para-platform"
+  register: para_up
+  changed_when: para_up.stdout is search('Recreate|Creat|Start') or para_up.stderr is search('Recreate|Creat|Start')
+
+- name: make verify
+  ansible.builtin.command: make verify
+  args:
+    chdir: "{{ para_root }}/para-platform"
+  register: para_verify
+  changed_when: false
+  failed_when: false
+  when: para_role == 'primary'
+
+- name: Resumen
+  ansible.builtin.debug:
+    msg: "{{ (para_verify.stdout | default('worker: bsky y dataplane arriba')).splitlines() }}"
+
+- name: Fallar si verify encontró problemas
+  ansible.builtin.fail:
+    msg: make verify falló; ver el resumen de arriba y docs/RUNBOOK.md
+  when: para_role == 'primary' and para_verify.rc != 0

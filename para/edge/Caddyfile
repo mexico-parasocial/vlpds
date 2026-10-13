@@ -1,0 +1,50 @@
+# Edge de la plataforma PARA. Es lo único expuesto a internet (80 y 443).
+#
+# Importa el Caddyfile de WatZappa tal cual (PDS, AppView, Ozone, bridge y el
+# dominio raíz) y, según PROFILES, las rutas de Matrix (también de WatZappa) y
+# del broker M8; un perfil apagado monta un archivo vacío en su lugar. Así
+# cada repo sigue siendo dueño de sus rutas y aquí solo se juntan.
+
+{
+	email {$ACME_EMAIL}
+	servers {
+		# Métricas HTTP por host y código; Alloy las lee en :9180 (abajo).
+		metrics
+	}
+	# Los handles de usuario (alice.example.org) obtienen certificado la
+	# primera vez que alguien los visita, solo si el PDS confirma que la
+	# cuenta existe: nadie puede hacer que pidamos certificados al azar.
+	on_demand_tls {
+		ask http://pds:2583/tls-check
+	}
+}
+
+import /etc/caddy/watzappa.Caddyfile
+import /etc/caddy/sites/*.Caddyfile
+
+# ---------------------------------------------------------------------------
+# Handles de usuario: https://<handle>/.well-known/atproto-did responde el DID.
+# Los subdominios de servicio (pds., appview., ...) tienen su propio bloque y
+# le ganan a este comodín.
+# ---------------------------------------------------------------------------
+*{$PARA_HANDLE_DOMAIN} {
+	tls {
+		on_demand
+	}
+
+	handle /.well-known/atproto-did {
+		reverse_proxy pds:2583
+	}
+
+	# El perfil vive en la app web.
+	handle {
+		redir https://{$PARA_DOMAIN}/profile/{host} 302
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Métricas del edge, solo dentro de la red de Compose (el puerto no se publica).
+# ---------------------------------------------------------------------------
+:9180 {
+	metrics /metrics
+}

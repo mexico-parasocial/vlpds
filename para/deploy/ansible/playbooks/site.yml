@@ -1,0 +1,24 @@
+---
+# Provisiona y despliega la plataforma PARA. Idempotente: repetirlo solo
+# cambia lo que cambió (y reinicia solo los servicios afectados).
+#
+#   ansible-playbook -i inventories/<nombre>/hosts.yml playbooks/site.yml --check --diff
+#   ansible-playbook -i inventories/<nombre>/hosts.yml playbooks/site.yml
+#
+# Grupos del inventario:
+#   para              la máquina principal (un solo host): todo el estado
+#   para_appview      workers de AppView (opcional, docs/ESCALADO.md)
+
+- name: Base de cada máquina
+  hosts: para:para_appview
+  become: true
+  roles:
+    - common
+
+- name: Plataforma
+  hosts: para:para_appview
+  become: true
+  # Uno a la vez: la principal primero, luego cada worker.
+  serial: 1
+  roles:
+    - para

@@ -1,0 +1,35 @@
+---
+# Configuración no secreta. Los secretos van en ../para.sops.yaml (cifrado).
+# Lo mismo aplica a los workers (group_vars/para_appview/ puede enlazar aquí).
+
+para_repos:
+  para-platform: {url: "git@github.com:mexico-parasocial/para-platform.git", version: v1.0.0}
+  WatZappa: {url: "https://github.com/mexico-parasocial/WatZappa.git", version: v1.0.0}
+  mubEZ: {url: "git@github.com:mexico-parasocial/mubEZ.git", version: v1.0.0}
+
+para_env:
+  PARA_DOMAIN: example.org
+  ACME_EMAIL: ops@example.org
+  PARA_PROFILE: tiny
+  PROFILES: core,matrix,identity,edge
+  # Las imágenes que CI publicó para esas revisiones (nunca main ni latest).
+  WATZAPPA_VERSION: sha-0000000000000000000000000000000000000000
+  MUBEZ_VERSION: sha-0000000000000000000000000000000000000000
+  S3_ENDPOINT: https://ACCOUNT_ID.r2.cloudflarestorage.com
+  S3_REGION: auto
+  S3_BUCKET: para-example
+  S3_PREFIX: prod
+  # ADMIN_DIDS: did:plc:...
+  # PARA_METRICS_URL: http://100.64.0.5:9090/api/v1/write   (y agrega monitoring a PROFILES)
+  # PARA_LOGS_URL: http://100.64.0.5:3100/loki/api/v1/push
+
+para_identity_env:
+  IDENTITY_ISSUER_DID: did:m8:ine:emisor-001
+  IDENTITY_ISSUER_KEY_ID: ine-ed25519-2026-01
+  CURP_PEPPER_KEY_ID: v1
+
+# para_core_env:
+#   PDS_RECOVERY_DID_KEY: did:key:...
+
+# Únete a la red privada al provisionar (authkey en para.sops.yaml como
+# common_tailscale_authkey).

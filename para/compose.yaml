@@ -1,0 +1,95 @@
+# Plataforma PARA: un solo punto de entrada para levantar todos los servicios.
+#
+# Este archivo NO define servicios propios. Incluye los compose que ya viven en
+# cada repo (WatZappa, mubEZ) y les agrega encima, con archivos de `overrides/`,
+# lo que solo tiene sentido a nivel plataforma: perfiles, cómo se encuentran
+# entre sí y el edge (Caddy) con todas las rutas públicas.
+#
+# Perfiles (se eligen con `make up PROFILES=...`):
+#   core       PDS, AppView (bsky + dataplane), bsync, Ozone, Postgres, Redis,
+#              respaldos al bucket
+#   matrix     Synapse, MAS, para-idp, Element, matrix-bridge
+#   identity   mubEZ (broker M8: identidad, INE, ZKP)
+#   edge       Caddy: HTTPS y rutas públicas de todo lo anterior
+#   monitoring Alloy: métricas y logs hacia tu Prometheus/Loki
+#   local-s3   un S3 local (SeaweedFS) para probar sin nube
+#   web        la app web de PARA (bskyweb) en el dominio raíz
+#
+# Estado durable: Postgres y el bucket (S3_BUCKET/S3_PREFIX). Todo lo demás es
+# caché o se reconstruye; ver docs/RESPALDOS.md.
+#
+# Al estar todo en un mismo proyecto de Compose, los servicios se ven por
+# nombre en la red por defecto del proyecto. La red externa `para-edge` se
+# conserva para que los despliegues antiguos por separado sigan funcionando.
+
+name: para
+
+include:
+  - path:
+      - ${WATZAPPA_DIR:-../WatZappa}/docker-compose.prod.yaml
+      - overrides/core.yaml
+  - path:
+      - ${WATZAPPA_DIR:-../WatZappa}/docker-compose.matrix.yaml
+      - overrides/matrix.yaml
+  - path:
+      - ${MUBEZ_DIR:-../mubEZ}/docker-compose.yml
+      - overrides/identity.yaml
+  - path: ops/compose.yaml
+  - path: web/compose.yaml
+
+# Un archivo por secreto en secrets/ (make secrets; PARA_SECRETS_DIR lo cambia,
+# p. ej. a un tmpfs). Cada servicio declara los
+# que usa y los recibe en /run/secrets/<nombre>; ver docs/CONFIGURACION.md.
+secrets:
+  postgres_password:
+    file: ${PARA_SECRETS_DIR:-secrets}/postgres_password
+  postgres_url:
+    file: ${PARA_SECRETS_DIR:-secrets}/postgres_url
+  postgres_url_bridge:
+    file: ${PARA_SECRETS_DIR:-secrets}/postgres_url_bridge
+  s3_access_key_id:
+    file: ${PARA_SECRETS_DIR:-secrets}/s3_access_key_id
+  s3_secret_access_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/s3_secret_access_key
+  pds_jwt_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_jwt_secret
+  pds_dpop_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_dpop_secret
+  pds_admin_password:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_admin_password
+  pds_plc_rotation_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_plc_rotation_key
+  pds_rate_limit_bypass_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/pds_rate_limit_bypass_key
+  bsky_service_signing_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/bsky_service_signing_key
+  bsky_admin_passwords:
+    file: ${PARA_SECRETS_DIR:-secrets}/bsky_admin_passwords
+  ozone_signing_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/ozone_signing_key
+  ozone_admin_password:
+    file: ${PARA_SECRETS_DIR:-secrets}/ozone_admin_password
+  authority_service_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/authority_service_token
+  civic_delegation_resolver_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/civic_delegation_resolver_secret
+  m8_jwt_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_jwt_secret
+  m8_app_key:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_app_key
+  m8_cookie_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_cookie_secret
+  m8_curp_pepper:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_curp_pepper
+  m8_civic_vote_proof_secret:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_civic_vote_proof_secret
+  m8_issuer_private_jwk:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_issuer_private_jwk
+  m8_issuer_public_jwk:
+    file: ${PARA_SECRETS_DIR:-secrets}/m8_issuer_public_jwk
+  matrix_admin_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/matrix_admin_token
+  matrix_appservice_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/matrix_appservice_token
+  matrix_hs_token:
+    file: ${PARA_SECRETS_DIR:-secrets}/matrix_hs_token

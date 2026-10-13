@@ -1,0 +1,90 @@
+# Se aplica sobre mubEZ/docker-compose.yml.
+#
+# El compose de mubEZ está pensado para desarrollo: fija NODE_ENV=development
+# y trae secretos por defecto en `environment`. En development el broker
+# activa el "dev-token bootstrap", que entrega un token M8 para CUALQUIER DID
+# sin pruebas. Por eso aquí `environment` se reemplaza completo (`!override`)
+# en vez de mezclarse: si se mezclara, los secretos de desarrollo del archivo
+# base le ganarían a todo lo demás.
+#
+# Los secretos son archivos de secrets/ (make secrets). env/identity.env
+# lleva solo configuración no secreta; si trae un secreto que también existe
+# como archivo, el broker se niega a arrancar.
+#
+# El disco del contenedor es solo caché: Litestream replica la base al
+# bucket en ~1 s y, si el disco está vacío (máquina nueva, volumen perdido),
+# la restaura de ahí al arrancar. Nunca levantes dos brokers con el mismo
+# S3_PREFIX: escribirían la misma réplica.
+
+services:
+  mubez:
+    profiles: [identity]
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/mubez:${MUBEZ_VERSION:-local}
+    container_name: !reset null
+    # Solo el edge (Caddy) debe hablar con el broker; no se publica en el host.
+    ports: !reset []
+    group_add: ['${PARA_SECRETS_GID:-10001}']
+    env_file:
+      - path: ${PLATFORM_DIR:?Ejecuta con make desde para-platform}/env/identity.env
+        required: false
+    environment: !override
+      NODE_ENV: production
+      PORT: '8787'
+      HOST: 0.0.0.0
+      DATABASE_PATH: /app/data/mubez.db
+      DATABASE_AUTOMIGRATE: 'true'
+      SECURITY_HEADERS_ENABLED: 'true'
+      RATE_LIMIT_ENABLED: 'true'
+      SERVICE_URL: https://m8.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}
+      # Detrás de Caddy la IP real del cliente llega en X-Forwarded-For; sin
+      # esto el rate limit trataría a todos como la misma IP (la de Caddy).
+      TRUST_PROXY_HEADERS: 'true'
+      PDS_URL: https://pds.${PARA_DOMAIN}
+      PLC_URL: ${PLC_URL:-https://plc.directory}
+      CORS_ORIGIN: ${M8_CORS_ORIGIN:-https://${PARA_DOMAIN}}
+      OAUTH_RETURN_TO_ALLOWLIST: ${M8_OAUTH_RETURN_TO_ALLOWLIST:-im8://oauth/callback,para://m8-auth,https://${PARA_DOMAIN}/m8-auth}
+      # El login explícito de PARA: handoff OAuth sí, dev-token bootstrap no.
+      # Fijado aquí para que ni GrowthBook ni env/identity.env lo reabran.
+      GROWTHBOOK_FEATURE_OVERRIDES: '{"m8:auth:oauth_mobile_handoff":true,"m8:auth:dev_token_bootstrap":false}'
+      JWT_SECRET_FILE: /run/secrets/m8_jwt_secret
+      APP_KEY_FILE: /run/secrets/m8_app_key
+      COOKIE_SECRET_FILE: /run/secrets/m8_cookie_secret
+      CURP_PEPPER_FILE: /run/secrets/m8_curp_pepper
+      CIVIC_VOTE_PROOF_SECRET_FILE: /run/secrets/m8_civic_vote_proof_secret
+      CIVIC_DELEGATION_RESOLVER_SECRET_FILE: /run/secrets/civic_delegation_resolver_secret
+      IDENTITY_ISSUER_PRIVATE_JWK_FILE: /run/secrets/m8_issuer_private_jwk
+      IDENTITY_ISSUER_PUBLIC_JWK_FILE: /run/secrets/m8_issuer_public_jwk
+      # La base vive en el bucket (docker/entrypoint.sh de mubEZ).
+      LITESTREAM_BUCKET: ${S3_BUCKET:?Define S3_BUCKET en .env}
+      LITESTREAM_PATH: ${S3_PREFIX:-prod}/litestream/mubez
+      LITESTREAM_ENDPOINT: ${S3_ENDPOINT:-}
+      LITESTREAM_REGION: ${S3_REGION:-auto}
+      LITESTREAM_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      LITESTREAM_SYNC_INTERVAL: ${LITESTREAM_SYNC_INTERVAL:-1s}
+      LITESTREAM_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key_id
+      LITESTREAM_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_access_key
+    secrets:
+      - m8_jwt_secret
+      - m8_app_key
+      - m8_cookie_secret
+      - m8_curp_pepper
+      - m8_civic_vote_proof_secret
+      - civic_delegation_resolver_secret
+      - m8_issuer_private_jwk
+      - m8_issuer_public_jwk
+      - s3_access_key_id
+      - s3_secret_access_key
+    # Un solo broker por prefijo, siempre (ver arriba).
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: ${MUBEZ_MEM:-512m}
+    stop_grace_period: 30s
+    networks:
+      - default
+      - para-edge
+
+networks:
+  para-edge:
+    external: true
