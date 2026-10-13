@@ -67,16 +67,10 @@ if has_profile monitoring; then
   done
 fi
 
-# El compose anterior dejaba los datos del PDS en un volumen anónimo; un
-# `make up` nuevo arrancaría un PDS vacío al lado. Mejor detenerse.
-project="${COMPOSE_PROJECT_NAME:-para}"
-if has_profile core && ! docker volume inspect "${project}_pds_data" >/dev/null 2>&1; then
-  old_pds="$(docker inspect para-pds --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Type}}:{{.Name}}{{end}}{{end}}' 2>/dev/null || true)"
-  case "$old_pds" in
-    volume:*) fail "El PDS anterior guarda sus datos en un volumen anónimo (${old_pds#volume:})" \
-                "Cópialos a ${project}_pds_data antes de make up: docs/ACTUALIZACIONES.md, paso 3" ;;
-    *) ok "Sin datos del PDS anterior que migrar" ;;
-  esac
+# vlpds envuelve con la KEK las llaves de firma que guarda en el bucket; una
+# KEK distinta de la que se usó al crear el prefijo no abre esos repos.
+if has_profile core && [ -s "${PARA_SECRETS_DIR:-$HERE/secrets}/vlpds_kek" ] && [ -s "${PARA_SECRETS_DIR:-$HERE/secrets}/vlpds_plc_rotation_key" ]; then
+  ok "vlpds tiene KEK y llave PLC envuelta (respáldalas offline: docs/RESPALDOS.md)"
 fi
 
 if has_profile matrix; then

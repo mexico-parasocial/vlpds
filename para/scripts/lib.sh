@@ -1,7 +1,7 @@
 # shellcheck shell=bash disable=SC2034
 # Funciones compartidas por los scripts de la plataforma (se carga con `.`).
 # Define WATZAPPA_DIR, MUBEZ_DIR, PARA_DIR e IM8_DIR para quien la carga.
-# Espera HERE = raíz de para-platform. Compatible con el bash 3.2 de macOS.
+# Espera HERE = raíz de la plataforma (vlpds/para). Compatible con el bash 3.2 de macOS.
 
 # env_value ARCHIVO LLAVE — valor de LLAVE en un .env, sin comillas.
 env_value() {
@@ -22,9 +22,9 @@ repo_dir() { # repo_dir VAR default
   abs_dir "$v"
 }
 
-WATZAPPA_DIR="$(repo_dir WATZAPPA_DIR ../WatZappa)"
-MUBEZ_DIR="$(repo_dir MUBEZ_DIR ../mubEZ)"
-PARA_DIR="$(repo_dir PARA_DIR ../PARA)"
+WATZAPPA_DIR="$(repo_dir WATZAPPA_DIR ../../WatZappa)"
+MUBEZ_DIR="$(repo_dir MUBEZ_DIR ../../mubEZ)"
+PARA_DIR="$(repo_dir PARA_DIR ../../PARA)"
 IM8_DIR="$(repo_dir IM8_DIR ../../iM8)"
 
 # IP de esta máquina en la red local (la que un teléfono puede alcanzar).

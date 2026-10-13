@@ -2,12 +2,11 @@
 # Dónde vive la plataforma en la máquina.
 para_root: /opt/para
 
-# Los tres repos, cada uno fijado a una revisión (tag o commit). Las imágenes
-# se descargan ya construidas (WATZAPPA_VERSION/MUBEZ_VERSION en para_env);
-# de los repos solo se usan los compose y la configuración.
+# Los repos, cada uno fijado a una revisión (tag o commit). La plataforma vive
+# en el fork de vlpds (vlpds/para). De WatZappa y mubEZ se usan los compose,
+# la configuración y, con WATZAPPA_VERSION=local, el código para construir.
 para_repos:
-  # para-platform todavía no tiene remoto: pon su URL en el inventario.
-  para-platform: {url: "", version: main}
+  vlpds: {url: "https://github.com/mexico-parasocial/vlpds.git", version: para/platform}
   WatZappa: {url: "https://github.com/mexico-parasocial/WatZappa.git", version: main}
   mubEZ: {url: "git@github.com:mexico-parasocial/mubEZ.git", version: main}
 
@@ -15,7 +14,7 @@ para_repos:
 # en el inventario (sops). Vacía = los repos son públicos o ya hay acceso.
 para_git_deploy_key: ""
 
-# Todo lo de para-platform/.env (ver .env.example). PARA_DOMAIN, el bucket y
+# Todo lo de vlpds/para/.env (ver .env.example). PARA_DOMAIN, el bucket y
 # las versiones son obligatorios.
 para_env: {}
 

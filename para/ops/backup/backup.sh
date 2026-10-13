@@ -6,17 +6,17 @@
 #
 # BACKUP_TARGETS elige qué respalda este contenedor:
 #   postgres       pg_dump -Fc de cada base de BACKUP_DATABASES
-#   pds            copia consistente (API de backup de SQLite) de los datos del
-#                  PDS: cuentas, secuenciador y un SQLite + llave por repo
 #   synapse-media  copia incremental del media_store de Synapse
+#
+# vlpds no se respalda aquí: todo su estado ya vive en el bucket
+# (S3_PREFIX/vlpds); protégelo con el versionado del bucket (docs/RESPALDOS.md).
 #
 # En el bucket:
 #   $S3_PREFIX/backups/postgres/<base>/<fecha>.dump
-#   $S3_PREFIX/backups/pds/<fecha>.tar.zst
 #   $S3_PREFIX/synapse/media_store/...
 #
-# Las llaves que no deben vivir en el bucket (rotación PLC, firma de Synapse,
-# emisor M8) NO se respaldan aquí: se guardan offline (docs/RESPALDOS.md).
+# Las llaves que no deben vivir en el bucket (KEK y rotación PLC de vlpds,
+# firma de Synapse, emisor M8) NO se respaldan aquí: se guardan offline (docs/RESPALDOS.md).
 #
 # Expone métricas en :9101/metrics para Alloy (ParaBackupStale,
 # ParaBackupFailing en ops/alerts.yml).
@@ -29,8 +29,8 @@ set -eu -o pipefail
 
 : "${S3_BUCKET:?falta S3_BUCKET}"
 : "${S3_PREFIX:?falta S3_PREFIX}"
-BACKUP_TARGETS="${BACKUP_TARGETS:-postgres pds}"
-BACKUP_DATABASES="${BACKUP_DATABASES:-para matrix mas bridge}"
+BACKUP_TARGETS="${BACKUP_TARGETS:-postgres}"
+BACKUP_DATABASES="${BACKUP_DATABASES:-para relay matrix mas bridge}"
 BACKUP_INTERVAL="${BACKUP_INTERVAL:-6h}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-14d}"
 METRICS_DIR=/srv/metrics
@@ -108,40 +108,6 @@ backup_postgres() {
     fi
   done
   rclone delete --min-age "$BACKUP_RETENTION" "$DEST/postgres"
-}
-
-backup_pds() {
-  src=/sources/pds
-  [ -d "$src" ] || { log "pds: no hay $src, se omite"; return 0; }
-  tmp="$(mktemp -d /tmp/pds.XXXXXX)"
-  # La API de backup de SQLite da una copia consistente aunque el PDS esté
-  # escribiendo. Los -wal/-shm no hacen falta en la copia; el resto (las
-  # llaves por repo) se copia tal cual.
-  if ! (cd "$src" && find . -type f) | while read -r f; do
-    case "$f" in
-      *-wal|*-shm) continue ;;
-    esac
-    mkdir -p "$tmp/$(dirname "$f")" || exit 1
-    case "$f" in
-      *.sqlite) sqlite3 "$src/$f" ".backup '$tmp/$f'" || exit 1 ;;
-      *) cp -p "$src/$f" "$tmp/$f" || exit 1 ;;
-    esac
-  done; then
-    rm -rf "$tmp"
-    log "pds: FALLÓ la copia local"
-    return 1
-  fi
-  obj="$DEST/pds/$STAMP.tar.zst"
-  if tar -C "$tmp" -cf - . | zstd -q -T0 | rclone rcat "$obj"; then
-    log "pds: $(du -sh "$tmp" | cut -f1) sin comprimir"
-  else
-    rclone deletefile "$obj" 2>/dev/null || true
-    rm -rf "$tmp"
-    log "pds: FALLÓ"
-    return 1
-  fi
-  rm -rf "$tmp"
-  rclone delete --min-age "$BACKUP_RETENTION" "$DEST/pds"
 }
 
 backup_synapse_media() {

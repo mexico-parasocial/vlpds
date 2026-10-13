@@ -6,6 +6,7 @@
 #   matrix  Synapse. Exige collation C, y eso solo se fija al crear la base.
 #   mas     Matrix Authentication Service.
 #   bridge  matrix-bridge.
+#   relay   el relay de indigo (hosts, cuentas y cursores).
 set -eu
 
 run_psql() {
@@ -25,3 +26,4 @@ create_db() { # create_db NOMBRE [OPCIONES...]
 create_db "${MATRIX_DB_NAME:-matrix}" ENCODING "'UTF8'" LC_COLLATE "'C'" LC_CTYPE "'C'" TEMPLATE template0
 create_db mas
 create_db bridge
+create_db relay

@@ -5,7 +5,7 @@
 #   1. Scripts: sintaxis con el bash 3.2 de macOS y shellcheck.
 #   2. Compose: la configuración final con .env.example y secretos de prueba,
 #      en los dos perfiles de tamaño.
-#   3. Caddyfile del edge (con el de WatZappa importado).
+#   3. Caddyfile del edge, con y sin los sitios de cada perfil.
 #   4. Alertas (promtool) y configuración de Alloy.
 #   5. Ansible: sintaxis de los playbooks y ansible-lint.
 
@@ -29,11 +29,11 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/para-check.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 section "Scripts"
-for f in scripts/*.sh ops/backup/*.sh ops/postgres/init/*.sh; do
+for f in scripts/*.sh dev/*.sh matrix/*.sh runtime/*.sh ops/backup/*.sh ops/postgres/init/*.sh; do
   run "sintaxis $f" /bin/bash -n "$f"
 done
 run "shellcheck" docker run --rm -v "$HERE:/w:ro" -w /w koalaman/shellcheck:v0.10.0 -S warning -x \
-  scripts/*.sh ops/backup/*.sh ops/postgres/init/*.sh
+  scripts/*.sh dev/*.sh matrix/*.sh runtime/*.sh ops/backup/*.sh ops/postgres/init/*.sh
 
 section "Compose"
 mkdir -p "$TMP/secrets"
@@ -55,12 +55,11 @@ caddy_validate() { # caddy_validate DESCRIPCIÓN SITIO_MATRIX SITIO_IDENTIDAD MA
     -e PARA_DOMAIN=example.org -e ACME_EMAIL=ops@example.org -e APPVIEW_WORKERS="10.0.0.2:2584" \
     -e PARA_HANDLE_DOMAIN=.example.org -e MATRIX_SERVER_NAME=matrix.example.org -e PARA_ROOT_HANDLER="$4" \
     -v "$HERE/edge/Caddyfile:/etc/caddy/Caddyfile:ro" \
-    -v "$WATZAPPA_DIR/services/caddy/Caddyfile.prod:/etc/caddy/watzappa.Caddyfile:ro" \
     -v "$2:/etc/caddy/sites/matrix.Caddyfile:ro" -v "$3:/etc/caddy/sites/identity.Caddyfile:ro" \
-    caddy:2.8.4 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+    caddy:2.10.2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 }
 caddy_validate "caddy validate: todos los perfiles y app web" \
-  "$WATZAPPA_DIR/services/caddy/Caddyfile.matrix.prod" "$HERE/edge/sites/identity.Caddyfile" "reverse_proxy web:8100"
+  "$HERE/edge/sites/matrix.Caddyfile" "$HERE/edge/sites/identity.Caddyfile" "reverse_proxy web:8100"
 caddy_validate "caddy validate: solo core (perfiles apagados, raíz 404)" \
   "$HERE/edge/sites/empty.Caddyfile" "$HERE/edge/sites/empty.Caddyfile" 'respond "Not Found" 404'
 

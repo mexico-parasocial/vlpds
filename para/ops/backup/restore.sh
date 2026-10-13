@@ -1,17 +1,16 @@
 #!/bin/sh
 # Restaura desde el bucket lo que backup.sh respaldó.
 #
-#   restore.sh list [postgres/<base>|pds]
+#   restore.sh list [postgres/<base>]
 #   restore.sh postgres <base> [<fecha>|latest] [--force]
-#   restore.sh pds [<fecha>|latest] [--force]
 #   restore.sh synapse-media          (con el volumen de Synapse en /restore/synapse)
 #
 # Se usa con `make restore ARGS="..."` (ver docs/RESPALDOS.md), que corre este
 # script en el contenedor de respaldos. Antes de restaurar, detén los
 # servicios que escriben en lo que vas a reemplazar.
 #
-# Sin --force se niega a pisar datos: una base con tablas o un directorio del
-# PDS que no está vacío.
+# Sin --force se niega a pisar una base con tablas. vlpds se recupera del
+# bucket mismo, no de aquí (docs/RESPALDOS.md).
 
 # shellcheck disable=SC3040  # el sh de la imagen (busybox ash) sí tiene pipefail
 set -eu -o pipefail
@@ -71,23 +70,6 @@ case "${1:-}" in
     echo "restore: postgres/$db/$obj -> $db"
     rclone cat "$SRC/postgres/$db/$obj" |
       pg_restore -h "${PGHOST:-postgres}" -U "${PGUSER:-pg}" -d "$db" --clean --if-exists --no-owner
-    echo "restore: listo"
-    ;;
-
-  pds)
-    when="${2:-latest}"; [ "$when" = --force ] && when=latest
-    obj="$(pick pds "$when" .tar.zst)"
-    [ -n "$obj" ] || { echo "restore: no hay respaldos del PDS" >&2; exit 1; }
-    dst=/sources/pds
-    if [ -n "$(ls -A "$dst" 2>/dev/null)" ] && [ "$force" = 0 ]; then
-      echo "restore: $dst no está vacío. Detén el PDS (make stop S=pds) y repite con --force." >&2
-      exit 1
-    fi
-    echo "restore: pds/$obj -> $dst"
-    find "$dst" -mindepth 1 -delete
-    rclone cat "$SRC/pds/$obj" | zstd -dq | tar -C "$dst" -xf -
-    # El PDS corre como node (uid 1000) en su imagen.
-    chown -R 1000:1000 "$dst"
     echo "restore: listo"
     ;;
 

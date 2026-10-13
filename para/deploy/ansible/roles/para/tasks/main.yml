@@ -48,13 +48,13 @@
 - name: .env de la plataforma
   ansible.builtin.template:
     src: env.j2
-    dest: "{{ para_root }}/para-platform/.env"
+    dest: "{{ para_root }}/vlpds/para/.env"
     mode: "0640"
 
 - name: Configuración no secreta de los servicios
   ansible.builtin.template:
     src: kv.env.j2
-    dest: "{{ para_root }}/para-platform/env/{{ item.name }}.env"
+    dest: "{{ para_root }}/vlpds/para/env/{{ item.name }}.env"
     mode: "0640"
   vars:
     kv: "{{ item.kv }}"
@@ -69,7 +69,7 @@
 
 - name: Directorio de secretos
   ansible.builtin.file:
-    path: "{{ para_root }}/para-platform/secrets"
+    path: "{{ para_root }}/vlpds/para/secrets"
     state: directory
     owner: root
     group: "{{ para_secrets_gid }}"
@@ -97,7 +97,7 @@
 - name: Un archivo por secreto (root:{{ para_secrets_gid }}, 0440)
   ansible.builtin.copy:
     content: "{{ item.value }}"
-    dest: "{{ para_root }}/para-platform/secrets/{{ item.key }}"
+    dest: "{{ para_root }}/vlpds/para/secrets/{{ item.key }}"
     owner: root
     group: "{{ para_secrets_gid }}"
     mode: "0440"
@@ -113,7 +113,7 @@
 - name: URLs de Postgres derivadas
   ansible.builtin.command: ./scripts/secrets.sh derive
   args:
-    chdir: "{{ para_root }}/para-platform"
+    chdir: "{{ para_root }}/vlpds/para"
   register: para_derived
   changed_when: false
   when: para_role == 'primary'
@@ -128,7 +128,7 @@
 - name: Generar la configuración de Synapse y MAS
   ansible.builtin.command: make matrix-init
   args:
-    chdir: "{{ para_root }}/para-platform"
+    chdir: "{{ para_root }}/vlpds/para"
   when:
     - para_role == 'primary'
     - "'matrix' in (para_env.PROFILES | default('core,matrix,identity,edge'))"
@@ -140,7 +140,7 @@
 - name: Preflight (configuración, secretos, bucket, DNS)
   ansible.builtin.command: make preflight
   args:
-    chdir: "{{ para_root }}/para-platform"
+    chdir: "{{ para_root }}/vlpds/para"
   register: para_preflight_out
   changed_when: false
   failed_when: para_preflight_out.rc != 0
@@ -152,14 +152,14 @@
   ansible.builtin.command: >-
     make up {{ 'UP_ARGS=--force-recreate' if para_secret_files is changed else '' }}
   args:
-    chdir: "{{ para_root }}/para-platform"
+    chdir: "{{ para_root }}/vlpds/para"
   register: para_up
   changed_when: para_up.stdout is search('Recreate|Creat|Start') or para_up.stderr is search('Recreate|Creat|Start')
 
 - name: make verify
   ansible.builtin.command: make verify
   args:
-    chdir: "{{ para_root }}/para-platform"
+    chdir: "{{ para_root }}/vlpds/para"
   register: para_verify
   changed_when: false
   failed_when: false

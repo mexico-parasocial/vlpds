@@ -22,7 +22,7 @@ case "$d" in ''|example.org) echo "Define PARA_DOMAIN en .env" >&2; exit 2 ;; es
 appview_did="$(cfg BSKY_SERVER_DID)"; appview_did="${appview_did:-did:web:appview.$d}"
 
 cat <<ENV
-# App PARA para https://$d (generado por para-platform: make app-env)
+# App PARA para https://$d (generado por vlpds/para: make app-env)
 EXPO_PUBLIC_ENV=production
 EXPO_PUBLIC_DEFAULT_SERVICE=https://pds.$d
 EXPO_PUBLIC_BLUESKY_PROXY_DID=$appview_did

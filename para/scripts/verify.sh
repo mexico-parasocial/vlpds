@@ -74,18 +74,29 @@ if has_profile edge && [ -n "$DOMAIN" ] && [ "$DOMAIN" != example.org ]; then
     check "App web /matrix-auth" "https://$DOMAIN/matrix-auth"
   fi
   has_profile identity && check "Broker M8" "https://m8.$DOMAIN/v1/health"
-  code="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "https://pds.$DOMAIN/xrpc/com.atproto.admin.getAccountInfos" 2>/dev/null || true)"
-  case "$code" in
-    404) ok "Las rutas de operador del PDS no se ven desde fuera (404)" ;;
-    *) warn "com.atproto.admin.* respondió $code desde esta máquina" "Normal si sales a internet por una IP privada; desde fuera debe ser 404" ;;
-  esac
+  for path in /admin /xrpc/vlpds.admin.getClusterStatus /metrics; do
+    code="$(curl -s -m 8 -o /dev/null -w '%{http_code}' "https://pds.$DOMAIN$path" 2>/dev/null || true)"
+    case "$code" in
+      404) ok "vlpds: $path no se ve desde fuera (404)" ;;
+      *) fail "vlpds: $path respondió $code desde fuera" "El edge debe bloquear las rutas de operador (edge/Caddyfile)" ;;
+    esac
+  done
 fi
 
 if has_profile core; then
   section "Handles de usuario"
-  code="$(compose exec -T pds wget -qO- "http://127.0.0.1:2583/tls-check?domain=pds.$DOMAIN" 2>/dev/null || true)"
-  if [ "$code" = OK ]; then ok "El PDS responde /tls-check (Caddy emite certificados de handles bajo demanda)"
-  else fail "El PDS no responde /tls-check: los handles de usuario no tendrán certificado" "¿La imagen del PDS incluye /tls-check? WATZAPPA_VERSION reciente"; fi
+  code="$(compose exec -T pds curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:2583/tls-check?domain=pds.$DOMAIN" 2>/dev/null || true)"
+  if [ "$code" = 200 ]; then ok "vlpds responde /tls-check (Caddy emite certificados de handles bajo demanda)"
+  else fail "vlpds no responde /tls-check ($code): los handles de usuario no tendrán certificado"; fi
+
+  section "Firehose"
+  hosts="$(compose exec -T relay wget -qO- http://127.0.0.1:2470/xrpc/com.atproto.sync.listHosts 2>/dev/null || true)"
+  if printf '%s' "$hosts" | grep -q "\"hostname\":\"pds.$DOMAIN\""; then
+    ok "El relay sigue a vlpds (pds.$DOMAIN)"
+  else
+    fail "El relay no sigue a pds.$DOMAIN: el AppView y el bridge no reciben nada" \
+      "vlpds se lo pide al arrancar (VLPDS_CRAWLERS); a mano: docs/OPERACIONES.md, \"Relay\""
+  fi
 fi
 
 section "Estado durable"

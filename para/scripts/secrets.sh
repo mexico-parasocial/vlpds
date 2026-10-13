@@ -30,6 +30,7 @@ abs_dir() { (cd "$HERE" && cd "$1" 2>/dev/null && pwd) || echo "$1"; }
 
 # nombre|tipo|offline|descripción|perfil que lo usa
 #   tipo: hex (openssl rand -hex 32), derived (se calcula), jwk (par Ed25519),
+#         wrapped (llave PLC nueva, envuelta con la KEK por la imagen de vlpds),
 #         provided (lo da un tercero: el proveedor del bucket, Synapse)
 #   offline: yes = no vive en el bucket y perderlo no tiene arreglo; respáldalo
 #            fuera de la máquina (docs/RESPALDOS.md)
@@ -38,15 +39,19 @@ SPEC='
 postgres_password|hex|no|Contraseña de Postgres (usuario POSTGRES_USER)|core
 postgres_url|derived|no|URL de Postgres para AppView, dataplane, bsync y Ozone|core
 postgres_url_bridge|derived|no|URL de Postgres (base bridge) para el matrix-bridge|matrix
-s3_access_key_id|provided|no|Llave del bucket (PDS, mubEZ/Litestream, respaldos)|core
+postgres_url_relay|derived|no|URL de Postgres (base relay) para el relay|core
+s3_access_key_id|provided|no|Llave del bucket (vlpds, mubEZ/Litestream, respaldos)|core
 s3_secret_access_key|provided|no|Secreto del bucket|core
-pds_jwt_secret|hex|no|PDS: firma de sesiones|core
-pds_dpop_secret|hex|no|PDS: nonces DPoP de OAuth|core
-pds_admin_password|hex|no|PDS: contraseña de administrador|core
-pds_plc_rotation_key|hex|yes|PDS: llave de rotación PLC (k256). Controla los DIDs de todas las cuentas|core
-pds_rate_limit_bypass_key|hex|no|PDS: llave para saltar rate limits (servicios de confianza)|core
+vlpds_jwt_secret|hex|no|vlpds: firma de sesiones|core
+vlpds_admin_token|hex|no|vlpds: token de operador (consola /admin y vlpds.admin.*)|core
+vlpds_internal_token|hex|no|vlpds: token entre nodos (escrituras reenviadas al dueño de un shard)|core
+vlpds_kek|hex|yes|vlpds: KEK, envuelve cada llave de firma de repo. No está en el bucket: sin ella los repos no se pueden firmar|core
+vlpds_plc_rotation_key|wrapped|yes|vlpds: llave de rotación PLC envuelta con la KEK. Controla los DIDs de todas las cuentas|core
+vlpds_rate_limit_bypass_key|hex|no|vlpds: llave para saltar rate limits (servicios de confianza)|core
+relay_admin_password|hex|no|Relay: contraseña de su API de admin (solo red interna)|core
 bsky_service_signing_key|hex|yes|AppView: llave de firma del servicio|core
 bsky_admin_passwords|hex|no|AppView: contraseña de administrador|core
+bsync_api_key|hex|no|Llave con la que el AppView llama a bsync|core
 ozone_signing_key|hex|yes|Ozone: llave de firma de etiquetas de moderación|core
 ozone_admin_password|hex|no|Ozone: contraseña de administrador|core
 authority_service_token|hex|no|Credencial compartida AppView ↔ bridge (autoridad de comunidades)|core
@@ -98,6 +103,7 @@ derive_urls() {
   chmod u+w "$DIR"/postgres_url* 2>/dev/null || true
   write_secret postgres_url "postgres://$user:$pw@postgres:5432/$db"
   write_secret postgres_url_bridge "postgres://$user:$pw@postgres:5432/bridge"
+  write_secret postgres_url_relay "postgres://$user:$pw@postgres:5432/relay"
 }
 
 gen_jwk() {
@@ -112,6 +118,21 @@ gen_jwk() {
   echo "  + m8_issuer_private_jwk, m8_issuer_public_jwk"
 }
 
+VLPDS_IMAGE="${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}"
+
+# wrap_plc_key [HEX]: envuelve con la KEK una llave de rotación PLC (la que
+# se pasa, o una nueva) usando la imagen de vlpds. La KEK entra como archivo
+# montado, nunca como argumento ni variable de entorno.
+wrap_plc_key() {
+  command -v docker >/dev/null || { echo "  ⚠️  sin docker: no puedo envolver la llave PLC (vlpds_plc_rotation_key)" >&2; return 1; }
+  [ -s "$DIR/vlpds_kek" ] || { echo "  ⚠️  falta vlpds_kek para envolver la llave PLC" >&2; return 1; }
+  local out
+  out="$(printf '%s' "${1:-}" | docker run --rm -i -v "$DIR/vlpds_kek:/run/kek:ro" -e VLPDS_KEK_FILE=/run/kek \
+    "$VLPDS_IMAGE" --wrap-plc-rotation-key 2>/dev/null)" || return 1
+  case "$out" in vw1.*) ;; *) echo "  ⚠️  vlpds no devolvió una llave envuelta" >&2; return 1 ;; esac
+  write_secret vlpds_plc_rotation_key "$out"
+}
+
 cmd_generate() {
   mkdir -p "$DIR"
   chmod u+w "$DIR"
@@ -122,6 +143,9 @@ cmd_generate() {
     case "$kind" in
       hex) write_secret "$n" "$(openssl rand -hex 32)"; echo "  + $n"; created=$((created + 1)) ;;
       jwk) [ "$n" = m8_issuer_private_jwk ] && gen_jwk ;;
+      # Después de la KEK: SPEC la lista antes.
+      wrapped) chmod a+r "$DIR/vlpds_kek" 2>/dev/null || true
+               if wrap_plc_key; then echo "  + $n"; created=$((created + 1)); fi ;;
       provided) pending="$pending $n" ;;
     esac
   done
@@ -145,11 +169,7 @@ cmd_import() {
 postgres_password|$wz/.env|POSTGRES_PASSWORD
 s3_access_key_id|$wz/.env|PDS_BLOBSTORE_S3_ACCESS_KEY_ID
 s3_secret_access_key|$wz/.env|PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY
-pds_jwt_secret|$wz/.env|PDS_JWT_SECRET
-pds_dpop_secret|$wz/.env|PDS_DPOP_SECRET
-pds_admin_password|$wz/.env|PDS_ADMIN_PASSWORD
-pds_plc_rotation_key|$wz/.env|PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX
-pds_rate_limit_bypass_key|$wz/.env|PDS_RATE_LIMIT_BYPASS_KEY
+vlpds_rate_limit_bypass_key|$wz/.env|PDS_RATE_LIMIT_BYPASS_KEY
 bsky_service_signing_key|$wz/.env|BSKY_SERVICE_SIGNING_KEY
 bsky_admin_passwords|$wz/.env|ADMIN_PASSWORDS
 ozone_signing_key|$wz/.env|OZONE_SIGNING_KEY_HEX
@@ -193,6 +213,17 @@ EOF
       echo "  + $n  (de $yk en el registro del appservice)"
       imported=$((imported + 1))
     done
+  fi
+  # La llave PLC del PDS de TypeScript se conserva envuelta con la KEK: los
+  # documentos DID que la listan siguen siendo válidos (docs/VLPDS.md).
+  v="$(env_value "$wz/.env" PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX)"
+  if [ ! -s "$DIR/vlpds_plc_rotation_key" ] && [ -n "$v" ]; then
+    [ -s "$DIR/vlpds_kek" ] || write_secret vlpds_kek "$(openssl rand -hex 32)"
+    chmod a+r "$DIR/vlpds_kek" 2>/dev/null || true
+    if wrap_plc_key "$v"; then
+      echo "  + vlpds_plc_rotation_key  (PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX, envuelta con vlpds_kek)"
+      imported=$((imported + 1))
+    fi
   fi
   derive_urls
   fix_perms
@@ -247,7 +278,7 @@ cmd_check() {
   for f in "$HERE/env/identity.env" "$HERE/env/core.env" "$HERE/env/matrix.env"; do
     [ -f "$f" ] || continue
     for key in JWT_SECRET APP_KEY COOKIE_SECRET CURP_PEPPER CIVIC_VOTE_PROOF_SECRET IDENTITY_ISSUER_PRIVATE_JWK \
-               PDS_JWT_SECRET PDS_DPOP_SECRET PDS_ADMIN_PASSWORD PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX \
+               VLPDS_JWT_SECRET VLPDS_ADMIN_TOKEN VLPDS_INTERNAL_TOKEN VLPDS_KEK PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX \
                BSKY_SERVICE_SIGNING_KEY ADMIN_PASSWORDS OZONE_SIGNING_KEY_HEX MATRIX_ADMIN_TOKEN; do
       if [ -n "$(env_value "$f" "$key")" ]; then
         bad "${f#$HERE/} todavía define $key" "Quítalo: ese secreto ya es un archivo y el servicio no arrancaría con los dos"

@@ -25,7 +25,7 @@ services:
     ports: !reset []
     group_add: ['${PARA_SECRETS_GID:-10001}']
     env_file:
-      - path: ${PLATFORM_DIR:?Ejecuta con make desde para-platform}/env/identity.env
+      - path: ${PLATFORM_DIR:?Ejecuta con make desde para/}/env/identity.env
         required: false
     environment: !override
       NODE_ENV: production

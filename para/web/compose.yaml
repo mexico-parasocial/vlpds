@@ -13,7 +13,7 @@ services:
     image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/para-web:${PARA_WEB_VERSION:-local}
     build:
       # Ruta absoluta (el Makefile la calcula): las relativas aquí serían desde web/.
-      context: ${PARA_WEB_CONTEXT:?Ejecuta con make desde para-platform}
+      context: ${PARA_WEB_CONTEXT:?Ejecuta con make desde para/}
       dockerfile: Dockerfile
       args:
         EXPO_PUBLIC_ENV: production

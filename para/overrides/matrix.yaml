@@ -35,6 +35,9 @@ services:
   para-idp:
     container_name: !reset null
     profiles: [matrix]
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-para-idp:${WATZAPPA_VERSION:-local}
+    # Solo el edge habla con él.
+    ports: !reset []
     # Lo genera make matrix-init; opcional aquí para que `make config` valide
     # antes de esa primera vez (preflight sí lo exige con el perfil matrix).
     env_file: !override
@@ -47,6 +50,7 @@ services:
   mas:
     container_name: !reset null
     profiles: [matrix]
+    ports: !reset []
     depends_on: !override
       postgres:
         condition: service_healthy
@@ -59,6 +63,7 @@ services:
   element-web:
     container_name: !reset null
     profiles: [matrix]
+    ports: !reset []
     # La config generada por make matrix-init para PARA_DOMAIN, no la versionada
     # (que apunta a matrix.para.social).
     volumes: !override
@@ -70,22 +75,38 @@ services:
   matrix-bridge:
     container_name: !reset null
     profiles: [matrix]
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-matrix-bridge:${WATZAPPA_VERSION:-local}
     labels:
       para.metrics.port: '3001'
       para.metrics.path: /metrics
     <<: *secrets-reader
+    # Su imagen no lee NAME_FILE: el envoltorio de la plataforma lo hace
+    # (runtime/env-from-files.sh). Sin el CMD de la imagen, se repite aquí.
+    entrypoint: ['dumb-init', '--', 'sh', '/para/env-from-files']
+    command: ['node', '--heapsnapshot-signal=SIGUSR2', '--enable-source-maps', 'dist/index.js']
+    # Todo su estado está en Postgres: ni volumen ni puerto en el host, y
+    # nada de la red externa para-edge del compose de WatZappa.
+    volumes: !override
+      - ${PLATFORM_DIR}/runtime/env-from-files.sh:/para/env-from-files:ro
+    ports: !reset []
+    networks: !override [default]
     depends_on: !override
       synapse:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      relay:
+        condition: service_started
     environment:
       # El estado del bridge vive en Postgres (base bridge): el contenedor no
       # guarda nada propio. Para traer el SQLite de un despliegue anterior:
       # docs/ACTUALIZACIONES.md, "Bridge: de SQLite a Postgres".
       DATABASE_URL_FILE: /run/secrets/postgres_url_bridge
-      PDS_FIREHOSE_URL: ${PDS_FIREHOSE_URL:-wss://pds.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}}
-      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:-matrix.${PARA_DOMAIN}}
+      # El firehose de vlpds renumerado por el relay: el consumidor del
+      # bridge, como @atproto/sync, no admite seq por encima de 2^53.
+      PDS_FIREHOSE_URL: ws://relay:2470
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:-matrix.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}}
+      MATRIX_ENABLE_ENCRYPTION: ${MATRIX_ENABLE_ENCRYPTION:-true}
       PLC_URL: ${PLC_URL:-https://plc.directory}
       # Dentro de la plataforma mubEZ se alcanza por nombre de servicio; ya no
       # hace falta salir al host por host.docker.internal.
