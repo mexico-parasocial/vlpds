@@ -35,3 +35,7 @@ para_preflight: true
 para_role: "{{ 'appview-worker' if 'para_appview' in group_names else 'primary' }}"
 # IP privada de la principal, para los workers (Postgres y bsync).
 para_primary_ip: "{{ hostvars[groups['para'][0]].para_private_ip | default('') }}"
+
+# Con WATZAPPA_VERSION o MUBEZ_VERSION en `local` (nadie publica aún esas
+# imágenes), make preflight y make up construyen en el servidor (BUILD=1).
+para_build_arg: "{{ 'BUILD=1' if 'local' in [para_env.WATZAPPA_VERSION | default('local'), para_env.MUBEZ_VERSION | default('local')] else '' }}"

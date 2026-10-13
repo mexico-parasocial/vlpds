@@ -52,6 +52,11 @@ for v in $versions; do
     *) ok "$v=$tag" ;;
   esac
 done
+vimg="$(cfg VLPDS_IMAGE)"; vimg="${vimg:-ghcr.io/jazware/vlpds:1.1.0}"
+case "${vimg##*:}" in
+  latest|main|"$vimg") fail "VLPDS_IMAGE=$vimg no es una versión fija" "Usa ghcr.io/jazware/vlpds:X.Y.Z" ;;
+  *) ok "VLPDS_IMAGE=$vimg" ;;
+esac
 for v in S3_BUCKET S3_PREFIX; do
   if [ -n "$(cfg "$v")" ]; then ok "$v=$(cfg "$v")"; else fail "$v vacío" "El bucket es donde vive el estado; defínelo en .env"; fi
 done

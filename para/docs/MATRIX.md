@@ -10,7 +10,7 @@ sin registro abierto, con el login delegado en la identidad PARA del usuario.
  auth.<dominio>  MAS ──── upstream OIDC ────► idp.<dominio>  para-idp
       │  (emite los tokens Matrix)                (prueba la llave PARA)
       ▼
- matrix.<dominio>  Synapse ◄──── appservice ──── matrix-bridge ◄── firehose del PDS
+ matrix.<dominio>  Synapse ◄──── appservice ──── matrix-bridge ◄── firehose (relay)
       ▲                                              │
  chat.<dominio>  Element Web                    bridge.<dominio>  (API de la app)
 ```
@@ -34,7 +34,7 @@ make matrix-init           # Synapse, MAS, Element y el appservice del bridge pa
 ```
 
 `make matrix-init` genera, en carpetas no versionadas de WatZappa
-(`deploy/matrix/synapse/`, `deploy/matrix/mas/`):
+(`WatZappa/deploy/matrix/synapse/`, `WatZappa/deploy/matrix/mas/`):
 
 - la config de Synapse y su llave de firma (respáldala offline),
 - la config de MAS con `public_base` = `https://auth.<dominio>/` y el
@@ -55,8 +55,9 @@ make up UP_ARGS=--force-recreate
 
 El bridge recibe de Synapse los eventos de las salas como appservice, y
 registra las cuentas derivadas (localparts de 32 caracteres base32, CD-M1).
-`make matrix-init` genera su registro con `deploy/matrix/setup-appservice.sh`
-de WatZappa, el mismo que ya se usaba en local:
+`make matrix-init` genera su registro con `matrix/setup-appservice.sh` (traído
+aquí del PR #10 de WatZappa, que no se mezcló; escribe en
+`WatZappa/deploy/matrix`, de donde lo monta su compose):
 
 - `url: http://matrix-bridge:3001` (el servicio en la plataforma),
 - `as_token` y `hs_token` nuevos, que `make secrets-import` copia a
@@ -113,11 +114,11 @@ las URLs públicas, pero no regenera una config existente (cambiar el
 proveedor dejaría huérfanas las cuentas vinculadas). Para corregir una
 existente, edita a mano, conservando los secretos:
 
-- `deploy/matrix/mas/config.yaml`: `public_base` e `issuer` →
+- `WatZappa/deploy/matrix/mas/config.yaml`: `public_base` e `issuer` →
   `https://auth.<dominio>/`; en el proveedor, `issuer` →
   `https://idp.<dominio>` y `authorization_endpoint` →
   `https://idp.<dominio>/authorize`.
-- `deploy/matrix/mas/para-idp.env`: `PARA_IDP_ISSUER=https://idp.<dominio>` y
+- `WatZappa/deploy/matrix/mas/para-idp.env`: `PARA_IDP_ISSUER=https://idp.<dominio>` y
   el `redirectUris` → `https://auth.<dominio>/upstream/callback/<id>`.
 
 Después: `make up UP_ARGS=--force-recreate`.

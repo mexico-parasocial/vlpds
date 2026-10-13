@@ -8,13 +8,13 @@
     that:
       - para_env.PARA_DOMAIN is defined and para_env.PARA_DOMAIN not in ['', 'example.org']
       - para_role == 'appview-worker' or (para_env.S3_BUCKET | default('')) | length > 0
-      - (para_env.WATZAPPA_VERSION | default('local')) not in ['local', 'main', 'latest']
-      - para_role == 'appview-worker' or (para_env.MUBEZ_VERSION | default('local')) not in ['local', 'main', 'latest']
+      - (para_env.WATZAPPA_VERSION | default('local')) not in ['main', 'latest']
+      - para_role == 'appview-worker' or (para_env.MUBEZ_VERSION | default('local')) not in ['main', 'latest']
       - para_role == 'primary' or (para_primary_ip | length > 0 and para_private_ip is defined)
       - para_repos | dict2items | map(attribute='value.url') | select('equalto', '') | list | length == 0
     fail_msg: >-
       Faltan datos en el inventario: PARA_DOMAIN, S3_BUCKET y versiones fijadas
-      (sha-<commit> o X.Y.Z) en para_env; para un worker, para_private_ip en
+      (sha-<commit>, X.Y.Z, o local para construir en el servidor) en para_env; para un worker, para_private_ip en
       él y en la principal; la URL de cada repo en para_repos.
     quiet: true
 
@@ -85,7 +85,7 @@
         if para_role == 'primary'
         else (para_secrets
               | dict2items
-              | selectattr('key', 'in', ['bsky_service_signing_key', 'bsky_admin_passwords',
+              | selectattr('key', 'in', ['bsky_service_signing_key', 'bsky_admin_passwords', 'bsync_api_key',
                                          'authority_service_token', 'civic_delegation_resolver_secret'])
               | items2dict)
              | combine({'postgres_url': 'postgres://' ~ (para_env.POSTGRES_USER | default('pg')) ~ ':'
@@ -138,7 +138,7 @@
 # --- levantar -----------------------------------------------------------------
 
 - name: Preflight (configuración, secretos, bucket, DNS)
-  ansible.builtin.command: make preflight
+  ansible.builtin.command: make preflight {{ para_build_arg }}
   args:
     chdir: "{{ para_root }}/vlpds/para"
   register: para_preflight_out
@@ -150,7 +150,7 @@
 # cambió, se recrean los contenedores para que lo lean.
 - name: make up
   ansible.builtin.command: >-
-    make up {{ 'UP_ARGS=--force-recreate' if para_secret_files is changed else '' }}
+    make up {{ para_build_arg }} {{ 'UP_ARGS=--force-recreate' if para_secret_files is changed else '' }}
   args:
     chdir: "{{ para_root }}/vlpds/para"
   register: para_up

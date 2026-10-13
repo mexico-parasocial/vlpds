@@ -1,86 +1,84 @@
 # Desarrollo
 
-Todo el entorno local con un comando, en una terminal.
+El entorno local con vlpds, en Docker, con un comando. El paso a paso con lo
+que debe salir está en el [libreto](LIBRETO.md#2-entorno-local); aquí, cómo
+está armado y cómo conectarle mubEZ y la app.
 
 ```
 make dev
-  ├─ m8       mubEZ (pnpm dev)               :8787   PLC/PDS locales por entorno
-  └─ atproto  WatZappa (make run-dev-env)    :2581 introspección · :2582 PLC
-                                             :2583 PDS · :2584 AppView · :2590 chat
-                                             :3001 matrix-bridge
-              Postgres :5434 y Redis :6381 en Docker (se quedan arriba al salir)
+  net        un contenedor que solo presta su red: localhost:<puerto> es lo
+             mismo dentro de cada servicio y desde tu Mac
+  ├─ plc        :2582  did-method-plc, construido desde el commit que usan los bancos de prueba de vlpds
+  ├─ vlpds      :2583  --memory --dev-mode (nada persiste)
+  ├─ relay      :2470  indigo, renumera el firehose de vlpds
+  ├─ dataplane  :2585  indexa el firehose del relay en Postgres
+  ├─ appview    :2584  api.js
+  ├─ bsync      :2586  construido desde WatZappa main
+  └─ postgres          tmpfs, una base por servicio
 ```
-
-## Primera vez
-
-```bash
-git clone … para-platform && git clone … WatZappa && git clone … mubEZ   # carpetas hermanas
-cd para-platform
-make setup
-make dev
-```
-
-`make setup` revisa Docker, Node (con nvm cada repo usa su `.nvmrc`: WatZappa
-22, mubEZ 24), pnpm, jq y compañía; instala dependencias donde falten o el
-lockfile cambió; y crea `mubEZ/.env` con secretos de desarrollo. Se puede
-repetir: no toca lo que ya está bien.
-
-Si los repos no son carpetas hermanas, pon sus rutas en `.env`
-(`WATZAPPA_DIR`, `MUBEZ_DIR`, `PARA_DIR`).
-
-## El día a día
 
 | Comando | Qué hace |
 | --- | --- |
-| `make dev` | Levanta todo, espera a que cada servicio responda, imprime las URLs y muestra los logs de todos con prefijo. Ctrl-C detiene todo. |
-| `make dev APP=web` | Además la app (`web`, `ios`, `android` o `expo`). La app se queda con la terminal; los logs del backend van a `.dev/logs/`. |
-| `make dev MATRIX=1` | Además Synapse, MAS y Element en Docker. |
-| `make dev FRESH=1` | Perfil desechable: nada persiste al salir (como `just dev` de vlpds). Sin bridge. |
-| `make seed` | Cuentas de prueba (`WatZappa/test-accounts.json`) y memes. |
-| `make dev-logs S=atproto` | Sigue un log (`atproto`, `m8`; sin `S`, todos). |
-| `make doctor` | Qué está mal y el comando que lo arregla. |
-| `make e2e-dm` | Prueba punta a punta de los mensajes directos por Matrix: Synapse desechable, rutas reales del bridge, cifrado real. No necesita `make dev`. |
-| `make dev-app-env` | Apunta `PARA/.env.local` a esta Mac: IP, URLs del broker y del bridge, DID del AppView. |
-| `make dev-down` | Apaga Postgres/Redis de desarrollo. |
-| `make dev-reset` | Borra los datos locales persistentes (pide confirmación). |
+| `make dev` | Genera las llaves de desarrollo en `.dev/dev.env` la primera vez, levanta todo, espera a que responda y registra vlpds en el relay |
+| `make dev-smoke` | Cuenta → post → AppView → proxy de vlpds |
+| `make dev-down` | Apaga y borra todo |
+| `make e2e-dm` | DMs cifrados por Matrix de punta a punta, aislados (no usan vlpds) |
+| `make check` | Valida la plataforma sin levantar nada |
 
-`make dev` no edita ningún `.env`: a mubEZ le pasa `PLC_URL` y `PDS_URL`
-locales por entorno, que le ganan a su `.env`.
+Variables útiles al levantar:
 
-## La app en un teléfono físico
+| Variable | Por defecto | Para qué |
+| --- | --- | --- |
+| `VLPDS_IMAGE` | `ghcr.io/jazware/vlpds:1.1.0` | Probar otra versión de vlpds |
+| `BSKY_IMAGE` | `para-core-bsky:latest` | La imagen local del AppView (hasta que se construya desde WatZappa) |
+| `BSYNC_IMAGE` | `para-bsync:<commit>` | La imagen de bsync |
+| `DATAPLANE_LOG_LEVEL` | `info` | `debug` para ver cada evento indexado |
 
-En el teléfono, `localhost` es el teléfono. Con `make dev` arriba:
+## Por qué así
 
-```bash
-make dev-app-env               # escribe la IP y el DID en PARA/.env.local
-cd ../PARA && npx expo start --clear
-```
+- **Una sola red para todos.** Las URLs que quedan en los documentos DID
+  (`http://localhost:2583`, `did:web:localhost%3A2584`) tienen que funcionar
+  desde vlpds, el AppView, el relay y tu navegador. Con un contenedor que
+  presta su red, `localhost` es el mismo en todas partes, como en los bancos de
+  prueba de vlpds.
+- **El AppView desactiva la protección SSRF** (`BSKY_DISABLE_SSRF_PROTECTION`)
+  porque si no, se niega a resolver DIDs contra el PLC en `localhost`. Solo en
+  desarrollo.
+- **El relay se registra por su base.** Solo acepta hosts con IP pública,
+  incluso por su ruta de admin; `dev/up.sh` inserta `localhost:2583` en su
+  tabla de hosts y lo reinicia.
+- **Nada persiste.** Es más fácil empezar de cero que reparar un estado
+  local. Las llaves (rotación PLC y firma del AppView) sí se guardan en
+  `.dev/dev.env` para no cambiar de identidad en cada arranque.
 
-Repítelo cuando cambies de red (otra IP) o después de `make dev-reset` (otro
-DID). `make doctor` avisa en ambos casos.
+## mubEZ contra el entorno local
 
-## Si algo falla
-
-| Síntoma | Causa y arreglo |
-| --- | --- |
-| `Puertos ocupados` al arrancar | Otro `make dev` (o un proceso viejo). El mensaje trae el `lsof` para verlo. |
-| `could not resolve proxy did` al hacer login | La app hace proxy a un DID que no es el del AppView en ejecución. `make dev-app-env` y Metro con `--clear`. |
-| La app no conecta desde el teléfono | IP vieja en `.env.local`: `make dev-app-env`. |
-| mubEZ inventa DIDs para los handles | Está resolviendo contra el PLC público. Arráncalo con `make dev` (le pasa el local). |
-| Corre código viejo después de cambiar algo | `make doctor` → "Builds". `make dev` recompila lo que WatZappa necesita al arrancar. |
-| Un proceso se cae | `make dev` detiene el resto y muestra sus últimas 25 líneas; el log completo está en `.dev/logs/`. |
-
-## Probar la plataforma de producción en tu máquina
-
-Sin nube, con el perfil `local-s3` (un S3 de SeaweedFS):
+Desde `mubEZ/`, con Node 24 ([MUBEZ.md](MUBEZ.md)):
 
 ```bash
-cp .env.example .env    # PARA_DOMAIN=para.test, PROFILES=core,identity,local-s3,
-                        # S3_ENDPOINT=http://s3-local:8333, S3_BUCKET=para-test
-make secrets            # y crea a mano s3_access_key_id / s3_secret_access_key (cualquier valor)
-make up BUILD=1         # construye las imágenes aquí (tarda: compila WatZappa)
+PLC_URL=http://localhost:2582 PDS_URL=http://localhost:2583 pnpm dev
 ```
 
-El edge necesita DNS real, así que en local se deja fuera. Si en esta máquina
-ya corre otro stack con los mismos puertos, usa otro nombre de proyecto y
-puerto de Postgres: `COMPOSE_PROJECT_NAME=paratest POSTGRES_PORT=15432 make up …`.
+## La app contra el entorno local
+
+La app necesita el PDS y el DID del AppView. En `PARA/.env.local`:
+
+```bash
+EXPO_PUBLIC_LOCAL_DEV_SERVICE=http://<IP de tu Mac>:2583
+EXPO_PUBLIC_LOCAL_BSKY_PROXY_DID=did:web:localhost%3A2584
+```
+
+En un teléfono físico, `localhost` es el teléfono: usa la IP de tu Mac
+(`ipconfig getifaddr en0`) y reinicia Metro con `--clear` cuando cambie. Ojo:
+el DID del AppView dice `localhost`, así que desde el teléfono las peticiones
+que vlpds reenvía funcionan (vlpds está en tu Mac), pero no las que la app
+haga directo al AppView por su DID.
+
+Recuerda que con vlpds la app no puede crear comunidades, unirse ni votar
+([VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara)). Para trabajar en esas
+pantallas, usa la variante tradicional ([tradicional/LIBRETO.md](tradicional/LIBRETO.md)).
+
+## Probar la producción en tu máquina
+
+El perfil `core` de producción sobre un S3 local:
+[libreto, paso 4](LIBRETO.md#4-la-producción-en-tu-máquina).

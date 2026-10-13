@@ -7,10 +7,17 @@ Dos roles:
 | Rol | Qué hace |
 | --- | --- |
 | `common` | Paquetes, UTC y chrony, parches de seguridad sin reinicio automático, fail2ban, Docker (con tope de logs), Tailscale opcional y ufw (22, 80, 443; todo en `tailscale0`) |
-| `para` | Clona los tres repos en su revisión fijada, escribe `.env` y `env/*.env`, un archivo por secreto (`root:10001`, `0440`), genera la config de Matrix la primera vez, corre `make preflight`, `make up` y `make verify` |
+| `para` | Clona el fork de vlpds (rama `para/platform`), WatZappa y mubEZ en su revisión fijada, escribe `.env` y `env/*.env`, un archivo por secreto (`root:10001`, `0440`), genera la config de Matrix la primera vez, corre `make preflight`, `make up` y `make verify` |
 
-Las imágenes no se construyen en el servidor: `WATZAPPA_VERSION` y
-`MUBEZ_VERSION` apuntan a lo que CI publicó en GHCR.
+vlpds se descarga (`VLPDS_IMAGE`, una versión fija). Las imágenes de
+WatZappa, mubEZ y el relay se construyen en el servidor mientras
+`WATZAPPA_VERSION` o `MUBEZ_VERSION` sean `local` (nadie las publica todavía):
+el rol corre `make preflight BUILD=1` y `make up BUILD=1`. Cuando un CI las
+publique, pon `sha-<commit>` o `X.Y.Z` y se descargan.
+
+La llave de rotación PLC de vlpds va envuelta con la KEK: genera
+`vlpds_kek` y `vlpds_plc_rotation_key` en tu máquina con `make secrets` y
+copia los dos archivos al inventario cifrado.
 
 ## Primera vez
 

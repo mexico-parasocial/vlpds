@@ -68,7 +68,8 @@ section_prod() {
   for v in WATZAPPA_VERSION MUBEZ_VERSION; do
     tag="$(env_value .env "$v")"
     case "$tag" in
-      ''|local|main|latest) fail "$v=${tag:-local}: no es una imagen fijada" "Usa sha-<commit> o X.Y.Z; make upgrade $v=..." ;;
+      ''|local) warn "$v=${tag:-local}: las imágenes se construyen en esta máquina (make up BUILD=1)" ;;
+      main|latest) fail "$v=$tag: no es una imagen fijada" "Usa sha-<commit> o X.Y.Z, o local con BUILD=1" ;;
       *) ok "$v=$tag" ;;
     esac
   done

@@ -31,13 +31,20 @@ despliegue.
 ## ParaUpstreamDown
 
 **Página.** Caddy no alcanza un servicio (la etiqueta `upstream` dice cuál:
-`pds:2583`, `bsky:2584`, `ozone:3000`, `matrix-bridge:3001`, `mubez:8787`, o
-un worker).
+`pds:2583` (vlpds), `bsky:2584`, `ozone:3000`, `matrix-bridge:3001`,
+`mubez:8787`, o un worker).
 
 1. `make ps` y `make logs S=<servicio>`.
 2. Si el contenedor reinicia y el log dice `env-from-files: …`: falta un
    secreto, está vacío o llega dos veces. `scripts/secrets.sh check`.
-3. mubEZ que no arranca con un error de Litestream: no alcanza el bucket
+   vlpds dice lo mismo con sus propias palabras (secreto corto, repetido, sin
+   KEK) y se detiene.
+3. vlpds que sale con código 2–9 se detuvo a propósito (perdió su lease, no
+   alcanza el bucket, otro nodo con su `VLPDS_NODE_ID`); Docker lo levanta de
+   nuevo. Tras un SIGKILL u OOM no escribe durante un lease (60 s en `tiny`).
+   Si no se recupera: `make logs S=pds` y que el bucket responda
+   (`make preflight`).
+4. mubEZ que no arranca con un error de Litestream: no alcanza el bucket
    (llaves, endpoint, red). Es a propósito: sin bucket no hay durabilidad, así
    que no sirve. Arregla el bucket (`make preflight` lo prueba).
 4. Un worker de AppView: ¿responde por la red privada? `curl
@@ -98,8 +105,9 @@ avisa si sigue). Mismos pasos que arriba.
 2. Imágenes viejas: `docker image prune -a` (solo las que no usa ningún
    contenedor).
 3. Logs: Docker tiene tope por contenedor (Ansible lo configura: 5 × 50 MB).
-4. El respaldo del PDS hace una copia temporal del tamaño de los datos del PDS
-   mientras corre: deja ese espacio libre.
+4. La caché de disco de vlpds ocupa hasta `VLPDS_DISK_CACHE_MB` (4 GB en
+   `tiny`) y el relay guarda 72 h de eventos: los dos se pueden borrar sin
+   perder nada (sus volúmenes `vlpds_cache` y `relay_data`).
 5. Postgres o el media de Synapse crecen de verdad: más disco.
 
 ## ParaMemoryLow
@@ -122,8 +130,8 @@ firmas dependen de la hora.
 
 ## ParaTargetDown
 
-**Ticket.** Un servicio con métricas (`job`: `matrix-bridge`, `backup`,
-`backup-media`) dejó de entregarlas.
+**Ticket.** Un servicio con métricas (`job`: `pds`, `relay`,
+`matrix-bridge`, `backup`, `backup-media`) dejó de entregarlas.
 
 1. `make ps`: ¿está corriendo? Si no, sus logs.
 2. Si corre: su puerto de métricas (`para.metrics.port` en los overrides) y
@@ -131,11 +139,34 @@ firmas dependen de la hora.
 
 ## ParaBridgeFirehoseLagging
 
-**Ticket.** El bridge procesa el firehose del PDS con más de 5 min de retraso:
-lo que pasa en las comunidades tarda en llegar a Matrix.
+**Ticket.** El bridge procesa el firehose (que lee del relay) con más de
+5 min de retraso: lo que pasa en las comunidades tarda en llegar a Matrix.
 
 1. `make logs S=matrix-bridge`: errores contra Synapse (token de admin
-   vencido → `secrets/matrix_admin_token`) o contra el PDS.
-2. ¿Synapse está sano? `make logs S=synapse`.
-3. Después de una caída larga, el retraso baja solo mientras se pone al día;
+   vencido → `secrets/matrix_admin_token`) o contra el relay.
+2. ¿El relay sigue a vlpds? `make verify` (sección Firehose) o
+   `make compose ARGS="exec -T relay wget -qO- http://127.0.0.1:2470/xrpc/com.atproto.sync.listHosts"`.
+   Si no: `make relay-add-pds`.
+3. ¿Synapse está sano? `make logs S=synapse`.
+4. Después de una caída larga, el retraso baja solo mientras se pone al día;
    vigila que la curva baje.
+
+---
+
+## Sin alerta propia
+
+### El AppView no muestra lo nuevo
+
+Las publicaciones se escriben en vlpds pero no aparecen en los feeds.
+
+1. ¿El relay sigue a vlpds? Igual que en `ParaBridgeFirehoseLagging`, paso 2.
+2. `make logs S=dataplane`: un `error in firehose event lexicon validation …
+   at $.seq` quiere decir que algo apunta al firehose de vlpds directo; el
+   dataplane debe leer `ws://relay:2470` (`BSKY_REPO_PROVIDER`).
+3. Un solo dataplane indexa: si hay un worker de AppView, el suyo no debe
+   tener `BSKY_REPO_PROVIDER` (`overrides/worker.yaml`).
+
+### La app no puede crear comunidades, unirse ni votar
+
+No es una caída: esas rutas `com.para.*` no existen en vlpds
+([VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara)).

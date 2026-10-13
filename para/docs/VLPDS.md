@@ -1,315 +1,181 @@
-# PARA y vlpds
+# PARA sobre vlpds frente a WatZappa tradicional
 
-Qué tomamos de [vlpds](https://vlpds.jazco.dev/docs/overview), qué no, cómo seguimos
-su desarrollo con el fork, y qué hacer con **Spaces** (datos con permisos), que llegó
-en vlpds 1.1.0.
+Hay dos formas de correr el backend de PARA y las dos siguen vivas mientras
+decidimos cuál usar:
 
-Escrito el 2026-10-11. Nada de lo que describe está en commits todavía: son cambios
-locales en ramas `infra/vlpds-style`.
+| | **Tradicional** | **vlpds** (este fork) |
+|---|---|---|
+| PDS | El de WatZappa, en TypeScript | [vlpds](https://vlpds.jazco.dev/docs/overview) 1.1.0, en Rust |
+| Dónde vive la infraestructura | El repo WatZappa (Ansible, compose) | `vlpds/para/` en `mexico-parasocial/vlpds` |
+| Documentación | [tradicional/](tradicional/README.md) | Esta carpeta |
+| Libreto de comandos | [tradicional/LIBRETO.md](tradicional/LIBRETO.md) | [LIBRETO.md](LIBRETO.md) |
+
+Todo lo demás es el mismo código en las dos: el AppView, bsync, Ozone, el
+bridge de Matrix, para-idp y mubEZ salen de sus repos. El fork no cambia nada
+de WatZappa.
 
 ---
 
 ## 1. En corto
 
-- No corremos vlpds. PARA sigue usando su PDS en TypeScript (WatZappa). De vlpds
-  tomamos **la forma de operar**: un solo comando para desarrollar, perfiles chicos,
-  secretos como archivos, revisar antes de levantar y comprobar después, alertas con
-  runbook.
-- El fork `mexico-parasocial/vlpds` es una **copia de referencia** que se sincroniza
-  sola cada día. Sirve para leer qué cambia arriba, no para compilar nada nuestro.
-- **No implementé Spaces.** No existía cuando hice el trabajo de infraestructura, y
-  aunque ahora existe, sigue en alfa (cambios incompatibles cada semana). Abajo está
-  qué hay en WatZappa, por qué la opción del "sidecar" no funciona, y lo que
-  recomiendo.
+- **vlpds funciona como PDS de PARA para lo genérico de ATProto**: cuentas,
+  sesiones, OAuth, repos, blobs, handles, el firehose y el proxy al AppView.
+  Probado de punta a punta en `make dev-smoke`.
+- **Bloqueo: las escrituras propias de PARA no existen en vlpds.** Unas doce
+  rutas `com.para.*` (crear comunidad, unirse, votar, el factor de correo…) las
+  implementa el PDS de TypeScript. En vlpds responden 501, y reenviadas al
+  AppView responden 400. Con vlpds, hoy la app no puede hacer esas acciones
+  (§3).
+- **vlpds exige un relay.** Numera su firehose con valores mayores que 2^53,
+  que los consumidores en TypeScript (el AppView, el bridge) rechazan. Un relay
+  de indigo los renumera (§4).
+- **Operarlo es más simple**: todo su estado está en el bucket, el disco es
+  caché, no hay respaldos que correr para el PDS y escala a varios nodos sin
+  cambiar nada (§5).
 
 ---
 
-## 2. Repos
+## 2. Qué cambia, pieza por pieza
 
-Cinco repos, un worktree por repo, todos en la rama `infra/vlpds-style`. Sin commits.
-
-| Repo | Base | Cambios | Qué contiene |
-|---|---|---|---|
-| **para-platform** | `d6c23de` | 11 modificados, 58 nuevos | La plataforma al estilo vlpds: `make dev`, perfiles `tiny`/`standard`, compose por capas, Caddy, respaldos, Alloy y alertas, Ansible, docs en español, `make e2e-dm`. Remoto: `github.com/mexico-parasocial/para-platform` (vacío hasta el primer push). |
-| **WatZappa** | `0caa89ea9` (main) | 137 modificados, 62 nuevos | Imágenes con secretos `_FILE`, workflow de imágenes, Caddyfiles de producción, scripts de Matrix (`setup-appservice.sh`), `/tls-check` en el PDS, solicitudes de DM en el bridge (`/api/dm-requests`), Spaces fijado al mismo commit que vlpds (fase 1) el PDS como repo host de sus cuentas (fase 2) y simplespace host de sus spaces (fase 3a, §7.4). Se borraron `ansible/` y `docker-compose.swarm.yml` (pasaron a para-platform). |
-| **mubEZ** | `d25e62d` (main) | 6 modificados, 4 nuevos | Litestream y entrypoint con `_FILE`, imagen, audiencia `para-matrix-bridge/dm.v1` en el relay de firmas. |
-| **iM8** | `161abe9` (`feat/holder-wallet`) | 1 modificado | El texto de aprobación para `dm.v1`. Parte de `feat/holder-wallet` porque esa pantalla solo existe ahí. |
-| **PARA** | `1cf76f3bc` (main) | 12 modificados, 16 nuevos | Dockerfile web por dominio, DMs cifrados por Matrix detrás de `EXPO_PUBLIC_MATRIX_DMS`: pedir, aceptar, verificar la invitación por su intro, lista y vista de conversación (nativo). |
-
----
-
-## 3. El fork
-
-**Qué es.** `github.com/mexico-parasocial/vlpds` es un fork real de `jazware/vlpds`.
-El repo vacío que se creó primero quedó renombrado como `vlpds-vacio-borrar`; se
-puede borrar (`gh auth refresh -s delete_repo` y luego `gh repo delete`).
-
-**Cómo se mantiene al día.** Un solo commit nuestro encima de upstream,
-`.github/workflows/sync-upstream.yml`:
-
-- corre diario (`17 6 * * *` UTC) y a mano (`workflow_dispatch`);
-- llama a la API `merge-upstream` de GitHub sobre `main`;
-- usa `secrets.SYNC_TOKEN` si existe, si no `GITHUB_TOKEN`.
-
-**Estado hoy.** Al día: tiene `77b8897 vlpds 1.1.0` y el commit posterior de upstream
-(`f2961b8`), más nuestro workflow y los merges de sincronización.
-
-**Lo que hay que saber:**
-
-| Detalle | Efecto | Qué hacer |
+| | Tradicional | vlpds |
 |---|---|---|
-| `merge-upstream` no copia tags | El fork no tiene `v1.0.0` ni `v1.1.0` | Para leer una versión, usar el commit (`vlpds 1.1.0` = `77b8897`) o los releases de upstream |
-| Con `GITHUB_TOKEN`, un cambio de upstream en `.github/workflows/` no se puede sincronizar | El sync fallaría ese día | Agregar el secreto `SYNC_TOKEN` (token con permiso `workflow`) |
-| Los workflows de upstream también viven en el fork | Al subir nuestro commit corrieron `CI` (falló) e `Image` (publicó `ghcr.io/mexico-parasocial/vlpds`) | **Hecho (2026-10-11):** `CI` e `Image` deshabilitados en el fork; solo corre `sync-upstream`. La imagen ya publicada se puede borrar desde GitHub si no la queremos |
+| Estado del PDS | SQLite por repo y cuentas en un volumen local; blobs en el bucket | Todo en el bucket (`S3_PREFIX/vlpds`), con SlateDB; el disco es caché |
+| Respaldo del PDS | Copia de los SQLite cada `BACKUP_INTERVAL`: se puede perder hasta un intervalo | Nada que copiar: cada commit es durable en el bucket antes de responder |
+| Llaves de firma | En el volumen del PDS | En el bucket, envueltas con la KEK (`vlpds_kek`, offline) |
+| Llave de rotación PLC | Hex en claro | Envuelta con la KEK (`make secrets` lo hace) |
+| Escalar el PDS | No escala: un secuenciador, SQLite en disco | Varios nodos sobre el mismo bucket, con leases y shards |
+| Firehose | `seq` consecutivos desde 1; el AppView lo lee directo | `seq = unix_micros × 256 + escritor`, más de 2^53; hace falta el relay |
+| Rutas propias de PARA (`com.para.*`) | En el PDS | **No existen**; solo las lecturas que también tiene el AppView |
+| Reglas de PARA al escribir | El PDS rechaza boletas congeladas, votos y delegaciones sin prueba, reposts | No las aplica; solo el AppView al indexar |
+| Consola de operador | `com.atproto.admin.*` con contraseña | `/admin` y `vlpds.admin.*` con token, en un puerto solo de loopback |
+| Certificados de handles | `/tls-check` (añadido en WatZappa) | `/tls-check` nativo |
+| Memoria | 512 MB (tiny) | 2 GB como mínimo |
+| Spaces (datos con permisos) | Port parcial en WatZappa (fases 1–3a) | Completo en alfa, con `--spaces` (`VLPDS_SPACES`) |
 
-**Por qué un fork y no copiar código.** No construimos sobre vlpds: es un servidor en
-Rust con su propio almacenamiento (SlateDB sobre un bucket). Lo que nos sirve es leer
-sus decisiones a tiempo (como Spaces). El fork da eso sin costo: si algún día
-queremos parchearlo, ya tiene historial compartido con upstream.
+## 3. La brecha de `com.para.*`
 
----
+La app manda todas las rutas `com.para.*` con el cliente del AppView, es
+decir, con la cabecera `atproto-proxy: <AppView>#bsky_appview`. En la variante
+tradicional el PDS de TypeScript resuelve las de escritura él mismo. vlpds no
+las conoce y reenvía todo lo que trae esa cabecera al AppView, que no las
+implementa.
 
-## 4. Lo que hicimos frente a vlpds
-
-| Principio de vlpds | En vlpds | En PARA (para-platform) | Diferencia y por qué |
-|---|---|---|---|
-| Un estado durable | Todo en un bucket S3; los nodos no guardan nada | Postgres + Litestream (SQLite) + rclone hacia un bucket | PARA tiene varios servicios con bases propias (PDS, AppView, Synapse, MAS, mubEZ). El bucket es el destino de respaldos, no la base viva. |
-| Nodos desechables | Se pierde un nodo y otro toma sus shards | Se reconstruye una máquina desde el bucket: `make restore`, `restore-media` | Sin failover automático: un servidor por perfil hasta que haga falta más. |
-| Perfiles | Tamaños de nodo | `profiles/tiny.env` y `standard.env` (memoria, réplicas, workers) | Igual en espíritu. |
-| Secretos | Archivos montados | Todo `_FILE`; `env-from-files.sh` en cada imagen, `make secrets` / `secrets-import` | Igual. Docker Desktop monta los secretos como root, así que en dev quedan `0444`. |
-| Revisar antes, comprobar después | preflight y verify | `make preflight`, `make verify`, `make doctor`, `make check` | Igual. `check` valida compose, Caddy, alertas, Alloy y Ansible sin servidor. |
-| Alertas con runbook | Una sección por alerta | `ops/alerts.yml` + `docs/RUNBOOK.md` | Igual. |
-| Desarrollo en un comando | `just dev` | `make dev` (`APP=`, `MATRIX=1`, `FRESH=1`) | `FRESH=1` es el equivalente desechable. |
-| Horizontalidad | Clúster con leases sobre el bucket | `PARA_ROLE=worker`: más workers de AppView detrás de Caddy | Sin coordinación de shards: escala lo que es sin estado. |
-| Dominios de handle | Cualquier dominio, TLS bajo demanda | Cualquier `PARA_DOMAIN`; handles `alice.<dominio>`; Caddy `on_demand_tls` pregunta a `/tls-check` del PDS | `/tls-check` es nuevo en el PDS de WatZappa (6 pruebas). |
-| Chat | No tiene | Synapse + MAS + para-idp + bridge, appservice generado por `make matrix-init` | Propio de PARA. |
-| Mensajes directos | No tiene (ni `chat.bsky`) | DMs cifrados por Matrix con **solicitud con consentimiento** (ver `MATRIX.md`) | Propio de PARA. `make e2e-dm` lo prueba punta a punta. |
-| **Spaces** | **1.1.0, en alfa, con `--spaces`** | **No implementado** | Ver §5 y §6. |
-
-Lo que **no** tomamos a propósito: el almacenamiento de vlpds (SlateDB, log en el
-bucket, leases). Exige que todo el servidor esté escrito para eso; adoptarlo sería
-cambiar de PDS.
-
----
-
-## 5. Spaces en vlpds 1.1.0
-
-**Qué es un space.** Los datos privados de un grupo. Tiene una **autoridad** (un DID)
-que decide quién lee y quién escribe. Cada miembro que escribe guarda un **space
-repo** en **su propio PDS**, y el space es la unión de esos repos. Nada pasa por el
-firehose. **No hay cifrado**: controla quién lee, pero los PDS que lo guardan sí
-pueden leerlo.
-
-- Dirección: `at://{autoridad}/space/{tipoDeSpace}/{skey}`. El tipo es un NSID con
-  una declaración de léxico `"type": "space"`.
-- Space repo: un conjunto plano `{colección}/{rkey}` → CID, con hash LtHash firmado
-  por lector. Se jala con `listRepoOps`/`getRepo`; no se empuja.
-- Leer el repo de otro: cadena de tres tokens. Tu PDS emite una delegación (60 s), la
-  autoridad emite una credencial (10 min) atada a la llave del cliente, y cada
-  petición va firmada (RFC 9421).
-- Roles de vlpds: **repo host** (los space repos de sus cuentas) y **simplespace
-  host** (spaces que gobiernan sus cuentas).
-
-**Lo que vlpds agrega sobre la implementación de referencia:**
-
-- **Solo OAuth.** Ni app passwords ni sesiones de contraseña leen o escriben spaces.
-  La referencia sí los deja.
-- Sin fugas: pruebas con centinelas en firehose, réplicas y backfill; métodos de
-  spaces sin implementar responden 501 localmente y nunca se reenvían a otro host.
-- Blobs: con Spaces activo, `sync.getBlob` solo sirve blobs que nombra un registro
-  público.
-- Acceso del operador auditado (cada lectura deja un registro con motivo) y takedowns
-  de registro, cuenta y space.
-- Límites: 100k registros por repo, oplog de 7 días.
-
-**Estado.** Apagado por defecto (`--spaces`). Fijado al PR #5187 de atproto
-(`5b95b2f2`). Sin compatibilidad hacia atrás de datos de Spaces, y la actualización
-desde builds anteriores es en un solo sentido (detener todos los nodos y arrancar
-todos con el build nuevo).
-
----
-
-## 6. Spaces en WatZappa hoy
-
-| Pieza | Estado |
-|---|---|
-| `packages/space` | Copia sin cambios de la referencia en `5b95b2f2`, el commit que sigue vlpds 1.1.0 (antes usaba DPoP, el protocolo anterior al 1 de octubre). Pasa su suite y los vectores de vlpds. Procedencia en `packages/space/SOURCE`. |
-| Léxicos `com.atproto.space.*` y `simplespace.*` | En el mismo commit (`putMember` reemplaza a `addMember`, nuevo `notifyCredentialRevoked`). Cliente de `packages/api` regenerado. |
-| Endpoints en el PDS | **Repo host propio (fase 2) y simplespace host de spaces propios (fase 3a):** con `PDS_SPACES_ENABLED`, cada cuenta escribe y lee sus propios space repos y crea, configura y borra sus spaces. Lo demás de Spaces responde 501. |
-| Decisiones escritas | **CD-P3** (nueva, `docs/PERSONAL_CIVIC_TREE.md`): datos de spaces solo con sesiones OAuth. **CD-M5** (`docs/MATRIX_V2.md`): Spaces será la capa de "espacio con permisos", nunca reemplazo de Matrix, y la identidad anónima nunca escribe en un space. **CD-P2** (`docs/PERSONAL_CIVIC_TREE.md`): compartir es membresía de un space, nunca un campo `isPublic`. **OD-P1** (abierta): dónde viven las colecciones; candidatos "PDS alfa como sidecar" o "seguir el port a mano". |
-
-Los dos casos que CD-P2 señala como errores vigentes: `com.para.raq.assessment` lleva
-`isPublic` y `com.para.highlight.annotation` lleva `visibility`, en repos públicos.
-Cualquiera que lea el PDS directo ve esos datos.
-
----
-
-## 7. Qué recomiendo
-
-### 7.1 El sidecar no sirve para lo que queremos
-
-En Spaces, **cada registro vive en el PDS de quien lo escribe**. Un vlpds al lado
-(sidecar) solo puede guardar space repos de cuentas que vivan en ese vlpds. Las
-cuentas de PARA viven en el PDS de WatZappa, así que el sidecar solo podría ser la
-**autoridad** de spaces cuyos miembros no escriben nada. Para OD-P1, donde la dueña
-de la colección escribe, quedan dos caminos reales:
-
-| Opción | Qué implica | Veredicto |
+| Ruta | Tradicional | vlpds |
 |---|---|---|
-| **A. Repo host + simplespace host en el PDS de WatZappa** sobre `packages/space` | Re-fijar el port a `5b95b2f2` (el mismo pin que vlpds), escribir los handlers, todo detrás de una bandera como `--spaces` | **Recomendada**, por fases |
-| B. Mudar las cuentas a vlpds | Perder lo propio del PDS de WatZappa, como la verificación de boletas cívicas (`verifyPublicBallotProof`) antes de preparar escrituras, y `/tls-check` | No |
-| C. Esperar a que Spaces sea estable | Nada que mantener | Válida si no hay prisa por cerrar OD-P1 |
+| `com.para.community.createBoard`, `join`, `leave`, `acceptDraftInvite` | PDS | ✗ |
+| `com.para.community.createBriefingPack`, `updateBriefingPack` | PDS | ✗ |
+| `com.para.community.shareContent`, `sharedContentAction` | PDS | ✗ |
+| `com.para.civic.castVote` | PDS (verifica la prueba de M8) | ✗ |
+| `com.para.account.getAuthFactor`, `setAuthFactor` | PDS | ✗ |
+| `com.para.alpha.requestAccess`, `createInvite` | PDS | ✗ |
+| `com.para.alpha.getAccess`, `getRolloutStatus` | AppView | ✓ |
+| `com.para.feed.getTimeline`, `com.para.actor.getProfileStats`, `com.para.social.getPostMeta` | AppView | ✓ |
 
-### 7.2 Primer léxico privado: las colecciones del árbol cívico personal
+Comprobado contra el entorno local: `com.para.community.join` y
+`com.para.civic.castVote` responden 501 en vlpds, y 400 cuando se reenvían al
+AppView; `com.para.feed.getTimeline` responde 200. El libreto lo repite en
+[LIBRETO.md, paso 2.4](LIBRETO.md#24-la-brecha-de-compara).
 
-`com.para.collection.*` es el mejor primer caso:
+Las salidas posibles, para decidir antes de mover usuarios:
 
-- **Hoy no tiene léxico de registro**: es un `payload` opaco en el AppView. No hay
-  datos públicos que migrar ni que borrar de repos públicos.
-- El diseño ya está escrito (OD-P1): space de tipo `com.para.space.personal`,
-  `skey: civic-tree`, `memberListPolicy`, la dueña como único miembro. El AppView
-  queda como índice.
-- Autoridad, escritora y lectora son la misma cuenta en el mismo PDS: no hace falta
-  hablar con otros hosts para el primer paso.
+1. **Que la app escriba los registros directamente** con
+   `com.atproto.repo.createRecord`, y que el AppView valide al indexar. El
+   AppView ya verifica las boletas antes de indexarlas, incluidas las de otros
+   repos. Es el camino más ATProto, pero cambia la app y pierde el rechazo
+   inmediato (un voto inválido se escribe y se ignora en vez de rechazarse).
+2. **Un servicio pequeño de PARA** que implemente esas rutas. Solo sirve para
+   las que no escriben en el repo del usuario: un servicio no puede escribir en
+   un repo ajeno.
+3. **Implementarlas en el fork de vlpds** (Rust). Contradice la idea de no
+   construir sobre vlpds y nos ata a mantener un parche.
 
-**Después**, con el mismo mecanismo: `highlight.annotation` y `raq.assessment`
-dejan `visibility`/`isPublic` y pasan a spaces (compartir = `putMember`).
+Mientras no se resuelva, vlpds sirve para probar operación, rendimiento y
+costos, no para usuarios reales.
 
-**Nunca en un space:**
+## 4. Por qué el relay es obligatorio
 
-- Votos y delegaciones: cada commit de space va firmado con el DID del autor, así que
-  un space oculta el registro a quien no es miembro pero no lo anonimiza ante los
-  miembros. Esperan la identidad de boleta (OD-2).
-- Nada de la identidad anónima (CD-M5).
-- Chat y DMs: Spaces no cifra. Los DMs que hice siguen en Matrix, con E2EE, que es
-  lo que pide CD-M5.
+vlpds no tiene un secuenciador global: cada nodo numera los eventos de su log
+con `unix_micros × 256 + escritor` y todos los nodos mezclan los logs en el
+mismo orden. Eso es lo que le permite escalar a varios nodos sin coordinarse.
+Su documentación lo dice claro: esos números pasan de 2^53, así que hay que
+guardarlos como enteros de 64 bits, no como números de JavaScript.
 
-### 7.3 Requisitos antes de escribir código
+`@atproto/sync`, la biblioteca con la que el AppView lee el firehose, valida
+el `seq` como entero seguro de JavaScript y descarta los eventos de vlpds
+(`Expected integer value type (got 458708000931978140n) at $.seq`). El bridge
+de Matrix tiene el mismo problema.
 
-1. **OAuth en la app.** PARA inicia sesión con `createSession` (contraseña). La
-   referencia todavía lo acepta para spaces; vlpds no, y es la dirección que
-   conviene: una app no debería poder leer los spaces de nadie con una sesión de
-   contraseña. Sin cliente OAuth en la app, Spaces queda a medias.
-2. **Re-fijar `packages/space`** al protocolo de `5b95b2f2` (firmas HTTP, credenciales
-   de 10 minutos con revocación, `repoRev`/`spaceRev`) y actualizar los léxicos
-   (`putMember`).
-3. **Copiar las barreras de vlpds**, cada una con su prueba: sin firehose (pruebas con
-   centinelas), 501 local para métodos no implementados (nunca reenviar), la regla de
-   blobs, lectura del operador auditada, takedowns.
-4. **Interop contra vlpds.** vlpds trae un arnés de interoperabilidad
-   (`bench/spaces`) contra la referencia; usarlo con nuestro PDS como uno de los lados.
-5. **Seguir el pin con el fork.** `lexicons/spaces-alpha/SOURCE` en el fork dice qué
-   commit de la referencia sigue vlpds; cuando cambie, sabemos que hay cambio de
-   protocolo.
+El relay de [indigo](https://github.com/bluesky-social/indigo) (en Go) lee el
+firehose de vlpds y lo vuelve a publicar con `seq` consecutivos propios, como
+hace la red de ATProto. El AppView y el bridge leen `ws://relay:2470`. Cuesta
+un proceso pequeño (256 MB en tiny), una base en Postgres y unos GB de disco
+para 72 h de eventos.
 
-### 7.4 Fases
+Dos detalles de la puesta en marcha:
 
-| Fase | Entrega | Riesgo | Estado |
-|---|---|---|---|
-| 0 | Decidir OAuth en la app; deshabilitar CI/Image en el fork; `SYNC_TOKEN` | Bajo | **Hecha**, salvo `SYNC_TOKEN` (lo tiene que crear una persona: abajo) |
-| 1 | `packages/space` y léxicos al pin `5b95b2f2`; su suite y los vectores de vlpds pasan | Bajo (código aislado) | **Hecha** |
-| 2 | Repo host en el PDS detrás de `PDS_SPACES_ENABLED=true`: `space.createRecord/getRecord/listRecords/listRepoOps/getRepo` para la propia cuenta, con pruebas de fuga | Medio | **Hecha** |
-| 3a | Simplespace host mínimo (autoridad = la propia cuenta, un solo miembro) y el registro `com.para.collection.record`, solo dentro de un space | Medio | **Hecha** |
-| 3b | Cliente OAuth en la app (CD-P3); la app lee y escribe sus colecciones en su PDS y copia una vez las del AppView; se retiran `com.para.collection.*` del AppView | Alto: toca el login | Pendiente |
-| 4 | Compartir (`putMember`) y mover highlights y RAQ a spaces | Alto: depende de que el protocolo se estabilice | Pendiente |
+- En producción, vlpds avisa solo al relay al arrancar (`VLPDS_CRAWLERS`), y
+  el relay comprueba `https://pds.<dominio>` por la red pública antes de
+  seguirlo. `make verify` revisa que lo esté siguiendo; `make relay-add-pds`
+  lo vuelve a pedir.
+- El relay solo da de alta hosts con IP pública, incluso por su ruta de admin.
+  En el entorno local, donde vlpds es `localhost:2583`, `make dev` lo registra
+  directo en la base del relay.
 
-**Lo que hizo la fase 0 (2026-10-11):**
+## 5. Lo que se gana operando vlpds
 
-- **OAuth decidido** como requisito, registrado como CD-P3 en
-  `WatZappa/docs/PERSONAL_CIVIC_TREE.md`. Construir el cliente OAuth en la app es
-  trabajo aparte.
-- `CI` e `Image` deshabilitados en el fork.
-- `para-platform` tiene su remoto (`origin`), sin push.
-- Falta, y solo puede hacerlo una persona: crear un token con permiso `workflow`
-  sobre el fork y guardarlo con `gh secret set SYNC_TOKEN -R mexico-parasocial/vlpds`.
-  Opcional: borrar `vlpds-vacio-borrar`.
+- **Un respaldo menos y nada que perder.** Cada commit está en el bucket antes
+  de responder. Perder la máquina no pierde ningún post: otra máquina con el
+  mismo bucket, la KEK y la llave PLC envuelta sigue donde quedó.
+- **Actualizaciones de ~1 s.** vlpds se detiene en ~0.1–0.25 s y arranca en
+  ~1.3 s; Caddy reintenta la conexión 10 s, así que los clientes esperan en vez
+  de ver errores.
+- **Escala horizontal.** El perfil `standard` usa 64 shards. Otro nodo con el
+  mismo prefijo toma los shards de uno caído en segundos (en este fork aún no
+  hay un compose de segundo nodo: ver [Escalado](ESCALADO.md)).
+- **Seguridad por defecto.** Se niega a arrancar con secretos cortos,
+  repetidos o vacíos, sin KEK o con las credenciales por defecto de MinIO; la
+  consola no sale por el edge.
+- **Spaces completo** (en alfa), con OAuth obligatorio y acceso de operador
+  auditado.
 
-**Lo que hizo la fase 1 (2026-10-11), en WatZappa:**
+## 6. Lo que se pierde o cambia
 
-- `packages/space` y los léxicos `space`/`simplespace` copiados sin cambios de
-  `5b95b2f2`. No había código propio que conservar ni consumidores fuera del código
-  generado.
-- Lo que la referencia cambió fuera del paquete y el paquete necesita: la opción
-  `format` de `verifySignature` en `@atproto/crypto` y `isValidDid` con entrada de
-  cualquier tipo en `@atproto/syntax`. Ambos compatibles hacia atrás.
-- `tests/vectors.test.ts` corre los vectores de vlpds (LtHash, commits, firmas HTTP,
-  tokens). Pasan los 19, así que la referencia, vlpds y nuestra copia producen y
-  aceptan lo mismo.
-- `pnpm codegen`: cambió solo el cliente de Spaces en `packages/api`. `api` y `pds`
-  compilan; suites: space 153/153, crypto 20/20.
-- Changeset `.changeset/spaces-alpha-pin.md`, procedencia en `packages/space/SOURCE`
-  y una nota en `AGENTS.md`.
-- Sin dependencias externas nuevas: `structured-headers` 1.0.1 ya estaba en el
-  lockfile.
+- Las rutas y reglas propias de PARA en el PDS (§3).
+- `com.para.account.*`: el segundo factor por correo de PARA vive en el PDS de
+  TypeScript. vlpds tiene su propio 2FA ([docs/oauth-2fa.md](../../docs/oauth-2fa.md)).
+- Más memoria: 2 GB como mínimo, y `tiny` pasa a pedir una VM de 12 GB.
+- Un proceso más: el relay.
+- La migración de cuentas existentes es la estándar de ATProto (exportar el
+  repo, importarlo y actualizar el DID), no una copia de archivos:
+  [docs/migration.md](../../docs/migration.md) de vlpds y
+  [Actualizaciones](ACTUALIZACIONES.md).
 
-**Lo que hizo la fase 2 (2026-10-11), en WatZappa:**
+## 7. El fork
 
-- **El PDS como repo host de sus propias cuentas**, portado de la referencia y
-  detrás de `PDS_SPACES_ENABLED` (apagado por defecto; en para-platform va
-  comentado en `env/core.env.example`). Métodos: `createRecord`, `putRecord`,
-  `deleteRecord`, `applyWrites`, `getRecord`, `listRecords`, `listRepoOps`,
-  `getLatestCommit` y `getRepo`.
-- **Almacenamiento:** las tablas y migraciones de la referencia, idénticas
-  (`002`–`004`), para que las fases siguientes encajen. Una cuenta creada antes
-  se migra la primera vez que usa Spaces (`ensureLatestSchema`).
-- **Solo OAuth (CD-P3):** `authVerifier.spaceAuthorization` rechaza sesiones de
-  contraseña y app passwords con `OAuthRequired`; cada handler exige el permiso
-  `space:` que corresponde (acción y colección). Para eso porté a
-  `oauth-scopes` los permisos `space:` de la referencia, y a `syntax` sus
-  validadores que aceptan cualquier valor.
-- **Límites deliberados de esta fase**, cada uno con su prueba:
-  - solo se escribe en spaces cuya autoridad es la propia cuenta
-    (`SpaceNotSupported`), porque escribir en el space de otra autoridad exige
-    avisarle (`notifyWrite`) y eso es de la fase 3;
-  - cada cuenta lee solo su propio repo (otro repo responde `RepoNotFound`),
-    porque leer el de otro miembro requiere credenciales de space;
-  - sin blobs (`SpaceBlobsNotSupported`): la referencia cambia `sync.getBlob`
-    para no servir blobs que solo nombran registros de spaces, y aquí todavía no.
-- **Barreras de vlpds:** cualquier método `com.atproto.space.*` o
-  `simplespace.*` sin handler responde 501 en el propio PDS (con la bandera
-  encendida o apagada) y nunca se reenvía a otro host; `getServiceAuth` no
-  firma tokens para métodos de Spaces.
-- **Pruebas:** `packages/pds/tests/spaces.test.ts`, 15 casos: lo que funciona,
-  cada rechazo, la migración de una cuenta vieja, que el repo exportado verifica
-  contra la llave de la cuenta, y una de fuga con centinelas (ni un evento en el
-  firehose, el commit público no cambia, nada en `repo.listRecords` ni en el CAR
-  de `sync.getRepo`). Siguen pasando las suites existentes de `getServiceAuth`,
-  CRUD, borrado de cuentas, proxy y OAuth (83 pruebas), y la de `oauth-scopes`
-  (360, incluidas 49 de `space:`).
+`mexico-parasocial/vlpds` es un fork real de `jazware/vlpds`:
 
-**Lo que hizo la fase 3a (2026-10-11), en WatZappa:**
+- `main` se sincroniza con upstream cada día (`.github/workflows/sync-upstream.yml`,
+  con `SYNC_TOKEN` si existe, si no `GITHUB_TOKEN`). `merge-upstream` no copia
+  tags: la versión 1.1.0 es el commit `77b8897`.
+- Los workflows `CI` e `Image` de upstream están deshabilitados en el fork;
+  la imagen que usamos es la de upstream, `ghcr.io/jazware/vlpds:1.1.0`.
+- `para/` es lo único nuestro. No compilamos vlpds: usamos su imagen. Si algún
+  día hiciera falta un parche, el fork ya comparte historial con upstream.
+- Con `GITHUB_TOKEN`, un cambio de upstream en `.github/workflows/` no se puede
+  sincronizar. Agrega el secreto `SYNC_TOKEN` (un token con permiso `workflow`).
 
-- **Simplespace host** para spaces propios: `createSpace`, `getSpace`,
-  `updateSpace`, `deleteSpace` y `listMembers`, solo OAuth con permisos
-  `manage:`. Solo acepta la política de lista de miembros (`UnsupportedPolicy`
-  para pública o de app gestora): este servidor no emite credenciales, y una
-  política abierta se volvería real el día que las emita. `putMember` y
-  `removeMember` siguen en 501 (compartir es la fase 4). Borrar el space borra
-  también el repo de la dueña en él.
-- **El registro de colección:** `com.para.collection.record`, uno por colección
-  (la clave es el id), con los mismos campos que ya usa el AppView. El space es
-  `at://<did>/space/com.para.space.personal/civic-tree`. El NSID del tipo de
-  space no tiene archivo de léxico: las herramientas de léxicos de WatZappa
-  todavía no saben declarar `"type": "space"`, y el PDS no lo necesita.
-- **Barrera:** el PDS rechaza `com.para.collection.record` en el repo público
-  (`SPACE_ONLY_COLLECTIONS` en `prepare.ts`). Así una colección privada no
-  puede terminar en el firehose por un error de la app.
-- **Un error corregido de paso:** un registro inválido en un space devolvía 500;
-  ahora 400, igual que en el repo público.
-- **Pruebas:** `spaces.test.ts` pasa a 21 casos; con las suites de regresión
-  (incluida `ballot-freeze`, que comparte `prepare.ts`), 141 pruebas en verde.
+## 8. Spaces
 
-**Dos correcciones al plan original:**
+vlpds 1.1.0 trae Spaces completo en alfa, detrás de `--spaces`
+(`VLPDS_SPACES=true` en `.env`): repo host y simplespace host, solo por OAuth,
+sin fugas al firehose y con acceso de operador auditado. WatZappa tiene un port
+parcial (fases 1–3a: el PDS como repo host y simplespace host de sus propias
+cuentas), fijado al mismo commit de la referencia.
 
-- **El AppView no indexa el space.** No puede leerlo sin credenciales de space,
-  y no hace falta: la dueña es la única lectora y la app lee directo de su PDS.
-  Las tablas de colecciones del AppView se retiran en la 3b, no se degradan a
-  índice.
-- **La mudanza la hace la app.** Solo la dueña, por OAuth, puede escribir en su
-  space; por eso la copia de las colecciones existentes es trabajo de la app, y
-  la 3b empieza por el cliente OAuth.
-
-Las fases 0 y 1 no comprometen datos. La 2 y la 3a tampoco mientras la bandera
-siga apagada. De la 2 en adelante,
-siempre detrás de la bandera y sin producción hasta que upstream deje de romper
-compatibilidad cada semana.
+Las decisiones de producto siguen en WatZappa: **CD-P3** (datos de spaces
+solo con OAuth), **CD-P2** (compartir es ser miembro de un space, nunca un
+campo `isPublic`), **CD-M5** (Spaces nunca reemplaza a Matrix y la identidad
+anónima nunca escribe en un space) y **OD-P1** (abierta: dónde viven las
+colecciones del árbol cívico personal). No lo actives en producción mientras
+el protocolo cambie cada semana: no hay compatibilidad hacia atrás de los
+datos de Spaces.

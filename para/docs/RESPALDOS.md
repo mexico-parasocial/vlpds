@@ -2,31 +2,31 @@
 
 ## Qué es durable y dónde
 
-| Dato | Dónde vive | Cómo llega al bucket | Lo que puede perderse |
+| Dato | Dónde vive | Cómo está protegido | Lo que puede perderse |
 | --- | --- | --- | --- |
-| Blobs del PDS (imágenes, video) | El bucket, directo | Ya están ahí | Nada |
-| Base de mubEZ (identidad, llaves envueltas, auditoría) | Disco del contenedor, **solo caché** | Litestream, cada `LITESTREAM_SYNC_INTERVAL` (1 s) | ~1 s de cambios |
-| Postgres: `para`, `matrix`, `mas`, `bridge` | Volumen `postgres_data` | `pg_dump` cada `BACKUP_INTERVAL` | Hasta un intervalo |
-| PDS: cuentas, secuenciador, un SQLite y una llave por repo | Volumen `pds_data` | Copia consistente (API de backup de SQLite) cada `BACKUP_INTERVAL` | Hasta un intervalo |
+| vlpds: cuentas, repos, blobs, llaves de firma (envueltas), estado de moderación | El bucket, directo (`S3_PREFIX/vlpds`) | Cada commit es durable en el bucket antes de responder | Nada |
+| Base de mubEZ | Disco del contenedor, **solo caché** | Litestream, cada `LITESTREAM_SYNC_INTERVAL` (1 s) | ~1 s de cambios |
+| Postgres: `para` (AppView, bsync, Ozone), `relay`, `matrix`, `mas`, `bridge` | Volumen `postgres_data` | `pg_dump` cada `BACKUP_INTERVAL` | Hasta un intervalo |
 | Media de Synapse | Volumen `synapse_data` | Copia incremental cada `BACKUP_INTERVAL` | Hasta un intervalo |
-| Redis | Memoria | No hace falta: es caché | Nada que importe |
-| Las cinco llaves offline | `secrets/` | **Nunca** al bucket | Todo, si no las respaldaste |
+| Caché de vlpds, archivos de eventos del relay, Redis | Volúmenes y memoria | No hace falta: se reconstruyen | Nada que importe |
+| Las seis llaves offline | `secrets/` | **Nunca** al bucket | Todo, si no las respaldaste |
+
+El AppView se puede reconstruir entero: su base sale de indexar el firehose.
+Restaurarla es más rápido que volver a indexar, pero no es imprescindible.
 
 En el bucket:
 
 ```
-<S3_BUCKET>/
-  blocks/ tmp/ quarantine/          blobs del PDS (el PDS no admite prefijo)
-  <S3_PREFIX>/litestream/mubez/     base de mubEZ
-  <S3_PREFIX>/backups/postgres/<base>/<fecha>.dump
-  <S3_PREFIX>/backups/pds/<fecha>.tar.zst
-  <S3_PREFIX>/synapse/media_store/
+<S3_BUCKET>/<S3_PREFIX>/
+  vlpds/                          todo vlpds (log, estado de SlateDB, blobs, cuentas)
+  litestream/mubez/               base de mubEZ
+  backups/postgres/<base>/<fecha>.dump
+  synapse/media_store/
 ```
 
-Usa un bucket por plataforma (los blobs no llevan prefijo). Activa en el
-bucket lo que el proveedor ofrezca para protegerlo de borrados: versionado o
-retención de objetos, y una regla que aborte subidas multiparte incompletas
-después de un día.
+Activa en el bucket el versionado (o la retención de objetos) y una regla que
+aborte subidas multiparte incompletas tras un día. Es lo que protege a vlpds
+de un borrado accidental: vlpds no tiene otra copia.
 
 ## Las llaves offline
 
@@ -36,28 +36,37 @@ contraseñas del equipo, o el inventario cifrado con sops):
 
 | Archivo | Si se pierde |
 | --- | --- |
-| `pds_plc_rotation_key` | No se pueden actualizar los DIDs de las cuentas (migrar, rotar llaves) |
+| `vlpds_kek` | **Los repos del bucket no se pueden volver a firmar.** vlpds guarda cada llave de firma envuelta con la KEK |
+| `vlpds_plc_rotation_key` | No se pueden actualizar los DIDs de las cuentas (migrar, rotar llaves). Va envuelta con la KEK: sirve junto con ella |
 | `bsky_service_signing_key` | Cambia la identidad del AppView ante los clientes |
 | `ozone_signing_key` | Las etiquetas de moderación firmadas dejan de verificarse |
 | `m8_curp_pepper` | Ya no se puede deduplicar a nadie por CURP |
-| `m8_issuer_private_jwk` | No se pueden emitir credenciales verificables con la misma identidad |
+| `m8_issuer_private_jwk` | No se pueden emitir credenciales con la misma identidad |
 
 Fuera de `secrets/`, también: la llave de firma de Synapse y los secretos de
 MAS (`WatZappa/deploy/matrix/synapse/` y `deploy/matrix/mas/`, generados por
 `make matrix-init`).
 
+Para más seguridad, agrega una llave de recuperación del operador
+(`VLPDS_PLC_RECOVERY_DID_KEY` en `env/vlpds.env`): vlpds la pone en las llaves
+de rotación de cada DID, delante de la del servidor. Su parte privada no toca
+nunca la máquina.
+
 ## Respaldos automáticos
 
-El servicio `backup` (perfil `core`) y `backup-media` (perfil `matrix`)
-respaldan cada `BACKUP_INTERVAL` y borran lo más viejo que
-`BACKUP_RETENTION`. Exponen métricas que vigilan `ParaBackupStale` y
-`ParaBackupFailing`.
+El servicio `backup` (perfil `core`) respalda cada base de Postgres y
+`backup-media` (perfil `matrix`) el media de Synapse, cada `BACKUP_INTERVAL`,
+y borran lo más viejo que `BACKUP_RETENTION`. Exponen métricas que vigilan
+`ParaBackupStale` y `ParaBackupFailing`.
 
 ```bash
 make backup                        # uno ahora, además del automático
-make restore ARGS="list"           # qué hay en el bucket
+make restore ARGS="list"
 make restore ARGS="list postgres/para"
 ```
+
+La imagen de respaldos usa la misma versión mayor que Postgres (17):
+`pg_dump` no respalda un servidor más nuevo que él.
 
 ## Restaurar
 
@@ -71,30 +80,32 @@ make restore ARGS="postgres para latest --force"  # o una fecha: 20261010T052901
 make up
 ```
 
-Sin `--force` se niega si la base tiene tablas.
+Sin `--force` se niega si la base tiene tablas. Para `relay`, detén el relay;
+para `bridge`, el bridge.
 
-**El PDS**
+**vlpds**: no hay nada que restaurar. Con el mismo bucket, la misma KEK y la
+misma llave PLC envuelta, un vlpds nuevo arranca donde quedó el anterior (la
+caché de disco se rellena sola). Si hubo un borrado en el bucket, recupera los
+objetos con el versionado del proveedor; los procedimientos de vlpds están en
+[docs/operations/backups-and-recovery.md](../../docs/operations/backups-and-recovery.md).
 
-```bash
-make stop S=pds
-make restore ARGS="pds latest --force"
-make up
-```
-
-**mubEZ**: no hay nada que hacer. Borra su volumen o muévelo de máquina y, al
-arrancar, se restaura solo desde el bucket (probado: un registro escrito antes
-de destruir el contenedor y su disco vuelve en el contenedor nuevo). Nunca
-corras dos brokers con el mismo `S3_PREFIX`.
+**mubEZ**: tampoco. Borra su volumen o muévelo de máquina y, al arrancar, se
+restaura solo desde el bucket. Nunca corras dos brokers con el mismo
+`S3_PREFIX`.
 
 ## Perder la máquina entera
 
-1. Máquina nueva con Docker; los tres repos en la misma revisión.
-2. `.env` igual al de antes y las llaves offline de vuelta en `secrets/`
-   (`make secrets` genera el resto; `postgres_password` y el resto de los
-   aleatorios conviene tenerlos también en el inventario cifrado, o tendrás
-   que cambiarlos donde se usan).
+1. Máquina nueva con Docker; los repos en la misma revisión (el fork en
+   `para/platform`, WatZappa, mubEZ).
+2. `.env` igual al de antes y los secretos de vuelta en `secrets/`: las llaves
+   offline **y** los aleatorios (tenlos también en el inventario cifrado; si
+   no, `make secrets` genera otros y habrá que cambiarlos donde se usan).
 3. `make preflight`, luego `make up PROFILES=core` sin el edge todavía.
-4. Restaura Postgres (cada base) y el PDS como arriba. mubEZ se restaura solo.
+   vlpds retoma su estado del bucket solo.
+4. Restaura Postgres (cada base). mubEZ se restaura solo.
 5. Si usas Matrix, restaura su media: `make stop S=synapse` y
    `make restore-media`.
 6. `make up` con todos los perfiles, apunta el DNS y `make verify`.
+
+Tras una caída dura, vlpds tarda hasta un lease (60 s en `tiny`) en volver a
+escribir: es normal.
