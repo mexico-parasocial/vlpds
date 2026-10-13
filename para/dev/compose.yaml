@@ -113,11 +113,11 @@ services:
 
   bsync:
     <<: *shared
-    # De WatZappa, en el commit de su PR #13 que arregla el Dockerfile.
+    # De WatZappa main (incluye el arreglo de su Dockerfile, WatZappa#14).
     build:
-      context: https://github.com/mexico-parasocial/WatZappa.git#d42bedac3e5ccf9c89962a25253700428691bc19
+      context: https://github.com/mexico-parasocial/WatZappa.git#ea85ae3561e8d104fa46a7ec0fa7ee51cfc91cf9
       dockerfile: services/bsync/Dockerfile
-    image: ${BSYNC_IMAGE:-para-bsync:d42beda}
+    image: ${BSYNC_IMAGE:-para-bsync:ea85ae3}
     depends_on:
       postgres:
         condition: service_healthy
