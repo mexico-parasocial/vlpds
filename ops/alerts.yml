@@ -19,6 +19,15 @@
 #   ceiling 4 s; at 60 s (the tiny profile): every 12 s, 48 s, 24 s.
 #   Nodes built before these metrics existed export neither, and the
 #   TTL-relative lease alerts stay silent for them.
+# - Not every scraper writes staleness markers (a collector that only
+#   remote-writes, for one), and without them a dead node's last values stay
+#   visible for the query lookback (5 minutes by default). The alerts where a
+#   dead node's last value would mislead count only nodes whose `up` is 1,
+#   which a scraper writes as 0 when the node stops answering, and
+#   VlpdsNotScraped checks up's age. When the node's whole host dies and
+#   takes its scraper with it, up stops instead, and its last value still
+#   counts for the lookback; VlpdsNodeDown doesn't fire then, so watch the
+#   age of up too (VlpdsNotScraped does for the whole job).
 #
 # Thresholds: the design numbers are ~40-50 ms p50 / ~150 ms p99 commit ack
 # on S3 Standard, ~25 ms segment PUTs, hedging after 100 ms, a 3 s forward
@@ -63,9 +72,15 @@ groups:
       # is blind. With several clusters on one evaluator, scope it per
       # cluster (roles/monitoring's extra_labels adds the cluster filter to
       # the selector and the label to the alert), or one scraped cluster
-      # hides another's absence.
+      # hides another's absence. up's age catches a collector that stopped
+      # without staleness markers, which absent() alone sees only after the
+      # lookback; 3 minutes is several scrapes at any usual interval. Both
+      # branches carry the same labels (job, and cluster where the scope
+      # adds it), so they're one alert and its hold runs on across them.
       - alert: VlpdsNotScraped
-        expr: absent(up{job="vlpds"})
+        expr: >-
+          absent(up{job="vlpds"})
+          or (time() - max by (job, cluster) (timestamp(up{job="vlpds"}))) > 180
         for: 10m
         labels:
           severity: page
@@ -189,8 +204,14 @@ groups:
       # count as unowned until a peer opens them: normally 3-5 s (refused
       # probe) or TTL + skew (12 s at the default TTL, 72 s at 60 s) plus
       # replay. 2 minutes is past that at TTLs up to ~60 s (design). `or vector(0)` keeps it firing when every node is down.
+      # Only nodes whose up is 1 count: without staleness markers a dead
+      # node's last count would hide its shards for the lookback. That holds
+      # for a node process that dies (its scrape fails, up is 0); a dead host
+      # takes its scraper too, and its last count stays for the lookback.
       - alert: VlpdsShardsUnowned
-        expr: (sum(vlpds_owned_partitions{job="vlpds"}) or vector(0)) < vlpds:layout_shards
+        expr: >-
+          (sum(vlpds_owned_partitions{job="vlpds"} and on (instance) up{job="vlpds"} == 1) or vector(0))
+          < vlpds:layout_shards
         for: 2m
         labels:
           severity: page
@@ -204,8 +225,12 @@ groups:
       # Safety does not depend on this (fencing + CAS assignments), but two
       # nodes both reporting a shard for 5 minutes means a zombie that has not
       # fail-stopped (or nodes disagree on the layout mid split/merge).
+      # Live nodes only, so a dead node's last count isn't added to the
+      # shards its peers just took over.
       - alert: VlpdsShardsOverOwned
-        expr: sum(vlpds_owned_partitions{job="vlpds"}) > vlpds:layout_shards
+        expr: >-
+          sum(vlpds_owned_partitions{job="vlpds"} and on (instance) up{job="vlpds"} == 1)
+          > vlpds:layout_shards
         for: 5m
         labels:
           severity: ticket
@@ -365,11 +390,14 @@ groups:
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscommitlatencycritical"
 
       # Entries are waiting for the sequencer but no segment became durable
-      # for 2 minutes: the log is wedged (segment PUTs retry forever).
+      # for 2 minutes: the log is wedged (segment PUTs retry forever). On
+      # live nodes only: a node that died with entries queued is
+      # VlpdsNodeDown, not a wedged log.
       - alert: VlpdsCommitLogStalled
         expr: >-
           max by (instance) (vlpds_sequencer_queue_depth{job="vlpds"}) > 0
           and on (instance) sum by (instance) (rate(vlpds_segments_total{job="vlpds"}[2m])) == 0
+          and on (instance) up{job="vlpds"} == 1
         for: 1m
         labels:
           severity: page
@@ -380,11 +408,13 @@ groups:
       # now - own watermark, in microseconds. Idle logs advertise the clock
       # (lag ~0); under load it is about one segment PUT. Only meaningful
       # while the node owns shards (the gauge is not updated otherwise).
-      # 2 s (guess: half the lease ceiling at the default 10 s TTL).
+      # 2 s (guess: half the lease ceiling at the default 10 s TTL). On
+      # live nodes only, like VlpdsCommitLogStalled.
       - alert: VlpdsWatermarkLagHigh
         expr: >-
           max by (instance) (vlpds_watermark_lag_microseconds{job="vlpds"}) > 2e6
           and on (instance) vlpds_owned_partitions{job="vlpds"} > 0
+          and on (instance) up{job="vlpds"} == 1
         for: 5m
         labels:
           severity: ticket
