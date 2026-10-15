@@ -1,0 +1,130 @@
+// Alloy de la plataforma PARA (perfil monitoring).
+//
+// Métricas: el host, Postgres, y cada contenedor del proyecto que declare la
+// etiqueta para.metrics.port (Caddy, vlpds, el relay, el bridge, los respaldos). Logs: todos
+// los contenedores del proyecto. Todo sale a PARA_METRICS_URL / PARA_LOGS_URL
+// con instance = PARA_INSTANCE. Las alertas que leen esto: ops/alerts.yml.
+
+// --- salida -------------------------------------------------------------------
+
+prometheus.remote_write "out" {
+  endpoint {
+    url = sys.env("PARA_METRICS_URL")
+  }
+  external_labels = {
+    instance = sys.env("PARA_INSTANCE"),
+  }
+}
+
+loki.write "out" {
+  endpoint {
+    url = sys.env("PARA_LOGS_URL")
+  }
+  external_labels = {
+    instance = sys.env("PARA_INSTANCE"),
+  }
+}
+
+// --- host ---------------------------------------------------------------------
+
+prometheus.exporter.unix "host" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/host/root"
+}
+
+prometheus.scrape "host" {
+  targets         = prometheus.exporter.unix.host.targets
+  job_name        = "node"
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.out.receiver]
+}
+
+// --- Postgres -----------------------------------------------------------------
+
+local.file "pg_password" {
+  filename  = "/run/secrets/postgres_password"
+  is_secret = true
+}
+
+prometheus.exporter.postgres "db" {
+  data_source_names = ["postgresql://" + sys.env("PGUSER") + ":" + local.file.pg_password.content + "@postgres:5432/postgres?sslmode=disable"]
+}
+
+prometheus.scrape "postgres" {
+  targets         = prometheus.exporter.postgres.db.targets
+  job_name        = "postgres"
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.out.receiver]
+}
+
+// --- contenedores del proyecto -----------------------------------------------
+
+discovery.docker "para" {
+  host = "tcp://docker-proxy:2375"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=para"]
+  }
+}
+
+discovery.relabel "para" {
+  targets = discovery.docker.para.targets
+
+  // Un contenedor en dos redes aparecería dos veces; nos quedamos con la red
+  // del proyecto.
+  rule {
+    source_labels = ["__meta_docker_network_name"]
+    regex         = "para_default"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+// Métricas: solo los que publican para.metrics.port.
+discovery.relabel "metrics" {
+  targets = discovery.relabel.para.output
+
+  rule {
+    source_labels = ["__meta_docker_container_label_para_metrics_port"]
+    regex         = ".+"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_network_ip", "__meta_docker_container_label_para_metrics_port"]
+    regex         = "(.+);(.+)"
+    replacement   = "$1:$2"
+    target_label  = "__address__"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_para_metrics_path"]
+    regex         = "(.+)"
+    target_label  = "__metrics_path__"
+  }
+  rule {
+    source_labels = ["service"]
+    target_label  = "job"
+  }
+}
+
+prometheus.scrape "services" {
+  targets         = discovery.relabel.metrics.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.out.receiver]
+}
+
+// Logs: todos los contenedores del proyecto.
+loki.source.docker "para" {
+  host          = "tcp://docker-proxy:2375"
+  targets       = discovery.docker.para.targets
+  relabel_rules = discovery.relabel.para.rules
+  forward_to    = [loki.write.out.receiver]
+}

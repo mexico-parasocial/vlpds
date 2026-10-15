@@ -1,0 +1,74 @@
+# Servicios de operación que no pertenecen a ningún repo de servicios.
+# Las rutas relativas aquí se resuelven desde ops/.
+#
+#   monitoring  Alloy: métricas del host, de Caddy, de Postgres, del bridge y
+#               de los respaldos, más los logs de los contenedores, hacia tu
+#               stack compatible con Prometheus/Loki (PARA_METRICS_URL,
+#               PARA_LOGS_URL). Las alertas están en ops/alerts.yml.
+#   local-s3    un S3 local (SeaweedFS) para probar la plataforma completa sin
+#               nube. Nunca en producción: no tiene réplicas ni respaldo.
+
+services:
+  alloy:
+    profiles: [monitoring]
+    image: grafana/alloy:v1.8.3
+    restart: unless-stopped
+    command:
+      - run
+      - --storage.path=/var/lib/alloy
+      - --server.http.listen-addr=127.0.0.1:12345
+      - /etc/alloy/config.alloy
+    environment:
+      PARA_METRICS_URL: ${PARA_METRICS_URL:-}
+      PARA_LOGS_URL: ${PARA_LOGS_URL:-}
+      PARA_INSTANCE: ${PARA_INSTANCE:-${PARA_DOMAIN}}
+      PGUSER: ${POSTGRES_USER:-pg}
+    group_add: ['${PARA_SECRETS_GID:-10001}']
+    secrets: [postgres_password]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy
+      # Métricas del host, solo lectura.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    depends_on: [docker-proxy]
+    deploy:
+      resources:
+        limits:
+          memory: ${ALLOY_MEM:-256m}
+
+  # Alloy lee los logs de Docker a través de este proxy, que solo deja listar
+  # contenedores y leer sus logs: nunca crear, borrar ni ver su entorno.
+  docker-proxy:
+    profiles: [monitoring]
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+
+  s3-local:
+    profiles: [local-s3]
+    image: chrislusf/seaweedfs:4.37
+    restart: unless-stopped
+    command: server -s3 -dir=/data -master.volumeSizeLimitMB=256 -volume.max=8
+    ports:
+      - '127.0.0.1:8333:8333'
+    volumes:
+      - s3_local_data:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:8333/ >/dev/null 2>&1 || wget -S -qO- http://127.0.0.1:8333/ 2>&1 | grep -q 403']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  alloy_data:
+  s3_local_data:

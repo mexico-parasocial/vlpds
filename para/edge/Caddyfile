@@ -1,0 +1,169 @@
+# Edge de la plataforma PARA. Es lo único expuesto a internet (80 y 443).
+#
+# Define todos los sitios del núcleo (vlpds, AppView, Ozone, bridge, el
+# dominio raíz y los handles) y, según PROFILES, importa las rutas de Matrix
+# y del broker M8; un perfil apagado monta un archivo vacío en su lugar.
+
+{
+	email {$ACME_EMAIL}
+	# Métricas HTTP por host y código; Alloy las lee en :9180 (abajo).
+	metrics
+	# Los handles de usuario (alice.example.org) obtienen certificado la
+	# primera vez que alguien los visita, solo si vlpds confirma que la
+	# cuenta existe: nadie puede hacer que pidamos certificados al azar.
+	on_demand_tls {
+		ask http://pds:2583/tls-check
+	}
+}
+
+(para_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+# ---------------------------------------------------------------------------
+# PDS (vlpds)
+# ---------------------------------------------------------------------------
+pds.{$PARA_DOMAIN} {
+	encode gzip
+	import para_headers
+
+	# Las rutas de operador de vlpds nunca salen por aquí: un 404 vacío para
+	# todos. Detrás de Docker, Caddy puede ver a cualquier cliente con la IP
+	# del bridge (172.x), así que filtrar por red no protegería nada. La
+	# consola está en el puerto de operador, solo en loopback del servidor
+	# (docs/OPERACIONES.md, "Consola de vlpds").
+	@vlpds_operator {
+		path /admin /admin/* /xrpc/vlpds.admin.* /metrics /internal/*
+	}
+	handle @vlpds_operator {
+		respond 404
+	}
+
+	# Los blobs no cambian una vez escritos.
+	handle /xrpc/com.atproto.sync.getBlob* {
+		reverse_proxy pds:2583 {
+			header_down Cache-Control "public, max-age=31536000, immutable"
+		}
+	}
+
+	# Mientras vlpds reinicia (una actualización tarda ~1 s), Caddy reintenta
+	# la conexión hasta 10 s en vez de devolver 502. Solo reintenta
+	# conexiones que vlpds nunca aceptó, así que una escritura no corre dos
+	# veces.
+	handle {
+		reverse_proxy pds:2583 {
+			lb_try_duration 10s
+			lb_try_interval 250ms
+		}
+	}
+}
+
+# ---------------------------------------------------------------------------
+# AppView
+# ---------------------------------------------------------------------------
+appview.{$PARA_DOMAIN} {
+	encode gzip
+	import para_headers
+
+	# Las miniaturas son caras de generar.
+	handle /img/* {
+		reverse_proxy bsky:2584 {
+			header_down Cache-Control "public, max-age=86400"
+		}
+	}
+
+	# Cada réplica (el DNS de Docker las devuelve todas) más los workers de
+	# otras máquinas en APPVIEW_WORKERS ("host:puerto ..."). Una réplica que
+	# rechaza conexiones queda fuera 30 s.
+	handle {
+		reverse_proxy bsky:2584 {$APPVIEW_WORKERS} {
+			lb_policy round_robin
+			lb_try_duration 10s
+			fail_duration 30s
+		}
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Ozone (moderación)
+# ---------------------------------------------------------------------------
+ozone.{$PARA_DOMAIN} {
+	encode gzip
+	import para_headers
+	reverse_proxy ozone:3000
+}
+
+# ---------------------------------------------------------------------------
+# Bridge de Matrix: API de chat y gobierno de comunidades para la app
+# ---------------------------------------------------------------------------
+bridge.{$PARA_DOMAIN} {
+	encode gzip
+	import para_headers
+
+	# SSE: sin buffer, para que los eventos salgan al momento.
+	handle /api/events {
+		reverse_proxy matrix-bridge:3001 {
+			flush_interval -1
+		}
+	}
+
+	# Las métricas son para Alloy, por la red interna.
+	handle /metrics {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy matrix-bridge:3001
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Dominio raíz: descubrimiento de AT Protocol y, con el perfil web, la app.
+# ---------------------------------------------------------------------------
+{$PARA_DOMAIN} {
+	encode gzip
+
+	handle /.well-known/atproto-did {
+		reverse_proxy pds:2583
+	}
+
+	# El Makefile lo pone en "reverse_proxy web:8100" con el perfil web.
+	handle {
+		{$PARA_ROOT_HANDLER:respond "Not Found" 404}
+	}
+}
+
+import /etc/caddy/sites/*.Caddyfile
+
+# ---------------------------------------------------------------------------
+# Handles de usuario: https://<handle>/.well-known/atproto-did responde el DID.
+# Los subdominios de servicio (pds., appview., ...) tienen su propio bloque y
+# le ganan a este comodín.
+# ---------------------------------------------------------------------------
+*{$PARA_HANDLE_DOMAIN} {
+	tls {
+		on_demand
+	}
+
+	handle /.well-known/atproto-did {
+		reverse_proxy pds:2583
+	}
+
+	# El perfil vive en la app web.
+	handle {
+		redir https://{$PARA_DOMAIN}/profile/{host} 302
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Métricas del edge, solo dentro de la red de Compose (el puerto no se publica).
+# ---------------------------------------------------------------------------
+:9180 {
+	metrics /metrics
+}

@@ -1,0 +1,41 @@
+---
+# Primer contacto con una máquina nueva que solo da login con contraseña:
+# instala tu llave SSH y apaga el login por contraseña. Una sola vez:
+#
+#   ansible-playbook -i inventories/<nombre>/hosts.yml playbooks/bootstrap.yml \
+#     -u root --ask-pass -e bootstrap_pubkey="$(cat ~/.ssh/id_ed25519.pub)"
+#
+# Después todo va con site.yml y llaves.
+
+- name: Pasar la máquina a llaves SSH
+  hosts: para
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Exigir la llave pública
+      ansible.builtin.assert:
+        that: bootstrap_pubkey is defined and bootstrap_pubkey | length > 0
+        fail_msg: Pasa -e bootstrap_pubkey="$(cat ~/.ssh/id_ed25519.pub)"
+
+    - name: Instalar la llave para el usuario de conexión
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user | default('root') }}"
+        key: "{{ bootstrap_pubkey }}"
+        state: present
+
+    - name: Apagar el login por contraseña
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-para-keys-only.conf
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin prohibit-password
+        mode: "0644"
+      notify: Reload sshd
+
+  handlers:
+    - name: Reload sshd
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded

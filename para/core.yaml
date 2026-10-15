@@ -1,0 +1,500 @@
+# Perfil core de PARA sobre vlpds: el PDS es vlpds y el resto (AppView,
+# bsync, Ozone) son los servicios de WatZappa, construidos desde su checkout
+# (WATZAPPA_DIR) sin cambiarle nada.
+#
+#   pds        vlpds. Todo su estado vive en el bucket (S3_PREFIX/vlpds); el
+#              disco es solo caché. Se llama `pds` para que el resto de la
+#              plataforma (edge, mubEZ, bridge) no tenga que saber cuál PDS es.
+#   relay      relay de indigo entre vlpds y los consumidores en TypeScript.
+#              vlpds numera su firehose con unix_micros × 256 + escritor (sin
+#              secuenciador global), y esos seq pasan de 2^53: @atproto/sync
+#              los rechaza. El relay los vuelve a numerar (docs/VLPDS.md).
+#   dataplane  migra la base del AppView e indexa el firehose del relay
+#   bsky       el AppView (api.js)
+#   bsync      sincronización de mutes y notificaciones del AppView
+#   ozone      moderación
+#   postgres   una sola instancia; cada servicio en su esquema
+#   redis      caché del AppView, sin disco
+#   backup     respaldos de Postgres al bucket (vlpds ya vive en él)
+#   caddy      el edge (perfil edge): HTTPS y rutas públicas
+#
+# Los secretos son archivos (compose.yaml, secrets/). Las imágenes de WatZappa
+# no saben leer NAME_FILE, así que runtime/env-from-files.sh se monta como
+# entrypoint delante de su comando. Redefinir el entrypoint borra el CMD de la
+# imagen: por eso cada servicio repite el suyo.
+
+x-secrets-reader: &secrets-reader
+  # Los archivos de secrets/ son root:PARA_SECRETS_GID con modo 0440; este
+  # grupo es lo único que deja leerlos al usuario sin privilegios del proceso.
+  group_add: ['${PARA_SECRETS_GID:-10001}']
+
+x-env-from-files: &env-from-files
+  entrypoint: ['dumb-init', '--', 'sh', '/para/env-from-files']
+
+x-env-from-files-volume: &env-from-files-volume ${PLATFORM_DIR:?Ejecuta con make desde para/}/runtime/env-from-files.sh:/para/env-from-files:ro
+
+services:
+  postgres:
+    profiles: [core, matrix]
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pg}
+      POSTGRES_DB: ${POSTGRES_DB:-para}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    # listen_addresses: con el comando propio Postgres seguiría escuchando en
+    # todas las interfaces de su red; el perfil fija lo que depende de la RAM.
+    command: >-
+      postgres -c listen_addresses=*
+      -c shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      -c effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      -c work_mem=${PG_WORK_MEM:-4MB}
+      -c maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-64MB}
+      -c max_connections=${PG_MAX_CONNECTIONS:-100}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Crea las bases matrix (collation C), mas y bridge en el primer
+      # arranque; `make db-init` lo repite en un volumen que ya existía.
+      - ${PLATFORM_DIR}/ops/postgres/init:/docker-entrypoint-initdb.d:ro
+    # Solo para workers de AppView en otras máquinas (PARA_PRIVATE_BIND = la
+    # IP privada de esta). Por defecto, solo loopback.
+    ports:
+      - '${PARA_PRIVATE_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432'
+    networks:
+      default:
+        # Las configuraciones generadas de Synapse y MAS llaman así a su base.
+        aliases: [synapse-db, mas-db]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-pg}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    shm_size: 256mb
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEM:-1g}
+
+  redis:
+    profiles: [core]
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >-
+      redis-server --save '' --appendonly no
+      --maxmemory ${REDIS_MAXMEMORY:-96mb} --maxmemory-policy allkeys-lru
+      --loglevel warning
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEM:-128m}
+
+  pds:
+    profiles: [core]
+    image: ${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}
+    restart: unless-stopped
+    <<: *secrets-reader
+    labels:
+      para.metrics.port: '9583'
+      # vlpds se detiene a propósito ante ciertos fallos (exit 2–9) y espera
+      # que Docker lo vuelva a levantar; Watchtower nunca debe tocarlo.
+      com.centurylinklabs.watchtower.enable: 'false'
+    # Las opciones de tamaño sin variable de entorno van como argumentos; los
+    # valores salen del perfil (profiles/*.env).
+    command:
+      - --firehose-ring-mb=${VLPDS_FIREHOSE_RING_MB:-64}
+      - --firehose-merge-queue-mb=${VLPDS_FIREHOSE_MERGE_QUEUE_MB:-32}
+      - --firehose-max-lag-mb=${VLPDS_FIREHOSE_MAX_LAG_MB:-64}
+      - --live-ring-mb=${VLPDS_LIVE_RING_MB:-32}
+      - --backfill-readahead-mb=${VLPDS_BACKFILL_READAHEAD_MB:-16}
+      - --backfill-cache-mb=${VLPDS_BACKFILL_CACHE_MB:-32}
+      - --firehose-max-backfills=${VLPDS_FIREHOSE_MAX_BACKFILLS:-4}
+      - --max-exports=${VLPDS_MAX_EXPORTS:-4}
+      - --lazy-mst-node-cache-mb=${VLPDS_LAZY_MST_NODE_CACHE_MB:-64}
+      - --firehose-threads=${VLPDS_FIREHOSE_THREADS:-1}
+    # Correo, marca, enlaces legales, llave de recuperación (opcional).
+    env_file:
+      - path: ${PLATFORM_DIR}/env/vlpds.env
+        required: false
+    environment:
+      VLPDS_PUBLIC_URL: https://pds.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}
+      VLPDS_SERVICE_DID: did:web:pds.${PARA_DOMAIN}
+      # Los handles de usuario: alice.<dominio> (PARA_HANDLE_DOMAIN sin el
+      # punto inicial; el Makefile lo calcula).
+      VLPDS_HANDLE_DOMAIN: ${VLPDS_HANDLE_DOMAIN:?Ejecuta con make desde para/}
+      VLPDS_PLC_URL: ${PLC_URL:-https://plc.directory}
+      VLPDS_INVITE_REQUIRED: ${PDS_INVITE_REQUIRED:-true}
+      # El AppView y Ozone por la red interna: vlpds confía en esas URLs.
+      VLPDS_APPVIEW: http://bsky:2584,${BSKY_SERVER_DID}
+      VLPDS_REPORT_SERVICE: http://ozone:3000,${OZONE_SERVER_DID}
+      VLPDS_MOD_SERVICE_DID: ${OZONE_SERVER_DID}
+      # El relay local siempre; bsky.network (o lo que pongas) para federar.
+      # vlpds exige un nombre con punto: el relay tiene el alias de abajo.
+      VLPDS_CRAWLERS: http://relay.para.internal:2470${PDS_CRAWLERS_EXTRA:-,https://bsky.network}
+      # Caddy es el único que habla con vlpds; su X-Forwarded-For es fiable.
+      VLPDS_TRUSTED_PROXIES: ${PARA_DOCKER_SUBNETS:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+      VLPDS_S3_ENDPOINT: ${S3_ENDPOINT:-}
+      VLPDS_S3_REGION: ${S3_REGION:-auto}
+      VLPDS_S3_BUCKET: ${S3_BUCKET:?Define S3_BUCKET en .env}
+      # Un prefijo es un PDS: nunca apuntes dos despliegues al mismo.
+      VLPDS_PREFIX: ${S3_PREFIX:-prod}/vlpds
+      VLPDS_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key_id
+      VLPDS_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_access_key
+      VLPDS_JWT_SECRET_FILE: /run/secrets/vlpds_jwt_secret
+      VLPDS_ADMIN_TOKEN_FILE: /run/secrets/vlpds_admin_token
+      VLPDS_INTERNAL_TOKEN_FILE: /run/secrets/vlpds_internal_token
+      VLPDS_KEK_FILE: /run/secrets/vlpds_kek
+      VLPDS_PLC_ROTATION_KEY_FILE: /run/secrets/vlpds_plc_rotation_key
+      VLPDS_RATE_LIMIT_BYPASS_KEY_FILE: /run/secrets/vlpds_rate_limit_bypass_key
+      # Un nodo. Nunca levantes dos con el mismo VLPDS_NODE_ID y prefijo: se
+      # bloquean entre sí (docs/VLPDS.md, "Escalar").
+      VLPDS_NODE_ID: ${VLPDS_NODE_ID:-single}
+      VLPDS_SHARDS: ${VLPDS_SHARDS:-1}
+      VLPDS_LEASE_TTL_MS: ${VLPDS_LEASE_TTL_MS:-60000}
+      VLPDS_SLATEDB_MANIFEST_POLL: ${VLPDS_SLATEDB_MANIFEST_POLL:-60s}
+      VLPDS_CACHE_DIR: /var/lib/vlpds/cache
+      VLPDS_DISK_CACHE_MB: ${VLPDS_DISK_CACHE_MB:-4096}
+      # Solo dentro de la red de Compose (Alloy); el edge bloquea /metrics.
+      VLPDS_METRICS_LISTEN: 0.0.0.0:9583
+      # La consola de operador (/admin) y vlpds.admin.* en su propio puerto,
+      # publicado solo en el loopback del servidor: se llega por un túnel SSH
+      # o tailscale serve, nunca por el edge.
+      VLPDS_ADMIN_LISTEN: 0.0.0.0:2620
+      VLPDS_LOG_FORMAT: json
+      VLPDS_SPACES: ${VLPDS_SPACES:-false}
+    secrets:
+      - s3_access_key_id
+      - s3_secret_access_key
+      - vlpds_jwt_secret
+      - vlpds_admin_token
+      - vlpds_internal_token
+      - vlpds_kek
+      - vlpds_plc_rotation_key
+      - vlpds_rate_limit_bypass_key
+    ports:
+      - '127.0.0.1:${VLPDS_ADMIN_PORT:-2620}:2620'
+    volumes:
+      - vlpds_cache:/var/lib/vlpds/cache
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    healthcheck:
+      test: ['CMD', 'curl', '-sf', 'http://127.0.0.1:2583/xrpc/_health']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # Los shards reproducen la cola de su log antes de servir.
+      start_period: 120s
+    # Un apagado con gracia tarda ~1 s; tras un SIGKILL el nodo no escribe
+    # durante un lease (60 s en tiny).
+    stop_grace_period: 90s
+    deploy:
+      resources:
+        limits:
+          # vlpds dimensiona sus cachés con este límite; menos de 2 GB no le
+          # alcanza (vlpds --memory-plan).
+          memory: ${VLPDS_MEM:-2g}
+
+  relay:
+    profiles: [core]
+    build:
+      context: https://github.com/bluesky-social/indigo.git#${RELAY_COMMIT:-162dca49278b59fef7745f72ae7b641dc27f4d83}
+      dockerfile: cmd/relay/Dockerfile
+      args:
+        # Su Dockerfile llama a git describe.
+        BUILDKIT_CONTEXT_KEEP_GIT_DIR: '1'
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/indigo-relay:${RELAY_VERSION:-162dca4}
+    restart: unless-stopped
+    <<: [*secrets-reader]
+    labels:
+      para.metrics.port: '2471'
+    environment:
+      DATABASE_URL_FILE: /run/secrets/postgres_url_relay
+      RELAY_API_BIND: ':2470'
+      RELAY_METRICS_LISTEN: ':2471'
+      RELAY_PLC_HOST: ${PLC_URL:-https://plc.directory}
+      RELAY_PERSIST_DIR: /data/relay
+      RELAY_ADMIN_PASSWORD_FILE: /run/secrets/relay_admin_password
+      # Sin requestCrawl público: solo vlpds (por la red interna) y el admin.
+      RELAY_TRUSTED_DOMAINS: pds.${PARA_DOMAIN}
+    secrets: [postgres_url_relay, relay_admin_password]
+    networks:
+      default:
+        # vlpds no acepta un crawler sin punto en el nombre (`relay`).
+        aliases: [relay.para.internal]
+    volumes:
+      - relay_data:/data/relay
+      - *env-from-files-volume
+    entrypoint: ['dumb-init', '--', 'sh', '/para/env-from-files']
+    command: ['/relay', 'serve']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:2470/xrpc/_health']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: ${RELAY_MEM:-256m}
+
+  # dataplane, bsky, bsync y ozone no guardan nada propio: todo está en
+  # Postgres, así que se reemplazan y escalan sin miedo.
+  dataplane:
+    profiles: [core]
+    build:
+      context: ${WATZAPPA_DIR:-../../WatZappa}
+      dockerfile: ./services/bsky/Dockerfile
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-bsky:${WATZAPPA_VERSION:-local}
+    restart: unless-stopped
+    <<: [*secrets-reader, *env-from-files]
+    command: ['node', '--enable-source-maps', 'dataplane.js']
+    env_file:
+      - path: ${PLATFORM_DIR}/env/core.env
+        required: false
+    environment:
+      BSKY_DATAPLANE_PORT: 2585
+      BSKY_DB_POSTGRES_URL_FILE: /run/secrets/postgres_url
+      BSKY_DB_POSTGRES_SCHEMA: bsky
+      BSKY_DID_PLC_URL: ${PLC_URL:-https://plc.directory}
+      # El firehose de vlpds, renumerado por el relay.
+      BSKY_REPO_PROVIDER: ws://relay:2470
+      BSKY_BSYNC_URL: http://bsync:2586
+      BSKY_BSYNC_HTTP_VERSION: '1.1'
+      BSKY_BSYNC_API_KEY_FILE: /run/secrets/bsync_api_key
+    secrets: [postgres_url, bsync_api_key]
+    volumes:
+      - *env-from-files-volume
+    depends_on:
+      postgres:
+        condition: service_healthy
+      relay:
+        condition: service_started
+    deploy:
+      # Uno solo: indexa el firehose (dos indexarían todo dos veces).
+      replicas: 1
+      resources:
+        limits:
+          memory: ${DATAPLANE_MEM:-512m}
+
+  bsky:
+    profiles: [core]
+    build:
+      context: ${WATZAPPA_DIR:-../../WatZappa}
+      dockerfile: ./services/bsky/Dockerfile
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-bsky:${WATZAPPA_VERSION:-local}
+    restart: unless-stopped
+    <<: [*secrets-reader, *env-from-files]
+    command: ['node', '--heapsnapshot-signal=SIGUSR2', '--enable-source-maps', '--import=./tracer.js', '--import=@atproto/bsky/telemetry', 'api.js']
+    env_file:
+      - path: ${PLATFORM_DIR}/env/core.env
+        required: false
+    environment:
+      BSKY_PORT: 2584
+      # Sirve su documento did:web ahí; sin esto tampoco arma las URLs de
+      # imágenes y video.
+      BSKY_PUBLIC_URL: https://appview.${PARA_DOMAIN}
+      BSKY_SERVER_DID: ${BSKY_SERVER_DID}
+      BSKY_DID_PLC_URL: ${PLC_URL:-https://plc.directory}
+      BSKY_REDIS_HOST: redis:6379
+      BSKY_DATAPLANE_URLS: http://dataplane:2585
+      BSKY_DATAPLANE_HTTP_VERSION: '1.1'
+      BSKY_BSYNC_URL: http://bsync:2586
+      BSKY_BSYNC_HTTP_VERSION: '1.1'
+      BSKY_BSYNC_API_KEY_FILE: /run/secrets/bsync_api_key
+      BSKY_APP_VIEW_DID: ${BSKY_SERVER_DID}
+      MOD_SERVICE_DID: ${OZONE_SERVER_DID}
+      BSKY_ADMIN_PASSWORDS_FILE: /run/secrets/bsky_admin_passwords
+      BSKY_SERVICE_SIGNING_KEY_FILE: /run/secrets/bsky_service_signing_key
+      # Credencial compartida solo con el bridge (autoridad de comunidades).
+      PARA_AUTHORITY_SERVICE_TOKEN_FILE: /run/secrets/authority_service_token
+      # Compartido solo con mubEZ (resolución de delegaciones cívicas).
+      PARA_CIVIC_DELEGATION_RESOLVER_SECRET_FILE: /run/secrets/civic_delegation_resolver_secret
+    secrets:
+      - bsync_api_key
+      - bsky_admin_passwords
+      - bsky_service_signing_key
+      - authority_service_token
+      - civic_delegation_resolver_secret
+    volumes:
+      - *env-from-files-volume
+    depends_on:
+      redis:
+        condition: service_healthy
+      dataplane:
+        condition: service_started
+      bsync:
+        condition: service_started
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:2584/xrpc/_health']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      replicas: ${BSKY_REPLICAS:-1}
+      resources:
+        limits:
+          memory: ${BSKY_MEM:-768m}
+
+  bsync:
+    profiles: [core]
+    build:
+      context: ${WATZAPPA_DIR:-../../WatZappa}
+      dockerfile: ./services/bsync/Dockerfile
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-bsync:${WATZAPPA_VERSION:-local}
+    restart: unless-stopped
+    <<: [*secrets-reader, *env-from-files]
+    command: ['node', '--enable-source-maps', '--import=./tracer.js', '--import=@atproto/bsync/telemetry', 'index.js']
+    env_file:
+      - path: ${PLATFORM_DIR}/env/core.env
+        required: false
+    environment:
+      BSYNC_PORT: 2586
+      BSYNC_DB_POSTGRES_URL_FILE: /run/secrets/postgres_url
+      BSYNC_DB_POSTGRES_SCHEMA: bsync
+      BSYNC_DB_MIGRATE: 'true'
+      BSYNC_API_KEYS_FILE: /run/secrets/bsync_api_key
+    secrets: [postgres_url, bsync_api_key]
+    volumes:
+      - *env-from-files-volume
+    # Los workers de AppView lo llaman por la red privada.
+    ports:
+      - '${PARA_PRIVATE_BIND:-127.0.0.1}:2586:2586'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${BSYNC_MEM:-192m}
+
+  ozone:
+    profiles: [core]
+    build:
+      context: ${WATZAPPA_DIR:-../../WatZappa}
+      dockerfile: ./services/ozone/Dockerfile
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-ozone:${WATZAPPA_VERSION:-local}
+    restart: unless-stopped
+    <<: [*secrets-reader, *env-from-files]
+    command: ['node', '--enable-source-maps', '--import=./tracer.ts', 'api.ts']
+    env_file:
+      - path: ${PLATFORM_DIR}/env/core.env
+        required: false
+    environment:
+      OZONE_PORT: 3000
+      OZONE_PUBLIC_URL: https://ozone.${PARA_DOMAIN}
+      OZONE_SERVER_DID: ${OZONE_SERVER_DID}
+      OZONE_ADMIN_DIDS: ${ADMIN_DIDS:-}
+      OZONE_DID_PLC_URL: ${PLC_URL:-https://plc.directory}
+      OZONE_APPVIEW_URL: http://bsky:2584
+      OZONE_APPVIEW_DID: ${BSKY_SERVER_DID}
+      OZONE_APPVIEW_PUSH_EVENTS: 'true'
+      OZONE_PDS_URL: http://pds:2583
+      OZONE_PDS_DID: did:web:pds.${PARA_DOMAIN}
+      OZONE_DB_POSTGRES_URL_FILE: /run/secrets/postgres_url
+      OZONE_DB_POSTGRES_SCHEMA: ozone
+      # api.ts solo migra su esquema con esto.
+      OZONE_DB_MIGRATE: '1'
+      OZONE_SIGNING_KEY_HEX_FILE: /run/secrets/ozone_signing_key
+      OZONE_ADMIN_PASSWORD_FILE: /run/secrets/ozone_admin_password
+    secrets:
+      - postgres_url
+      - ozone_signing_key
+      - ozone_admin_password
+    volumes:
+      - *env-from-files-volume
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${OZONE_MEM:-384m}
+
+  # Respaldos de Postgres al bucket cada BACKUP_INTERVAL (ops/backup). vlpds
+  # no necesita uno: sus datos ya están en el bucket (docs/RESPALDOS.md).
+  backup:
+    profiles: [core]
+    labels:
+      para.metrics.port: '9101'
+    build: ${PLATFORM_DIR}/ops/backup
+    image: para-backup:local
+    restart: unless-stopped
+    group_add: ['${PARA_SECRETS_GID:-10001}']
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-auto}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX:-prod}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key_id
+      S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_access_key
+      BACKUP_INTERVAL: ${BACKUP_INTERVAL:-6h}
+      BACKUP_RETENTION: ${BACKUP_RETENTION:-14d}
+      BACKUP_TARGETS: postgres
+      BACKUP_DATABASES: ${POSTGRES_DB:-para} relay ${MATRIX_DB_NAME:-matrix} mas bridge
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-pg}
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password, s3_access_key_id, s3_secret_access_key]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${BACKUP_MEM:-256m}
+
+  # El edge: lo único expuesto a internet (80 y 443). edge/Caddyfile.
+  caddy:
+    profiles: [edge]
+    image: caddy:2.10.2
+    restart: unless-stopped
+    labels:
+      para.metrics.port: '9180'
+    environment:
+      PARA_DOMAIN: ${PARA_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      PARA_OPERATOR_CIDRS: ${PARA_OPERATOR_CIDRS:-127.0.0.1/8 100.64.0.0/10 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}
+      # AppViews en otras máquinas ("ip:puerto ..."); ver docs/ESCALADO.md.
+      APPVIEW_WORKERS: ${APPVIEW_WORKERS:-}
+      PARA_HANDLE_DOMAIN: ${PARA_HANDLE_DOMAIN:-.${PARA_DOMAIN}}
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:-matrix.${PARA_DOMAIN}}
+      # El Makefile lo pone en "reverse_proxy web:8100" con el perfil web.
+      PARA_ROOT_HANDLER: ${PARA_ROOT_HANDLER:-respond "Not Found" 404}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ${PLATFORM_DIR}/edge/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Rutas por perfil; el Makefile elige el archivo real o uno vacío.
+      - ${PARA_EDGE_MATRIX_SITE:-${PLATFORM_DIR}/edge/sites/empty.Caddyfile}:/etc/caddy/sites/matrix.Caddyfile:ro
+      - ${PARA_EDGE_IDENTITY_SITE:-${PLATFORM_DIR}/edge/sites/empty.Caddyfile}:/etc/caddy/sites/identity.Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      pds:
+        condition: service_healthy
+    # Caddy espera a que terminen las peticiones en curso al detenerse.
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${CADDY_MEM:-128m}
+
+volumes:
+  postgres_data:
+  vlpds_cache:
+  relay_data:
+  caddy_data:
+  caddy_config:

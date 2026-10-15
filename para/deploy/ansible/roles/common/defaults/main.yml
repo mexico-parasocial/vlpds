@@ -1,0 +1,13 @@
+---
+# Puertos públicos. 80 es obligatorio: Caddy lo usa para el reto ACME HTTP-01
+# y para redirigir a HTTPS. Los workers de AppView no necesitan ninguno.
+common_public_tcp_ports: "{{ [22, 80, 443] if 'para' in group_names else [22] }}"
+
+# Red privada (Tailscale). Con una authkey, la máquina se une y todo lo de
+# tailscale0 queda permitido: consola de operador, métricas, workers.
+common_tailscale_authkey: ""
+common_tailscale_tags: "tag:para"
+
+# Vacío = la versión estable del repo de Docker. Para fijar:
+# "5:27.3.1-1~ubuntu.24.04~noble"
+common_docker_apt_version: ""
