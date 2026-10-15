@@ -46,7 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH_DIR = os.path.join(HERE, "dashboards")
 PROD_DIR = os.path.normpath(os.path.join(HERE, "../../../../../deploy/ansible/roles/monitoring/files/dashboards"))
 # The Prometheus datasource uid of that deployment's Grafana.
-PROD_PROM_UID = "P4169E866C3094E38"
+PROD_PROM_UID = "yeet-query"
 
 PROM = {"type": "prometheus", "uid": "${ds_prometheus}"}
 PYRO = {"type": "grafana-pyroscope-datasource", "uid": "${ds_pyroscope}"}
