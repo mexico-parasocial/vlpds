@@ -75,7 +75,7 @@ confirmAction({
 })
 ```
 
-The footer shows `call`, the request it makes. `run` errors stay in the dialog. `openDialog(close => <FormDialog …/>)` is for forms that aren't confirmations.
+The footer shows `call`, the request it makes. `run` errors stay in the dialog. `openDialog(close => <FormDialog …/>)` is for forms that aren't confirmations (`wide` for a long one).
 
 ## Data layer
 
@@ -125,9 +125,12 @@ One client cache (TanStack Query, `lib/console/query.ts`) holds everything the c
 | Domains & invites | `/admin/domains` | Built. Detail kinds `domain`, `invite` |
 | Spaces | `/admin/spaces` | Built. Detail kind `space` (id: the space URI), and `/admin/spaces/space?uri=` shows its full page |
 | Mail | `/admin/mail` | Built. Detail kind `mail` (id `node:id`). Budgets from getRateLimits' `mail-*` buckets. `?purpose=`, `?domain=` and `?did=` filter the log |
+| Sign-in providers | `/admin/signin` | Built (`SignInProviders.tsx`, form, removal and per-node results in `signInUi.tsx`, model and payload in `lib/console/signInDraft.ts`). Detail kind `provider`. Every write carries the list's `version` as ifVersion; secrets and keys are write-only and only ever typed in (`{value}`; an omitted one keeps the stored one, except after the issuer or auth method changes, which needs it again). Each provider has its own callback URL (`/oauth/federated/callback/<id>`), shown in the slide-over and the form. `lib/console/changes.ts` maps `config` / `signin-providers` to its list |
 | AppView override | `/admin/appview` | Built (`AppviewOverride.tsx`). Every edit goes through `editOverride` (diff, then updateAppviewOverride with ifVersion). An account's page toggles it with `toggleAccount` |
 | Config | `/admin/config` | Built. Detail kind `cfg` (id: the flag). getConfig from every node, relayed by `x-vlpds-node` |
 
 ## Trying it
+
+`npm run dev:mock` serves the console and the account page from `dev/mock.mjs` with no server (sign-in providers and linked identities only; other panels show their errors). `VLPDS_MOCK_LEVEL=1` shows the sign-in providers page below feature level 2. `npm run shots [dir]` shoots both pages against it (desktop, phone, dark) and exits 1 on console errors; `npm test` runs `test/` (the sign-in provider form's checks and payload) under node.
 
 `just dev` (or any local vlpds) and `just dev-ui url=http://127.0.0.1:2620`, then `/admin` with the dev admin token. Open it in two tabs to see the change feed: an action in one shows in the other within a second. `loadgen setup` and `loadgen run --rate 5` give the tail and the strata something to show. A real three-node cluster needs an S3 bucket (a throwaway MinIO works) and three `--dev-mode` nodes sharing `--peer-tls-dir` and `--prefix`, as `bench/ha/hactl.py` starts them.

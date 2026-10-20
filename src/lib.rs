@@ -13,6 +13,7 @@ pub mod cluster;
 pub mod config_report;
 pub mod derived;
 pub mod email_policy;
+pub mod federated;
 pub mod forward;
 pub mod handle_domains;
 pub mod handle_policy;

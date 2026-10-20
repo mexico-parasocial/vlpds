@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 // The console's information architecture: one entry per sidebar item, in order. `key` is the
 // letter after `g`; `aliases` are older paths that still land in the section.
 
-export type SectionId = 'overview' | 'nodes' | 'storage' | 'firehose' | 'accounts' | 'moderation' | 'limits' | 'domains' | 'spaces' | 'mail' | 'appview' | 'config'
+export type SectionId = 'overview' | 'nodes' | 'storage' | 'firehose' | 'accounts' | 'moderation' | 'limits' | 'domains' | 'spaces' | 'mail' | 'signin' | 'appview' | 'config'
 
 export type Section = { id: SectionId; label: string; short?: string; key: string; group: '' | 'Cluster' | 'People' | 'System'; path: string; aliases?: string[]; icon: ReactNode; alpha?: boolean }
 
@@ -137,6 +137,21 @@ export const SECTIONS: Section[] = [
       <>
         <rect x="1.5" y="3" width="13" height="10" rx="1.5" {...s} />
         <path d="m2 4 6 5 6-5" {...s} />
+      </>,
+    ),
+  },
+  {
+    id: 'signin',
+    label: 'Sign-in providers',
+    short: 'Sign-in',
+    key: 'i',
+    group: 'System',
+    path: '/admin/signin',
+    aliases: ['/admin/sign-in-providers'],
+    icon: svg(
+      <>
+        <rect x="1.5" y="1.5" width="8" height="13" rx="1.5" {...s} />
+        <path d="M6 8h8M11.5 5.5 14 8l-2.5 2.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
       </>,
     ),
   },

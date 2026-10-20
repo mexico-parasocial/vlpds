@@ -238,6 +238,8 @@ async fn one_level_below_max_writes_nothing_new() {
     let _level = ACTIVE_LEVEL.lock().await;
     assert_eq!(version::MAX_LEVEL, version::TEST_LEVEL, "built with --features test-level");
     let below = version::MAX_LEVEL - 1;
+    // a level that didn't change segments writes the magic of the one that did
+    let below_seg = version::segment_level(version::segment_magic(below)).unwrap();
     let store = Arc::new(object_store::memory::InMemory::new());
     // the cluster runs one level below this build's max (as after a rolling
     // upgrade to it, before finalize)
@@ -282,7 +284,7 @@ async fn one_level_below_max_writes_nothing_new() {
 
     let s = scan(&store, Some(below)).await;
     eprintln!("at level {below}: {s:?}");
-    assert!(s.segments.get(&below).is_some_and(|n| *n > 10) && s.segments.len() == 1, "{s:?}");
+    assert!(s.segments.get(&below_seg).is_some_and(|n| *n > 10) && s.segments.len() == 1, "{s:?}");
     assert!(s.fences >= 1, "c's graceful exit fenced its log: {s:?}");
     assert!(s.reports.1 >= 3 && s.reports.0 == 0, "{s:?}");
     verify(&[&a, &b, &c], &acked).await;
@@ -318,7 +320,7 @@ async fn one_level_below_max_writes_nothing_new() {
     write(&[&a, &b, &c], &accts, 2, "b back", &mut acked).await;
     let s = scan(&store, None).await;
     eprintln!("after finalize: {s:?}");
-    assert!(s.segments.contains_key(&below) && s.segments.contains_key(&version::TEST_LEVEL), "{s:?}");
+    assert!(s.segments.contains_key(&below_seg) && s.segments.contains_key(&version::TEST_LEVEL), "{s:?}");
     verify(&[&a, &b, &c], &acked).await;
     let m = reqwest::get(format!("{}/metrics", a.url)).await.unwrap().text().await.unwrap();
     assert!(m.contains("vlpds_format_errors_total{format=\"segment\"} 0"), "no format errors");

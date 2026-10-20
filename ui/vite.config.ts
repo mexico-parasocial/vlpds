@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { vlpdsDocs } from './docs-build/plugin.mjs'
+import { vlpdsMock } from './dev/mock.mjs'
 
 // Node's environment, without pulling in @types/node for one variable.
 declare const process: { env: Record<string, string | undefined> }
@@ -13,7 +14,7 @@ const proxy = Object.fromEntries(
 )
 
 export default defineConfig({
-  plugins: [react(), vlpdsDocs()],
+  plugins: [react(), vlpdsDocs(), vlpdsMock()],
   base: '/',
   build: {
     outDir: 'dist',

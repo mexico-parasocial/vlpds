@@ -24,6 +24,7 @@ import { Nodes } from './Nodes'
 import { Overview } from './Overview'
 import { Legacy } from './Placeholder'
 import { Limits } from './Limits'
+import { SignInProviders } from './SignInProviders'
 import { SpaceByUri, Spaces } from './Spaces'
 import { Storage } from './Storage'
 import './systemDetails'
@@ -77,6 +78,9 @@ function route(p: string): Route {
       return { section: S.spaces, page: <SpaceByUri />, crumbs: crumb(S.spaces, 'Space') }
     case '/admin/mail':
       return { section: S.mail, page: <Mail /> }
+    case '/admin/signin':
+    case '/admin/sign-in-providers':
+      return { section: S.signin, page: <SignInProviders /> }
     case '/admin/appview':
     case '/admin/appview-override':
       return { section: S.appview, page: <AppviewOverride /> }

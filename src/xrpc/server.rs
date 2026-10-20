@@ -818,7 +818,7 @@ pub fn set_stale_claim_grace(app: &App, grace: std::time::Duration) {
 }
 
 /// (holder, version, age)
-async fn read_claim(
+pub(super) async fn read_claim(
     app: &App,
     path: &object_store::path::Path,
 ) -> XResult<Option<(String, object_store::UpdateVersion, std::time::Duration)>> {
@@ -846,6 +846,25 @@ async fn claim(
     did: &str,
     holds: impl Fn(&Account) -> bool,
 ) -> XResult<bool> {
+    let holds = &holds;
+    claim_with(app, path, did, |holder: String| async move {
+        match super::internal::account_anywhere(app, &holder).await {
+            Ok(a) => Ok(holds(&a)),
+            Err(e) if e.error == "AccountNotFound" => Ok(false),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+}
+
+/// [`claim`] with the holder's standing (Ok(true): an account stands on
+/// the claim) decided by `stands`; an error is never "no account".
+pub(super) async fn claim_with<F: std::future::Future<Output = XResult<bool>>>(
+    app: &App,
+    path: &object_store::path::Path,
+    did: &str,
+    stands: impl Fn(String) -> F,
+) -> XResult<bool> {
     let payload = || PutPayload::from(did.as_bytes().to_vec());
     let grace = std::time::Duration::from_millis(ext(app).claim_grace_ms.load(Ordering::Relaxed));
     for _ in 0..3 {
@@ -863,10 +882,7 @@ async fn claim(
         if age < grace {
             return Ok(false);
         }
-        let stale = match super::internal::account_anywhere(app, &holder).await {
-            Ok(a) => !holds(&a),
-            Err(e) => e.error == "AccountNotFound",
-        };
+        let stale = stands(holder.clone()).await.is_ok_and(|s| !s);
         if !stale || (version.e_tag.is_none() && version.version.is_none()) {
             return Ok(false);
         }
@@ -901,7 +917,7 @@ async fn try_release_email(app: &App, email: &str, did: &str) -> XResult<()> {
     Ok(())
 }
 
-async fn delete_claim(app: &App, path: &object_store::path::Path) -> XResult<()> {
+pub(super) async fn delete_claim(app: &App, path: &object_store::path::Path) -> XResult<()> {
     match app.store.raw.delete(path).await {
         Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
         Err(e) => Err(XrpcError::from_err(e)),
@@ -1193,15 +1209,17 @@ pub(super) async fn revoke_everything(app: &App, did: &str) -> XResult<()> {
     revoke_all_sessions(app, did).await
 }
 
-/// The OAuth and legacy sessions a passkey (`auth_ref`) signed in. Device
-/// sign-ins and codes it approved are refused when used
-/// (`passkeys::still_registered`).
+/// The OAuth and legacy sessions a passkey or sign-in identity (`auth_ref`)
+/// signed in. Device sign-ins and codes it approved are refused when used
+/// (`passkeys::credentials_live`).
 pub(super) async fn revoke_signed_in_with(app: &App, did: &str, auth_ref: &str) -> XResult<()> {
-    let gone = delete_sessions_where(app, did, |_, st| st.auth_cred.as_deref() == Some(auth_ref)).await?;
+    let gone =
+        delete_sessions_where(app, did, |_, st| crate::federated::signed_in_with(st.auth_cred.as_deref(), auth_ref))
+            .await?;
     let fams: Vec<String> = gone.into_iter().map(|st| st.family).collect();
     revoke_families(app, did, &fams).await?;
     for s in crate::oauth::store::list_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))? {
-        if s.auth_cred.as_deref() == Some(auth_ref) {
+        if crate::federated::signed_in_with(s.auth_cred.as_deref(), auth_ref) {
             crate::oauth::store::delete_session(app, did, &s.id)
                 .await
                 .map_err(|e| XrpcError::internal(e.description))?;
@@ -1375,6 +1393,14 @@ pub(super) struct CreateAccountIn {
     pub plc_op: Option<J>,
     /// Put first in the new DID's rotation keys.
     pub recovery_key: Option<String>,
+    /// A sign-in provider's identity the account is created with, in place
+    /// of a password (the provider signup, never the public method).
+    #[serde(skip)]
+    pub federated: Option<super::federated::NewIdentity>,
+    /// The provider vouched for the address (`trustEmail` and
+    /// `email_verified`).
+    #[serde(skip)]
+    pub email_confirmed: bool,
 }
 
 /// Account flag: the DID was migrated in, so its document is not ours to
@@ -1475,7 +1501,13 @@ async fn create_account_checked(
     if inp.plc_op.is_some() {
         return Err(invalid_request("Unsupported input: \"plcOp\""));
     }
-    let password = inp.password.ok_or_else(|| invalid_request("Password is required"))?;
+    let federated = inp.federated.clone();
+    // only a provider signup has no password; an empty one is none at all
+    let password = match (inp.password, &federated) {
+        (_, Some(_)) => String::new(),
+        (Some(p), None) if !p.trim().is_empty() => p,
+        (_, None) => return Err(invalid_request("Password is required")),
+    };
     if password.len() > NEW_PASSWORD_MAX_LENGTH {
         return Err(invalid_request(format!(
             "Password too long. Maximum length is {NEW_PASSWORD_MAX_LENGTH} characters."
@@ -1537,7 +1569,7 @@ async fn create_account_checked(
         None => None,
     };
     let release = |handle_ok: bool, email_ok: bool, claim: Option<super::admin::InviteClaim>| {
-        let (handle, email, did) = (&handle, &email, &did);
+        let (handle, email, did, federated) = (&handle, &email, &did, &federated);
         async move {
             if handle_ok {
                 release_handle(app, handle, did).await;
@@ -1548,17 +1580,44 @@ async fn create_account_checked(
             if let Some(c) = claim {
                 super::admin::release_invite_use(app, c).await;
             }
+            if let Some(f) = federated {
+                super::federated::release_new(app, f, did).await;
+            }
         }
     };
     // Concurrent: run one after the other, the claims' store round trips, the
     // password hash and the key wrap (KMS) were most of the latency.
-    let (h, e, password_hash, wrapped) = tokio::join!(
+    let hash = async {
+        match federated.is_some() {
+            true => Ok(String::new()),
+            false => state::try_hash_password(&password).await,
+        }
+    };
+    let fed_claim = async {
+        match &federated {
+            Some(f) => super::federated::claim_new(app, f, &did).await,
+            None => Ok(true),
+        }
+    };
+    let (h, e, password_hash, wrapped, f) = tokio::join!(
         claim_handle(app, &handle, &did),
         claim_email(app, &email, &did),
-        state::try_hash_password(&password),
-        app.secrets.wrap_signing_key(&did, &key)
+        hash,
+        app.secrets.wrap_signing_key(&did, &key),
+        fed_claim
     );
     let (h_ok, e_ok) = (matches!(h, Ok(true)), matches!(e, Ok(true)));
+    match f {
+        Ok(true) => {}
+        Ok(false) => {
+            release(h_ok, e_ok, claim).await;
+            return Err(XrpcError::bad("IdentityTaken", "That sign-in is already used by another account here"));
+        }
+        Err(err) => {
+            release(h_ok, e_ok, claim).await;
+            return Err(err);
+        }
+    }
     let wrapped = match &password_hash {
         Ok(_) => wrapped.map_err(XrpcError::from),
         // Argon2 saturated: 503 Overloaded, the claims released below
@@ -1591,6 +1650,19 @@ async fn create_account_checked(
             return Err(err.into());
         }
     }
+    if let Some(f) = &federated {
+        // the row first: an account never exists without the identity it
+        // was made for (a password-less account would have no way in)
+        if let Err(err) = super::federated::write_new(app, f, &did).await {
+            release(true, true, claim).await;
+            if let Some((plc, _)) = &genesis {
+                if let Err(t) = plc.tombstone(&did).await {
+                    tracing::error!(%did, "tombstoning the DID of a failed account creation: {t}");
+                }
+            }
+            return Err(err);
+        }
+    }
     let mut acct = Account {
         did: did.clone(),
         handle: handle.clone(),
@@ -1598,6 +1670,7 @@ async fn create_account_checked(
         signing_pubkey,
         created_at: vlatproto::events::now_rfc3339(),
         email: Some(email.clone()),
+        email_confirmed: inp.email_confirmed && federated.is_some(),
         ..Default::default()
     };
     acct.password_hash = password_hash.expect("checked with the signing key");
@@ -1619,9 +1692,10 @@ async fn create_account_checked(
     let created = create_repo(app, &did, &handle, key, &acct).await;
     if let Err((e, false)) = &created {
         // Ambiguous: the account may exist (or still appear). Ours if it
-        // carries this request's password hash (salted: unique per request).
+        // carries this request's signing key (fresh per request, password
+        // or not).
         match account_if_exists(app, &did).await {
-            Ok(Some(a)) if a.password_hash == acct.password_hash => {
+            Ok(Some(a)) if a.signing_pubkey == acct.signing_pubkey => {
                 tracing::warn!(%did, "account creation reported {} but the account exists: completed", e.message);
             }
             r => {
@@ -2570,6 +2644,7 @@ pub(super) async fn finish_delete(
         return Err(XrpcError::internal(format!("deletion of {did} stopped after the repo delete (crash hook)")));
     }
     super::space::delete_account_rows(app, did).await?;
+    super::federated::release_all(app, did).await;
     if let Some(d) = &intent {
         try_release_handle(app, &d.handle, did).await?;
         if let Some(e) = &d.email {

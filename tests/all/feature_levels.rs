@@ -90,11 +90,11 @@ async fn cluster_status_shows_levels_and_a_raise_waits_for_every_node() {
 
     // metrics
     let m = reqwest::get(format!("{}/metrics", a.url)).await.unwrap().text().await.unwrap();
-    for line in [
-        "vlpds_feature_level{kind=\"active\"} 1",
-        "vlpds_feature_level{kind=\"binary_max\"} 1",
-        "vlpds_format_errors_total{format=\"segment\"}",
-    ] {
+    // the active level is process-wide, and other tests' clusters run level 2
+    let binary_max = format!("vlpds_feature_level{{kind=\"binary_max\"}} {}", vlsync_store::version::MAX_LEVEL);
+    for line in
+        ["vlpds_feature_level{kind=\"active\"} ", binary_max.as_str(), "vlpds_format_errors_total{format=\"segment\"}"]
+    {
         assert!(m.contains(line), "{line} missing from /metrics");
     }
 }

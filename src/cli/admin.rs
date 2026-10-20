@@ -64,6 +64,9 @@ pub enum Cmd {
     /// (--handle-domain) and any added at runtime, for the whole cluster.
     #[command(subcommand)]
     HandleDomain(HandleDomainCmd),
+    /// Third-party sign-in providers (OpenID Connect), for the whole cluster.
+    #[command(subcommand)]
+    SigninProvider(SigninProviderCmd),
     /// Ask relays to crawl this PDS (pdsadmin request-crawl). Relays:
     /// hostnames or URLs, comma-separated (default: the node's --crawlers).
     RequestCrawl {
@@ -192,6 +195,32 @@ pub enum HandleDomainCmd {
         domain: String,
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SigninProviderCmd {
+    /// Every provider, without its secrets.
+    List,
+    /// Add or replace a provider from a JSON file (`-` for stdin) shaped as
+    /// putSignInProvider's `provider`. A secret or key is given as
+    /// `{"value": …}` and wrapped by the server; left out, the stored one is
+    /// kept (same issuer and method only).
+    Put {
+        file: String,
+        /// Refuse if the providers changed since this version.
+        #[arg(long)]
+        if_version: Option<u64>,
+        /// Save even if the issuer's discovery document can't be fetched.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop offering a provider. Its identities stay on their accounts,
+    /// unusable until a provider with the same issuer is added again.
+    Remove {
+        id: String,
+        #[arg(long)]
+        if_version: Option<u64>,
     },
 }
 
@@ -325,6 +354,68 @@ async fn handle_domain(c: &Client, cmd: HandleDomainCmd, opts: &Opts, out: &mut 
     Ok(())
 }
 
+async fn signin_provider(c: &Client, cmd: SigninProviderCmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
+    let r = match cmd {
+        SigninProviderCmd::List => c.get("vlpds.admin.listSignInProviders", &[]).await?,
+        SigninProviderCmd::Put { file, if_version, force } => {
+            let text = match file.as_str() {
+                "-" => std::io::read_to_string(std::io::stdin())?,
+                f => std::fs::read_to_string(f)?,
+            };
+            let provider: serde_json::Value = serde_json::from_str(&text)?;
+            let mut body = json!({"provider": provider, "force": force});
+            if let Some(v) = if_version {
+                body["ifVersion"] = json!(v);
+            }
+            let r = c.post("vlpds.admin.putSignInProvider", &body).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            writeln!(out, "saved {} (version {})", s(&r["provider"]["id"]), s(&r["version"]))?;
+            return Ok(());
+        }
+        SigninProviderCmd::Remove { id, if_version } => {
+            let mut body = json!({"id": id});
+            if let Some(v) = if_version {
+                body["ifVersion"] = json!(v);
+            }
+            let r = c.post("vlpds.admin.removeSignInProvider", &body).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            writeln!(out, "removed {} (version {})", s(&r["id"]), s(&r["version"]))?;
+            return Ok(());
+        }
+    };
+    if opts.json {
+        return pretty(out, &r);
+    }
+    let mut rows = vec![vec![
+        "ID".to_string(),
+        "NAME".into(),
+        "ISSUER".into(),
+        "AUTH".into(),
+        "SIGNUP".into(),
+        "CALLBACK URL TO REGISTER".into(),
+    ]];
+    for p in r["providers"].as_array().into_iter().flatten() {
+        rows.push(vec![
+            s(&p["id"]),
+            s(&p["name"]),
+            s(&p["issuer"]),
+            s(&p["clientAuth"]["method"]),
+            s(&p["signup"]),
+            s(&p["callbackUrl"]),
+        ]);
+    }
+    write!(out, "{}", table(&rows))?;
+    writeln!(out, "version {}", s(&r["version"]))?;
+    if let Some(why) = r["reason"].as_str() {
+        writeln!(out, "not offered: {why}")?;
+    }
+    Ok(())
+}
+
 /// Like pdsadmin's.
 fn generate_password() -> String {
     use rand::Rng;
@@ -434,6 +525,7 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         Cmd::HandleDomain(h) => handle_domain(&c, h, opts, out).await,
+        Cmd::SigninProvider(p) => signin_provider(&c, p, opts, out).await,
         Cmd::RequestCrawl { relays } => {
             let r = c.post("vlpds.admin.requestCrawl", &json!({"relays": relays})).await?;
             let results = r["results"].as_array().cloned().unwrap_or_default();

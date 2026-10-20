@@ -67,11 +67,14 @@ pub(super) struct Entry {
     /// Minted once per sign-in: a resent write finds it and adds nothing.
     pub id: String,
     pub at: u64,
-    /// "password" | "app_password" | "oauth" | "passkey" (in place of the
-    /// password)
+    /// "password" | "app_password" | "oauth" | "passkey" | "federated" (in
+    /// place of the password)
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_password: Option<String>,
+    /// The sign-in provider's name, for "federated".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     pub device: String,
@@ -325,6 +328,9 @@ pub(crate) enum Method {
     /// A passkey in place of the password: on the OAuth page for this
     /// client, or (None) on this server's own pages.
     Passkey(Option<String>),
+    /// A sign-in provider (its name) in place of the password, on the OAuth
+    /// page for this client or (None) on this server's own pages.
+    Federated(String, Option<String>),
 }
 
 impl Method {
@@ -334,6 +340,7 @@ impl Method {
             Method::AppPassword(_) => "app_password",
             Method::OAuth(_) => "oauth",
             Method::Passkey(_) => "passkey",
+            Method::Federated(..) => "federated",
         }
     }
 
@@ -352,6 +359,8 @@ impl Method {
             Method::OAuth(None) => "with your password, on the sign-in page".into(),
             Method::Passkey(Some(c)) => format!("with a passkey, for {}", client_name(c)),
             Method::Passkey(None) => "with a passkey".into(),
+            Method::Federated(p, Some(c)) => format!("with {p}, for {}", client_name(c)),
+            Method::Federated(p, None) => format!("with {p}"),
         }
     }
 }
@@ -385,8 +394,12 @@ async fn record_inner(app: &App, acct: &Account, method: &Method, factor: Option
             Method::AppPassword(n) => Some(n.clone()),
             _ => None,
         },
+        provider: match method {
+            Method::Federated(p, _) => Some(p.clone()),
+            _ => None,
+        },
         client_id: match method {
-            Method::OAuth(c) | Method::Passkey(c) => c.clone(),
+            Method::OAuth(c) | Method::Passkey(c) | Method::Federated(_, c) => c.clone(),
             _ => None,
         },
         device: ctx.device_key(),
@@ -686,6 +699,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
             at: 1_790_000_000,
             method: "oauth".into(),
             app_password: Some("phone".into()),
+            provider: None,
             client_id: Some("https://app.example/client-metadata.json".into()),
             device: "b:00112233445566778899aabbccddeeff".into(),
             user_agent: Some("Mozilla/5.0".into()),
@@ -712,6 +726,30 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         (did.into(), LOG.into(), to_json_bytes(&log)),
         (did.into(), format!("{TRUST}00112233445566778899aabbccddeeff"), to_json_bytes(&trust)),
     ]
+}
+
+/// A sign-in with a third-party provider (`private/federated.json`).
+pub(super) fn federated_fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
+    let log = Log {
+        entries: vec![Entry {
+            id: "8899aabbccddeeff".into(),
+            at: 1_790_000_600,
+            method: "federated".into(),
+            app_password: None,
+            provider: Some("Example".into()),
+            client_id: Some("https://app.example/client-metadata.json".into()),
+            device: "b:00112233445566778899aabbccddeeff".into(),
+            user_agent: Some("Mozilla/5.0".into()),
+            ip: Some("203.0.113.7".into()),
+            factor: Some("passkey".into()),
+            new_device: false,
+            alerted: false,
+        }],
+        known: vec![Known { device: "b:00112233445566778899aabbccddeeff".into(), last: 1_790_000_600 }],
+        alert_day: 20_717,
+        alerts: 0,
+    };
+    vec![(did.into(), LOG.into(), to_json_bytes(&log))]
 }
 
 pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
@@ -789,6 +827,7 @@ async fn get_sign_in_security(State(app): AppState, Auth(creds): Auth, headers: 
                 "at": rfc3339(e.at),
                 "method": e.method,
                 "appPassword": e.app_password,
+                "provider": e.provider,
                 "clientId": e.client_id,
                 "device": describe_user_agent(e.user_agent.as_deref()),
                 "userAgent": e.user_agent,

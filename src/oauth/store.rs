@@ -333,6 +333,10 @@ pub struct DeviceAccount {
     /// removing it ends what it signed in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_cred: Option<String>,
+    /// A sign-in the account page app asked for: until then, this browser's
+    /// page may trade it once for a session (`createFederatedSession`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub app_handoff_until: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -352,10 +356,29 @@ pub struct Device {
     pub pending_2fa_failures: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pending_2fa_epoch: String,
+    /// The pending sign-in's first step, when it wasn't the password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_2fa_first: Option<FirstFactor>,
     /// Kept past the idle expiry until then: an account trusts this browser
     /// (`xrpc::signin`), and the trust is keyed by this id.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub trusted_until: i64,
+}
+
+/// A sign-in provider in place of the password.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstFactor {
+    /// `fed:…` (`crate::federated::auth_ref`).
+    pub cred: String,
+    /// The provider's name, for the sign-in log.
+    pub provider: String,
+    /// Started from the account page app, which gets the session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub app: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(v: &i64) -> bool {
@@ -376,6 +399,21 @@ pub async fn get_device(app: &App, id: &str) -> Result<Option<Device>, OAuthErro
 
 pub async fn put_device(app: &App, d: &Device) -> Result<(), OAuthError> {
     put(app, &format!("oauth:dev:{}", d.id), "oauth/dev", Some(d)).await
+}
+
+/// The stored bytes are the condition of a [`put_device_if`].
+pub async fn get_device_raw(app: &App, id: &str) -> Result<Option<(Device, Bytes)>, OAuthError> {
+    match app.get_private(&format!("oauth:dev:{id}"), "oauth/dev").await? {
+        None => Ok(None),
+        Some(b) => serde_json::from_slice(&b)
+            .map(|d| Some((d, b)))
+            .map_err(|e| OAuthError::server_error(&format!("corrupt oauth record: {e}"))),
+    }
+}
+
+/// Ok(false): the row changed since `read`; nothing was written.
+pub async fn put_device_if(app: &App, d: &Device, read: Bytes) -> Result<bool, OAuthError> {
+    put_if(app, &format!("oauth:dev:{}", d.id), "oauth/dev", Some(d), vec![Cond::eq("oauth/dev", Some(read))]).await
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

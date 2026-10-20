@@ -207,13 +207,16 @@ lazy!(SCOPE_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_scope_r
 lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth, passkey: passwordless with a passkey, on the OAuth page or the account page) and second factor (none, totp, email, passkey, recovery: a recovery code, trusted: a trusted browser skipped it; a passwordless sign-in counts as passkey)", &["method", "factor"]));
 lazy!(SIGN_IN_ALERTS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_alerts_total", "Sign-ins from a new device, by what became of their alert mail: mailed (handed to the mailer), budget (a mail budget refused it: vlpds_mail_suppressed_total{purpose=\"sign_in_alert\"}), account_limit (the account's 3 alerts a day are spent), muted (the owner turned alerts off), no_email, email_code (an emailed code just went to the same inbox), baseline (the account's first recorded sign-in)", &["result"]));
 lazy!(SIGN_IN_SETTINGS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_settings_total", "Sign-in security settings changed by account owners, by setting (oauth_only, block_app_passwords, password_alerts, app_password_alerts) and new value (on, off)", &["setting", "value"]));
+lazy!(OIDC_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_oidc_requests_total", "Calls to sign-in providers by provider id (operator config), op (discovery, jwks, token) and result (ok, error)", &["provider", "op", "result"]));
+lazy!(FEDERATED_SIGN_INS: IntCounterVec = register_int_counter_vec!("vlpds_federated_callbacks_total", "Third-party sign-in callbacks by purpose (sign_in, link) and result: ok, unknown_identity (no account uses it), refused (state, device or id_token checks), provider_error (the provider said no or failed), error", &["purpose", "result"]));
+lazy!(FEDERATED_IDENTITIES: IntCounterVec = register_int_counter_vec!("vlpds_federated_identities_total", "Third-party identities linked to or unlinked from accounts", &["event"]));
 lazy!(PASSKEYS: IntCounterVec = register_int_counter_vec!("vlpds_passkeys_total", "Passkey changes by event: registered (an owner added one on the Security page), removed (an owner removed one), reset (the operator's resetSecondFactors removed them; counts accounts)", &["event"]));
 lazy!(PASSKEY_FAILURES: IntCounterVec = register_int_counter_vec!("vlpds_passkey_failures_total", "Passkey registrations and assertions refused, by the check that failed: malformed, too_large, type, challenge (wrong, expired or bound to another flow), origin, cross_origin, rp_id, user_present, user_verified (passwordless without a PIN or biometric), algorithm, key, signature, credential_id, counter (a hardware key's counter went backwards, or it was flagged for that), unknown_credential (not one of the account's), replay (its challenge was already used)", &["reason"]));
 lazy!(PASSKEY_COUNTER_REGRESSIONS: IntCounterVec = register_int_counter_vec!("vlpds_passkey_counter_regressions_total", "Passkey sign-ins whose signature counter went backwards, by result: refused (a key that can't be synced: flagged and the owner mailed), accepted (a synced passkey, whose copies are expected)", &["result"]));
 lazy!(TRUSTED_BROWSERS: IntCounterVec = register_int_counter_vec!("vlpds_trusted_browsers_total", "Trusted browsers (skip the second factor for --trusted-device-days): granted (\"trust this browser\" after a code), revoked (one, or all, from the account page)", &["event"]));
 lazy!(HANDLE_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_handle_checks_total", "vlpds.identity.checkHandle answers by kind (service: a name under the handle domain; external: the caller's own domain) and status (invalid, reserved, current, taken, available, verified, unverified)", &["kind", "status"]));
 lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
-lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page; passkey: a passkey in place of the password, on the OAuth page or the account page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), passkey_required (a passkey is the account's only strong factor: createSession refused its main password outside this server's own pages), rate_limited, error (server-side failure)", &["method", "result"]));
+lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page; passkey: a passkey in place of the password, on the OAuth page or the account page; federated: a third-party provider in place of the password) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), passkey_required (a passkey is the account's only strong factor: createSession refused its main password outside this server's own pages), rate_limited, error (server-side failure)", &["method", "result"]));
 lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password_resets_total", "Password resets: requested (a reset email asked for), unknown_email (asked for an address with no account; answered the same), completed (a new password set with its token)", &["step"]));
 lazy!(INVITE_CODES: IntCounterVec = register_int_counter_vec!("vlpds_invite_codes_total", "Invite codes: created (admin or earned), used (by a sign-up)", &["event"]));
 lazy!(RECORDS_WRITTEN: IntCounterVec = register_int_counter_vec!("vlpds_records_written_total", "Record ops committed by collection (the well-known app.bsky / chat.bsky collections; any other is `other`) and action (create, update, delete)", &["collection", "action"]));
@@ -335,12 +338,17 @@ pub fn init_counters() {
         LazyLock::force(&IMPORT_RESERVED_BYTES);
         LazyLock::force(&BLOB_UPLOAD_BYTES);
         CPU_CORES.set(std::thread::available_parallelism().map_or(0, |n| n.get()) as f64);
-        for method in ["password", "app_password", "oauth", "passkey"] {
+        for method in ["password", "app_password", "oauth", "passkey", "federated"] {
             for r in LOGIN_RESULTS {
                 LOGINS.with_label_values(&[method, r]);
             }
         }
-        for method in ["password", "app_password", "oauth", "passkey"] {
+        for purpose in ["sign_in", "link"] {
+            for r in ["ok", "unknown_identity", "refused", "provider_error", "error"] {
+                FEDERATED_SIGN_INS.with_label_values(&[purpose, r]);
+            }
+        }
+        for method in ["password", "app_password", "oauth", "passkey", "federated"] {
             for factor in ["none", "totp", "email", "passkey", "recovery", "trusted"] {
                 SIGN_IN_FACTORS.with_label_values(&[method, factor]);
             }
@@ -424,6 +432,10 @@ const LOGIN_RESULTS: [&str; 10] = [
     "rate_limited",
     "error",
 ];
+
+pub fn oidc_request(provider: &str, op: &str, ok: bool) {
+    OIDC_REQUESTS.with_label_values(&[provider, op, if ok { "ok" } else { "error" }]).inc();
+}
 
 pub fn login(method: &str, result: &str) {
     LOGINS.with_label_values(&[method, result]).inc();
@@ -525,6 +537,7 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&SIGN_IN_ALERTS, &["mailed", "budget", "account_limit", "muted", "no_email", "email_code", "baseline"]),
     (&TRUSTED_BROWSERS, &["granted", "revoked"]),
     (&PASSKEYS, &["registered", "removed", "reset"]),
+    (&FEDERATED_IDENTITIES, &["linked", "unlinked"]),
     (
         &PASSKEY_FAILURES,
         &[

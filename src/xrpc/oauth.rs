@@ -90,6 +90,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/oauth/account/sign-in", post(account_sign_in))
         .route("/oauth/account/sign-out", post(account_sign_out))
         .route("/oauth/account/revoke", post(account_revoke))
+        .route("/oauth/account/unlink", post(account_unlink))
         .route("/xrpc/vlpds.oauth.listSessions", get(xrpc_list_sessions))
         .route("/xrpc/vlpds.oauth.revokeSession", post(xrpc_revoke_session))
 }
@@ -668,6 +669,7 @@ pub(crate) async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device
         pending_2fa: None,
         pending_2fa_failures: 0,
         pending_2fa_epoch: String::new(),
+        pending_2fa_first: None,
         trusted_until: 0,
     };
     store::put_device(app, &d).await?;
@@ -734,7 +736,7 @@ fn html(app: &App, status: StatusCode, body: String, form_action: &[String], set
     r
 }
 
-fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response {
+pub(super) fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response {
     html(app, status, ui::error(title, msg), &[], None)
 }
 
@@ -902,7 +904,7 @@ fn server_name(app: &App) -> String {
 
 /// (did, handle) of fresh logins. A login from before a password change or
 /// takedown (its credential epoch changed) no longer counts.
-async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
+pub(super) async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
     let now = now_secs();
     let mut out = Vec::new();
     for a in &d.accounts {
@@ -912,8 +914,8 @@ async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
         if crate::xrpc::auth_epoch(app, &a.did).await.ok().as_deref() != Some(a.auth_epoch.as_str()) {
             continue;
         }
-        // signed in with a passkey that has since been removed
-        if !super::passkeys::still_registered(app, &a.did, a.auth_cred.as_deref()).await.unwrap_or(false) {
+        // signed in with a passkey or identity that has since been removed
+        if !super::passkeys::credentials_live(app, &a.did, a.auth_cred.as_deref()).await.unwrap_or(false) {
             continue;
         }
         if let Ok(acct) = account_any(app, &a.did).await {
@@ -947,6 +949,7 @@ fn login_page(app: &App, flow: &Flow, identifier: &str, error: Option<&str>, sta
             error,
             second: None,
             passkey: pk.as_ref().map(|(c, r)| ui::PasskeyUi { challenge: c, rp_id: r, allow: "[]" }),
+            providers: &provider_links(app, &format!("request_uri={}", ou::encode_uri_component(&flow.uri))),
         },
         "",
     );
@@ -1242,10 +1245,14 @@ pub(crate) enum LoginError {
     /// One message for every passkey failure: nothing says whether an
     /// account has passkeys, or which check failed.
     Passkey,
+    /// A sign-in provider's flow failed a check or the provider said no.
+    Federated,
+    /// The provider's identity isn't linked to any account here.
+    UnknownIdentity,
 }
 
 impl LoginError {
-    const ALL: [LoginError; 7] = [
+    const ALL: [LoginError; 9] = [
         LoginError::Invalid,
         LoginError::Timeout,
         LoginError::BadCode,
@@ -1253,6 +1260,8 @@ impl LoginError {
         LoginError::RateLimited,
         LoginError::Inactive,
         LoginError::Passkey,
+        LoginError::Federated,
+        LoginError::UnknownIdentity,
     ];
 
     pub(crate) fn code(self) -> &'static str {
@@ -1264,6 +1273,8 @@ impl LoginError {
             LoginError::RateLimited => "rate_limited",
             LoginError::Inactive => "inactive",
             LoginError::Passkey => "passkey",
+            LoginError::Federated => "federated",
+            LoginError::UnknownIdentity => "unknown_identity",
         }
     }
 
@@ -1280,6 +1291,10 @@ impl LoginError {
             LoginError::RateLimited => "Too many sign-in attempts. Please try again later.",
             LoginError::Inactive => "This account is deactivated or suspended",
             LoginError::Passkey => "Passkey not recognized",
+            LoginError::Federated => "That sign-in didn't go through. Try again, or sign in another way.",
+            LoginError::UnknownIdentity => {
+                "No account here uses that sign-in yet. Sign in another way, then add it on your account's sign-in methods."
+            }
         }
     }
 
@@ -1303,7 +1318,12 @@ async fn sign_in(
 ) -> Result<SignIn, OAuthError> {
     let passwordless = f.get("step").map(String::as_str) == Some("passkey");
     let r = sign_in_inner(app, device, f, req).await;
-    let result = match &r {
+    crate::metrics::login(if passwordless { "passkey" } else { "oauth" }, login_result(&r));
+    r
+}
+
+fn login_result(r: &Result<SignIn, OAuthError>) -> &'static str {
+    match r {
         Ok(SignIn::Ok(_)) => "success",
         Ok(SignIn::NeedFactor(..)) => "second_factor_required",
         Ok(SignIn::NeedFactorErr(..)) | Ok(SignIn::Failed(_, LoginError::BadCode | LoginError::TooManyCodes)) => {
@@ -1311,11 +1331,16 @@ async fn sign_in(
         }
         Ok(SignIn::Failed(_, LoginError::RateLimited)) => "rate_limited",
         Ok(SignIn::Failed(_, LoginError::Inactive)) => "inactive",
-        Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout | LoginError::Passkey)) => "failed",
+        Ok(SignIn::Failed(
+            _,
+            LoginError::Invalid
+            | LoginError::Timeout
+            | LoginError::Passkey
+            | LoginError::Federated
+            | LoginError::UnknownIdentity,
+        )) => "failed",
         Err(_) => "error",
-    };
-    crate::metrics::login(if passwordless { "passkey" } else { "oauth" }, result);
-    r
+    }
 }
 
 /// Where a sign-in form post came from, for the sign-in log and the
@@ -1369,7 +1394,6 @@ async fn sign_in_inner(
 ) -> Result<SignIn, OAuthError> {
     use crate::ratelimit as rl;
     let now = now_secs();
-    let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());
     let ident = f.get("identifier").map(|s| s.trim().trim_start_matches('@').to_lowercase()).unwrap_or_default();
     let limited = |ident: String| Ok(SignIn::Failed(ident, LoginError::RateLimited));
     use super::signin::{FailReason as R, FailedFor as For};
@@ -1380,7 +1404,7 @@ async fn sign_in_inner(
         return passwordless_sign_in(app, device, f, req).await;
     }
     let password_step = f.get("step").map(String::as_str) != Some("2fa");
-    let (acct, ident, epoch) = if !password_step {
+    let (acct, ident, epoch, first) = if !password_step {
         // password already verified for the pending account
         let Some((did, _)) = device.pending_2fa.clone().filter(|(_, at)| now - at < PENDING_2FA_TTL) else {
             return Ok(SignIn::Failed(String::new(), LoginError::Timeout));
@@ -1391,7 +1415,12 @@ async fn sign_in_inner(
             sign_in_failed(app, req, For::Did(&did), R::RateLimited).await;
             return limited(String::new());
         }
-        (account_any(app, &did).await?, String::new(), device.pending_2fa_epoch.clone())
+        (
+            account_any(app, &did).await?,
+            String::new(),
+            device.pending_2fa_epoch.clone(),
+            device.pending_2fa_first.clone(),
+        )
     } else {
         let invalid = || Ok(SignIn::Failed(ident.clone(), LoginError::Invalid));
         let password = f.get("password").cloned().unwrap_or_default();
@@ -1435,8 +1464,29 @@ async fn sign_in_inner(
         let Some(epoch) = crate::xrpc::epoch_for_login(app, &acct).await? else {
             return invalid();
         };
-        (acct, ident, epoch)
+        (acct, ident, epoch, None)
     };
+    after_first_step(app, device, f, req, acct, ident, epoch, password_step, first).await
+}
+
+/// The rest of a sign-in once its first step passed: the password, a
+/// sign-in provider (`first`), or (`!first_step`) the pending sign-in a
+/// second-factor post continues.
+#[allow(clippy::too_many_arguments)]
+async fn after_first_step(
+    app: &App,
+    device: &mut Device,
+    f: &HashMap<String, String>,
+    req: &SignInReq<'_>,
+    acct: Account,
+    ident: String,
+    epoch: String,
+    password_step: bool,
+    first: Option<store::FirstFactor>,
+) -> Result<SignIn, OAuthError> {
+    use super::signin::{FailReason as R, FailedFor as For};
+    let now = now_secs();
+    let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());
     let has_passkeys = super::passkeys::has_any(app, &acct.did).await?;
     // a trusted browser skips every factor, whichever are set up
     let trusted = password_step && super::signin::trusted(app, &acct, &epoch, &device.id).await?;
@@ -1479,6 +1529,7 @@ async fn sign_in_inner(
         Err(fe) if fe.err.error == "AuthFactorTokenRequired" => {
             device.pending_2fa = Some((acct.did.clone(), now));
             device.pending_2fa_epoch = epoch;
+            device.pending_2fa_first = first;
             device.pending_2fa_failures = 0;
             store::put_device(app, device).await?;
             return Ok(SignIn::NeedFactor(Pending::of(app, &acct, &fe.factor).await?));
@@ -1497,6 +1548,7 @@ async fn sign_in_inner(
             if password_step {
                 device.pending_2fa = Some((acct.did.clone(), now));
                 device.pending_2fa_epoch = epoch;
+                device.pending_2fa_first = first.clone();
                 device.pending_2fa_failures = 0;
             }
             device.pending_2fa_failures += 1;
@@ -1531,9 +1583,16 @@ async fn sign_in_inner(
             device.trusted_until = device.trusted_until.max(until as i64);
         }
     }
-    let method = super::signin::Method::OAuth(req.client_id.map(String::from));
+    let client = req.client_id.map(String::from);
+    let method = match &first {
+        Some(ff) => super::signin::Method::Federated(ff.provider.clone(), client),
+        None => super::signin::Method::OAuth(client),
+    };
     super::signin::record(app, &acct, method, factor, &ctx).await;
-    finish_device_sign_in(app, device, acct.did, epoch, auth_cred).await
+    let app_handoff = first.as_ref().is_some_and(|ff| ff.app);
+    let refs: Vec<String> = first.map(|ff| ff.cred).into_iter().chain(auth_cred).collect();
+    let auth_cred = (!refs.is_empty()).then(|| refs.join(" "));
+    finish_device_sign_in(app, device, acct.did, epoch, auth_cred, app_handoff).await
 }
 
 /// A discoverable passkey with user verification in place of the password
@@ -1578,8 +1637,11 @@ async fn passwordless_sign_in(
     let ctx = super::signin::Ctx { ip: req.ip, user_agent: req.user_agent, device_id: Some(&device_id) };
     let method = super::signin::Method::Passkey(req.client_id.map(String::from));
     super::signin::record(app, &acct, method, Some("passkey"), &ctx).await;
-    finish_device_sign_in(app, device, did, epoch, Some(used.cred.auth_ref())).await
+    finish_device_sign_in(app, device, did, epoch, Some(used.cred.auth_ref()), false).await
 }
+
+/// How long the account page app has to pick up a sign-in it asked for.
+const APP_HANDOFF_SECS: i64 = 120;
 
 /// The device's account list gains this sign-in.
 async fn finish_device_sign_in(
@@ -1588,12 +1650,20 @@ async fn finish_device_sign_in(
     did: String,
     epoch: String,
     auth_cred: Option<String>,
+    app_handoff: bool,
 ) -> Result<SignIn, OAuthError> {
     let now = now_secs();
     device.pending_2fa = None;
+    device.pending_2fa_first = None;
     device.pending_2fa_failures = 0;
     device.accounts.retain(|a| a.did != did);
-    device.accounts.push(DeviceAccount { did: did.clone(), authenticated_at: now, auth_epoch: epoch, auth_cred });
+    device.accounts.push(DeviceAccount {
+        did: did.clone(),
+        authenticated_at: now,
+        auth_epoch: epoch,
+        auth_cred,
+        app_handoff_until: if app_handoff { now + APP_HANDOFF_SECS } else { 0 },
+    });
     device.last_seen_at = now;
     store::put_device(app, device).await?;
     Ok(SignIn::Ok(did))
@@ -1635,6 +1705,7 @@ fn code_page(app: &App, flow: &Flow, p: &Pending, error: Option<LoginError>) -> 
             error: msg,
             second: Some(second_factor_form(p, &pk, super::signin::trust_days(app))),
             passkey: None,
+            providers: &[],
         },
         "",
     );
@@ -1689,12 +1760,12 @@ async fn authorize_sign_in(
 
 /// Kept when the sign-up form is shown again after an error.
 #[derive(Default)]
-struct SignupValues {
-    handle: String,
+pub(super) struct SignupValues {
+    pub handle: String,
     /// Empty: the primary.
-    domain: String,
-    email: String,
-    invite_code: String,
+    pub domain: String,
+    pub email: String,
+    pub invite_code: String,
 }
 
 fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, status: StatusCode) -> Response {
@@ -1776,6 +1847,7 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
         authenticated_at: now,
         auth_epoch: epoch,
         auth_cred: None,
+        app_handoff_until: 0,
     });
     flow.device.last_seen_at = now;
     if let Err(e) = store::put_device(&app, &flow.device).await {
@@ -1962,8 +2034,8 @@ async fn code_grant(
         return Err(OAuthError::invalid_dpop_proof("DPoP proof does not match the expected JKT"));
     }
     ensure_active_any(app, &did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    if !super::passkeys::still_registered(app, &did, req.auth_cred.as_deref()).await? {
-        return Err(fail("The passkey that approved this code was removed"));
+    if !super::passkeys::credentials_live(app, &did, req.auth_cred.as_deref()).await? {
+        return Err(fail("The passkey or sign-in identity that approved this code was removed"));
     }
     let token_scope = lexicon::build_token_scope_cached(app, &params.scope, &did, req.space_collections.as_ref())
         .await
@@ -1996,11 +2068,11 @@ async fn code_grant(
     // a password change or takedown since the approval voids the code
     let guard = store::SessionGuard::New { auth_epoch: req.auth_epoch.clone() };
     let out = issue_tokens(app, client, &mut s, guard).await?;
-    // a removal writes the passkeys row before it looks for sessions, so a
-    // session it missed (made after its scan) sees the passkey gone here
-    if !super::passkeys::still_registered(app, &did, req.auth_cred.as_deref()).await? {
+    // a removal writes its row before it looks for sessions, so a session
+    // it missed (made after its scan) sees the credential gone here
+    if !super::passkeys::credentials_live(app, &did, req.auth_cred.as_deref()).await? {
         store::delete_session(app, &did, &s.id).await?;
-        return Err(fail("The passkey that approved this code was removed"));
+        return Err(fail("The passkey or sign-in identity that approved this code was removed"));
     }
     Ok(out)
 }
@@ -2306,7 +2378,7 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
     Ok(Credentials::OAuth { did: did.to_string(), client_id: client_id.to_string(), scopes })
 }
 
-fn redirect_to(path: &str) -> Response {
+pub(super) fn redirect_to(path: &str) -> Response {
     let mut r = StatusCode::SEE_OTHER.into_response();
     r.headers_mut().insert(header::LOCATION, HeaderValue::from_str(path).unwrap());
     r
@@ -2367,6 +2439,7 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
                 error,
                 second: pending.as_ref().map(|p| second_factor_form(p, &pk, super::signin::trust_days(&app))),
                 passkey: pwless.as_ref().map(|(c, r)| ui::PasskeyUi { challenge: c, rp_id: r, allow: "[]" }),
+                providers: &if pending.is_none() { provider_links(&app, "account=1") } else { Vec::new() },
             },
             &csrf,
         );
@@ -2388,9 +2461,369 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
                 updated_at: fmt_time(s.updated_at),
             })
             .collect();
-        rows.push((did, handle, list));
+        let methods = sign_in_methods(&app, &device, &did).await;
+        rows.push(ui::AccountRow { did, handle, sessions: list, methods });
     }
-    html(&app, StatusCode::OK, ui::account_page(&csrf, &rows), &[], cookie)
+    let notice = q.get("notice").and_then(|c| AccountNotice::from_code(c)).map(|n| (n.message(), n.is_error()));
+    html(&app, StatusCode::OK, ui::account_page(&csrf, &rows, notice), &[], cookie)
+}
+
+/// Each offered provider as a start link; `rest` names where it continues.
+fn provider_links(app: &App, rest: &str) -> Vec<ui::ProviderLink> {
+    super::federated::offered(app)
+        .into_iter()
+        .map(|p| ui::ProviderLink {
+            href: format!("/oauth/federated/start?provider={}&{rest}", ou::encode_uri_component(&p.id)),
+            name: p.name,
+            icon: p.icon,
+        })
+        .collect()
+}
+
+/// How long ago a sign-in on this browser may be to add or remove a way to
+/// sign in.
+pub(super) const STEP_UP_SECS: i64 = 10 * 60;
+
+/// `did`'s sign-in on this device, if it's recent enough to change how the
+/// account signs in (and still valid).
+pub(super) async fn fresh_sign_in(app: &App, device: &Device, did: &str) -> bool {
+    let recent = device.accounts.iter().any(|a| a.did == did && now_secs() - a.authenticated_at <= STEP_UP_SECS);
+    recent && device_accounts(app, device).await.iter().any(|(d, _)| d == did)
+}
+
+/// A CSRF token bound to this device and `scope`.
+pub(super) fn device_csrf(app: &App, device_id: &str, scope: &str) -> String {
+    csrf_token(app, device_id, scope)
+}
+
+/// A provider signup's page, where the provider sign-in started: the OAuth
+/// page (`request_id`) or `/oauth/account`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn federated_signup_page(
+    app: &App,
+    headers: &HeaderMap,
+    request_id: Option<&str>,
+    ticket: &str,
+    provider: &str,
+    v: &SignupValues,
+    email_verified: bool,
+    invite_required: bool,
+    error: Option<&str>,
+    status: StatusCode,
+) -> Response {
+    let domains = app.handle_domains.names();
+    let domain = domains.iter().find(|d| **d == v.domain).unwrap_or(&domains[0]);
+    let name = server_name(app);
+    let render = |device_id: &str, ctx: Option<&ui::Ctx>| {
+        let csrf = csrf_token(app, device_id, &format!("fedsignup\0{ticket}"));
+        ui::federated_signup(
+            ctx,
+            &ui::FederatedSignup {
+                ticket,
+                csrf: &csrf,
+                provider,
+                email_verified,
+                form: ui::SignupForm {
+                    handle: &v.handle,
+                    domain,
+                    domains: &domains,
+                    email: &v.email,
+                    invite_code: &v.invite_code,
+                    invite_required,
+                    error,
+                },
+            },
+        )
+    };
+    let mut r = match request_id {
+        Some(id) => {
+            let mut flow = match load_flow(app, headers, Some(&store::request_uri(id)), None).await {
+                Ok(f) => f,
+                Err(e) => return e.into_response(app),
+            };
+            // the request outlives the signup form, as the ticket does
+            flow.req.expires_at = now_secs() + super::federated::SIGNUP_TTL;
+            if let Err(e) = store::put_request(app, &flow.id, Some(&flow.req)).await {
+                return server_error_page(app, "Sign-up failed", &e.description);
+            }
+            let fcsrf = flow.csrf(app);
+            let body = render(&flow.device.id, Some(&flow.ctx(&fcsrf, &name)));
+            flow.page(app, body)
+        }
+        None => match device_cookie_id(headers) {
+            Some(id) => html(app, StatusCode::OK, render(&id, None), &[], None),
+            None => return error_page(app, StatusCode::FORBIDDEN, "Sign-up failed", "Please start again."),
+        },
+    };
+    *r.status_mut() = status;
+    r
+}
+
+/// A provider signup made `did`: it's signed in on this device (the new
+/// account has no second factor yet), then on to consent, `/oauth/account`
+/// or the account page app.
+pub(super) async fn federated_signed_up(
+    app: &App,
+    headers: &HeaderMap,
+    request_id: Option<&str>,
+    did: &str,
+    epoch: String,
+    cred: String,
+    for_app: bool,
+) -> Response {
+    match request_id {
+        Some(id) => {
+            let mut flow = match load_flow(app, headers, Some(&store::request_uri(id)), None).await {
+                Ok(f) => f,
+                Err(e) => return e.into_response(app),
+            };
+            match finish_device_sign_in(app, &mut flow.device, did.to_string(), epoch, Some(cred), false).await {
+                Ok(_) => consent_step(app, flow, did).await,
+                Err(e) => server_error_page(app, "Sign-up failed", &e.description),
+            }
+        }
+        None => {
+            let mut device = match device_for(app, headers).await {
+                Ok((d, _)) => d,
+                Err(e) => return server_error_page(app, "Sign-up failed", &e.description),
+            };
+            let r = finish_device_sign_in(app, &mut device, did.to_string(), epoch, Some(cred), for_app).await;
+            account_sign_in_response(app, r, for_app)
+        }
+    }
+}
+
+/// CSRF for a link start (a GET) of `did` from this device: `{issued}.{mac}`,
+/// good for [`STEP_UP_SECS`], so a link copied from the page goes stale
+/// with the sign-in that showed it.
+pub(super) fn link_csrf(app: &App, device_id: &str, did: &str) -> String {
+    link_csrf_at(app, device_id, did, now_secs())
+}
+
+fn link_csrf_at(app: &App, device_id: &str, did: &str, at: i64) -> String {
+    format!("{at}.{}", csrf_token(app, device_id, &format!("fedlink\0{did}\0{at}")))
+}
+
+pub(super) fn link_csrf_ok(app: &App, device_id: &str, did: &str, token: &str) -> bool {
+    let Some(at) = token.split_once('.').and_then(|(t, _)| t.parse::<i64>().ok()) else { return false };
+    let age = now_secs() - at;
+    (0..=STEP_UP_SECS).contains(&age)
+        && crate::auth::ct_eq(token.as_bytes(), link_csrf_at(app, device_id, did, at).as_bytes())
+}
+
+async fn sign_in_methods(app: &App, device: &Device, did: &str) -> Option<ui::Methods> {
+    let offered = super::federated::offered(app);
+    let ids = super::federated::load_raw(app, did).await.map(|r| r.0.identities).unwrap_or_default();
+    if offered.is_empty() && ids.is_empty() {
+        return None;
+    }
+    let identities = ids
+        .iter()
+        .map(|l| {
+            let p = app.federated.providers.by_issuer(&l.iss);
+            ui::IdentityRow {
+                r: l.auth_ref(),
+                label: p.as_ref().map_or_else(|| l.iss.clone(), |p| p.name.clone()),
+                display: l.display.clone(),
+                dormant: p.is_none(),
+            }
+        })
+        .collect();
+    let csrf = link_csrf(app, &device.id, did);
+    let add = offered
+        .iter()
+        .filter(|p| !ids.iter().any(|l| l.iss == p.issuer))
+        .map(|p| ui::ProviderLink {
+            href: format!(
+                "/oauth/federated/start?provider={}&link={}&csrf={}",
+                ou::encode_uri_component(&p.id),
+                ou::encode_uri_component(did),
+                ou::encode_uri_component(&csrf)
+            ),
+            name: p.name.clone(),
+            icon: p.icon.clone(),
+        })
+        .collect();
+    Some(ui::Methods { identities, add, fresh: fresh_sign_in(app, device, did).await })
+}
+
+/// `/oauth/account?notice=`: fixed messages only, never request text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AccountNotice {
+    Linked,
+    Unlinked,
+    Stale,
+    Taken,
+    Full,
+    LastCredential,
+    Failed,
+}
+
+impl AccountNotice {
+    const ALL: [AccountNotice; 7] = [
+        AccountNotice::Linked,
+        AccountNotice::Unlinked,
+        AccountNotice::Stale,
+        AccountNotice::Taken,
+        AccountNotice::Full,
+        AccountNotice::LastCredential,
+        AccountNotice::Failed,
+    ];
+
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            AccountNotice::Linked => "linked",
+            AccountNotice::Unlinked => "unlinked",
+            AccountNotice::Stale => "stale",
+            AccountNotice::Taken => "taken",
+            AccountNotice::Full => "full",
+            AccountNotice::LastCredential => "last",
+            AccountNotice::Failed => "failed",
+        }
+    }
+
+    fn from_code(c: &str) -> Option<AccountNotice> {
+        Self::ALL.into_iter().find(|n| n.code() == c)
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            AccountNotice::Linked => "Added. You can now sign in with it.",
+            AccountNotice::Unlinked => "Removed. Anything it signed in has been signed out.",
+            AccountNotice::Stale => "Sign in again on this browser first, then try that again.",
+            AccountNotice::Taken => "That sign-in is already used by another account here.",
+            AccountNotice::Full => {
+                "This account already has as many sign-in methods as it can, or one from that provider."
+            }
+            AccountNotice::LastCredential => {
+                "That's the account's only way to sign in. Add another one before removing it."
+            }
+            AccountNotice::Failed => "That didn't work. Please try again.",
+        }
+    }
+
+    fn is_error(self) -> bool {
+        !matches!(self, AccountNotice::Linked | AccountNotice::Unlinked)
+    }
+}
+
+pub(super) fn account_notice(n: AccountNotice) -> Response {
+    redirect_to(&format!("/oauth/account?notice={}", n.code()))
+}
+
+/// Binds the OAuth request to this browser for a provider sign-in, for as
+/// long as the provider's flow may take: (request id, device, a new cookie).
+#[allow(clippy::result_large_err)]
+pub(super) async fn flow_for_federated(
+    app: &App,
+    headers: &HeaderMap,
+    request_uri: &str,
+    ttl: i64,
+) -> Result<(String, Device, bool), Response> {
+    let mut flow = load_flow(app, headers, Some(request_uri), None).await.map_err(|e| e.into_response(app))?;
+    flow.req.expires_at = now_secs() + ttl.max(AUTHORIZATION_INACTIVITY_TIMEOUT);
+    if let Err(e) = store::put_request(app, &flow.id, Some(&flow.req)).await {
+        return Err(server_error_page(app, "Sign-in failed", &e.description));
+    }
+    Ok((flow.id, flow.device, flow.new_cookie))
+}
+
+/// A provider sign-in resolved to `acct`: the rest of it happens where it
+/// started, the OAuth page (`request_id`) or `/oauth/account`. The account's
+/// second factor still applies.
+pub(super) async fn federated_continue(
+    app: &App,
+    headers: &HeaderMap,
+    ip: Option<std::net::IpAddr>,
+    request_id: Option<&str>,
+    acct: Account,
+    epoch: String,
+    first: store::FirstFactor,
+) -> Response {
+    let ua = super::signin::user_agent(headers);
+    let none = HashMap::new();
+    let handle = acct.handle.clone();
+    match request_id {
+        Some(id) => {
+            let mut flow = match load_flow(app, headers, Some(&store::request_uri(id)), None).await {
+                Ok(f) => f,
+                Err(e) => return e.into_response(app),
+            };
+            let (client_id, flow_key) = (flow.client.id.clone(), flow.id.clone());
+            let req = SignInReq { ip, user_agent: ua, client_id: Some(&client_id), flow_key: &flow_key };
+            let r = after_first_step(app, &mut flow.device, &none, &req, acct, handle, epoch, true, Some(first)).await;
+            crate::metrics::login("federated", login_result(&r));
+            match r {
+                Ok(SignIn::Ok(did)) => consent_step(app, flow, &did).await,
+                Ok(SignIn::NeedFactor(p)) => code_page(app, &flow, &p, None),
+                Ok(SignIn::NeedFactorErr(p, e)) => code_page(app, &flow, &p, Some(e)),
+                Ok(SignIn::Failed(ident, e)) => login_page(app, &flow, &ident, Some(e.message()), e.status()),
+                Err(e) => server_error_page(app, "Sign-in failed", &e.description),
+            }
+        }
+        None => {
+            let mut device = match device_for(app, headers).await {
+                Ok((d, _)) => d,
+                Err(e) => return server_error_page(app, "Sign-in failed", &e.description),
+            };
+            let req = SignInReq { ip, user_agent: ua, client_id: None, flow_key: "account" };
+            let for_app = first.app;
+            let r = after_first_step(app, &mut device, &none, &req, acct, handle, epoch, true, Some(first)).await;
+            crate::metrics::login("federated", login_result(&r));
+            account_sign_in_response(app, r, for_app)
+        }
+    }
+}
+
+/// Back on the page the provider sign-in started from, with why it failed.
+pub(super) async fn federated_failed(
+    app: &App,
+    headers: &HeaderMap,
+    request_id: Option<&str>,
+    e: LoginError,
+) -> Response {
+    match request_id {
+        Some(id) => match load_flow(app, headers, Some(&store::request_uri(id)), None).await {
+            Ok(flow) => login_page(app, &flow, "", Some(e.message()), e.status()),
+            Err(fe) => fe.into_response(app),
+        },
+        None => redirect_to(&format!("/oauth/account?add=1&error={}", e.code())),
+    }
+}
+
+/// Needs a recent sign-in on this browser, like adding one.
+async fn account_unlink(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (device, f) = match account_form(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let (did, r) = (f.get("did").cloned().unwrap_or_default(), f.get("ref").cloned().unwrap_or_default());
+    if !fresh_sign_in(&app, &device, &did).await {
+        return account_notice(AccountNotice::Stale);
+    }
+    if crate::ratelimit::check(&[&crate::ratelimit::FEDERATED_LINK_ACCOUNT], &did, 1).is_err() {
+        return error_page(
+            &app,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Request failed",
+            "Too many changes. Please try again later.",
+        );
+    }
+    match super::federated::unlink(&app, &did, &r).await {
+        Ok(gone) => {
+            let name = app.federated.providers.by_issuer(&gone.iss).map_or(gone.iss.clone(), |p| p.name);
+            super::passkeys::security_mail(
+                &app,
+                &did,
+                &format!("You can no longer sign in to your account with {name}."),
+            )
+            .await;
+            account_notice(AccountNotice::Unlinked)
+        }
+        Err(super::federated::UnlinkErr::NotLinked) => account_notice(AccountNotice::Failed),
+        Err(super::federated::UnlinkErr::LastCredential) => account_notice(AccountNotice::LastCredential),
+        Err(super::federated::UnlinkErr::Xrpc(e)) => server_error_page(&app, "Error", &e.message),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -2419,7 +2852,18 @@ async fn account_sign_in(
         Err(r) => return r,
     };
     let req = SignInReq { ip, user_agent: super::signin::user_agent(&headers), client_id: None, flow_key: "account" };
-    match sign_in(&app, &mut device, &f, &req).await {
+    let for_app =
+        f.get("step").map(String::as_str) == Some("2fa") && device.pending_2fa_first.as_ref().is_some_and(|ff| ff.app);
+    let r = sign_in(&app, &mut device, &f, &req).await;
+    account_sign_in_response(&app, r, for_app)
+}
+
+/// Where the account page app picks up a sign-in it asked for.
+pub(super) const APP_RETURN: &str = "/account?signin=device";
+
+fn account_sign_in_response(app: &App, r: Result<SignIn, OAuthError>, for_app: bool) -> Response {
+    match r {
+        Ok(SignIn::Ok(_)) if for_app => redirect_to(APP_RETURN),
         Ok(SignIn::Ok(_)) => redirect_to("/oauth/account"),
         Ok(SignIn::NeedFactor(p)) => {
             redirect_to(&format!("/oauth/account?add=1&2fa=1{}", if p.email_hint.is_some() { "&email=1" } else { "" }))
@@ -2431,9 +2875,9 @@ async fn account_sign_in(
         )),
         Ok(SignIn::Failed(_, e)) => redirect_to(&format!("/oauth/account?add=1&error={}", e.code())),
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
-            with_retry_after(error_page(&app, e.status, "Sign-in failed", BUSY_MESSAGE))
+            with_retry_after(error_page(app, e.status, "Sign-in failed", BUSY_MESSAGE))
         }
-        Err(e) => server_error_page(&app, "Sign-in failed", &e.description),
+        Err(e) => server_error_page(app, "Sign-in failed", &e.description),
     }
 }
 

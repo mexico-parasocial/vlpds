@@ -106,6 +106,16 @@ function SignedIn({ p }: { p: string }) {
 
 type Step = 'password' | 'code' | 'passkey'
 
+type Provider = { id: string; name: string; icon: string | null }
+
+// The server ran the provider (and any second factor) and sent the browser back with a
+// single-use ticket in its device cookie. Strict mode runs effects twice: one pickup per load.
+let pickup: Promise<void> | undefined
+function pickUpFederatedSession(): Promise<void> {
+  pickup ??= call('vlpds.server.createFederatedSession', { method: 'POST' }).then((out) => setSession(out))
+  return pickup
+}
+
 // production serves HTTPS; plain HTTP is a dev server, where a note on why passkeys are missing helps
 const devHost = import.meta.env.DEV || location.protocol === 'http:'
 
@@ -122,6 +132,22 @@ function SignIn() {
   const canPasskey = passkeysHere() && !otherRp
   const autofill = useRef<AbortController | undefined>(undefined)
   const [autofillRun, setAutofillRun] = useState(0)
+  const q = useSearch()
+  const returning = q.get('signin') === 'device'
+  const providers = useLoad<{ providers: Provider[] }>(() => call('vlpds.server.describeSignInProviders'), []).data?.providers ?? []
+
+  useEffect(() => {
+    if (!returning) return
+    pickUpFederatedSession()
+      .then(() => navigate('/account', { replace: true }))
+      .catch((e) => {
+        setError(e instanceof XrpcError && e.status === 401 ? new Error('That sign-in has expired or was already used. Try again.') : e)
+        navigate('/account', { replace: true })
+      })
+      .finally(() => {
+        pickup = undefined
+      })
+  }, [returning])
 
   // autofill: offer this site's passkeys in the identifier field's suggestions.
   // Nobody asked for this request, so its failures (aborted, dismissed, a host
@@ -311,6 +337,16 @@ function SignIn() {
                 <button type="button" className="btn wide" onClick={usePasskey} disabled={busy}>
                   Sign in with a passkey
                 </button>
+              </div>
+            )}
+            {step === 'password' && providers.length > 0 && (
+              <div className="passkey-alt" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {providers.map((p) => (
+                  <a key={p.id} className="btn wide" href={`/oauth/federated/start?provider=${encodeURIComponent(p.id)}&account=1&app=1`}>
+                    {p.icon && <img src={p.icon} alt="" width={16} height={16} />}
+                    Continue with {p.name}
+                  </a>
+                ))}
               </div>
             )}
             {step === 'password' && !canPasskey && devHost && (ipHost() || otherRp) && (

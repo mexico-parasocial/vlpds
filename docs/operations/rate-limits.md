@@ -26,7 +26,7 @@ diagram:
     - "mail -> budget: CAS"
     - { from: config, to: layer, dash: true }
 facts:
-  - { value: "46", unit: buckets, label: built in, note: "keyed by IP, identifier + IP, DID, node, cluster or space credential", tone: amber }
+  - { value: "47", unit: buckets, label: built in, note: "keyed by IP, identifier + IP, DID, node, cluster or space credential", tone: amber }
   - { value: "3,000", unit: "/ 5 min", label: XRPC calls per IP, note: "`global-ip` · the one most clients hit first" }
   - { value: "10 s", label: for a change to reach every node, note: "peers are nudged at once · 10 s bounds a lost nudge", tone: blue }
   - { value: per node, label: counters, note: "a restart starts them over · only `mail-cluster-day` is cluster-wide", tone: muted }
@@ -92,7 +92,7 @@ the start of the next. The names are what the console, the config and the metric
 | `com.atproto.server.requestEmailUpdate-1` | DID | 1 h | 5 | the same | 429 |
 | `repo-write-hour` | DID | 1 h | 5,000 | `createRecord`, `putRecord`, `deleteRecord`, `applyWrites` | 429 |
 | `repo-write-day` | DID | 1 day | 35,000 | the same | 429 |
-| `oauth-sign-in-ip` | IP | 5 min | 100 | OAuth sign-in form posts (`/oauth/authorize/sign-in`, `/oauth/account/sign-in`) | the sign-in page shows an error (429) |
+| `oauth-sign-in-ip` | IP | 5 min | 100 | OAuth sign-in form posts (`/oauth/authorize/sign-in`, `/oauth/account/sign-in`), and third-party sign-in's start and callback (`/oauth/federated/*`) | the sign-in page shows an error (429) |
 | `sign-in-account` | DID | 1 h | 100 | `server.createSession` and OAuth sign-in (both steps), from any IP · the account page's password re-checks (passkeys, TOTP off, recovery codes) | 429 · the sign-in page shows an error |
 | `oauth-ip` | IP | 5 min | 3,000 | POST `/oauth/par`, `/oauth/token`, `/oauth/revoke` (in place of `global-ip`) | 429 `rate_limit_exceeded` (OAuth error JSON) |
 | `com.atproto.server.reserveSigningKey-0` | IP | 1 h | 100 | `server.reserveSigningKey` | 429 |
@@ -108,6 +108,7 @@ the start of the next. The names are what the console, the config and the metric
 | `vlpds.identity.checkHandle-0` | DID | 5 min | 60 | `vlpds.identity.checkHandle` (the account page re-checks a new domain every 15 s) | 429 · the account page stops checking |
 | `vlpds.identity.checkHandle-1` | DID | 1 day | 1,000 | the same | 429 · the account page stops checking |
 | `passkey-register-account` | DID | 1 day | 10 | `vlpds.server.startPasskeyRegistration`, so passkeys added to one account (each rewrites its passkeys row and mails the owner) | 429 · the Security page shows an error |
+| `federated-link-account` | DID | 1 day | 10 | adding or removing a third-party sign-in on `/oauth/account`, so identities linked to one account (each mails the owner) | 429 · the page shows an error |
 | `passkey-sign-in-ip` | IP | 5 min | 100 | the account page's passkey sign-in (`vlpds.server.startPasskeySignIn`, `vlpds.server.createPasskeySession`) · OAuth page passkey posts count against `oauth-sign-in-ip` instead | 429 · the account page shows an error |
 | `space-read-credential` | space credential | 5 min | 3,000 | `com.atproto.space` reads and the space host's `listRepos`, `registerNotify` and `unregisterNotify` made with one space credential (keyed by a hash of its issuer and `jti`, so the console doesn't show them) · with `--spaces` | 429 |
 | `space-read-account` | DID | 5 min | 3,000 | `com.atproto.space` reads, `listSpaces` and `simplespace.getSpace` by an account's own OAuth session · with `--spaces` | 429 |

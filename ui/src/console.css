@@ -2192,9 +2192,15 @@ a.cx-rrow:hover {
   overflow: hidden;
   margin-top: 4vh;
   /* A long diff scrolls in the body; the title and buttons stay on screen. */
-  max-height: calc(100vh - 8vh);
+  max-height: calc(100vh - 16vh - 12px);
   display: flex;
   flex-direction: column;
+}
+.cx-dlg.wide {
+  width: min(680px, 100%);
+}
+.cx-dlg.wide .db {
+  padding-left: 18px;
 }
 .cx-dlg > .dh,
 .cx-dlg > .df {

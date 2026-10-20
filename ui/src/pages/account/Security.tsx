@@ -6,6 +6,7 @@ import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { acall, call, setSession } from '../../lib/xrpc'
 import { RecoveryKeys } from './RecoveryKeys'
+import { SignInMethods } from './SignInMethods'
 import { SignInSecurity } from './SignIns'
 import { Passkeys, RecoveryCodes, SavedCodes } from './Passkeys'
 
@@ -17,6 +18,7 @@ export function Security() {
       <Passkeys onChange={() => setVer((v) => v + 1)} />
       <Totp onChange={() => setVer((v) => v + 1)} />
       <RecoveryCodes ver={ver} />
+      <SignInMethods />
       <SignInSecurity ver={ver} />
       <RecoveryKeys />
       <AppPasswords />

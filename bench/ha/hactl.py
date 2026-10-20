@@ -2294,7 +2294,7 @@ def s_ctr_skew_steady(ctx):
 
 # ---- two builds: rolling upgrade / rollback / refusal (DESIGN.md "Rolling
 # upgrades and format versioning"). bench/ha/upgrade.sh builds the previous
-# release and this tree, plain and with the test-level feature (level 2,
+# release and this tree, plain and with the test-level feature (level 3,
 # segment magic VLSEGT1), so finalize changes formats.
 
 UPGRADE_DIR = os.environ.get("VLPDS_UPGRADE_DIR", os.path.join(PKG, "target", "upgrade"))
@@ -2382,6 +2382,12 @@ def finalize(idx, expect, level=None):
     return f
 
 
+# vlsync-store/src/version.rs: the newest real level, and the test-only one
+# above it that the test-level builds (NEW_TL_BIN) run.
+REAL_MAX = 2
+TEST_LEVEL = REAL_MAX + 1
+
+
 def upgrade_checks(ctx, res, finalized, new_formats):
     """Two-build invariants on top of `failures`: finalize outcomes as expected;
     segments in the test level's format only after a finalize (and then some);
@@ -2434,7 +2440,7 @@ def upgrade_ctx(ctx):
 
 @scenario("upgrade-rolling",
           "[two builds] 3 old nodes under load; replace them one by one (SIGTERM) with the new build (test feature "
-          "level 2); finalize; every acked write readable, checker + firehose complete, new segment format only after finalize")
+          "level 3); finalize; every acked write readable, checker + firehose complete, new segment format only after finalize")
 def s_upgrade_rolling(ctx):
     upgrade_ctx(ctx)
     acts = [(8, swap_build(1, NEW_TL_BIN, "new")), (8.01, audit_from_start(1)),
@@ -2443,25 +2449,26 @@ def s_upgrade_rolling(ctx):
             (28, swap_build(0, NEW_TL_BIN, "new")), (28.01, audit_from_start(0)),
             (36, finalize(1, 200))]
     res = run_load_scenario(ctx, 3, 50, acts, node_bins=[OLD_BIN] * 3)
-    return upgrade_checks(ctx, res, finalized=2, new_formats=True)
+    return upgrade_checks(ctx, res, finalized=TEST_LEVEL, new_formats=True)
 
 
 @scenario("upgrade-rolling-l1",
           "[two builds] the real release path: 3 old nodes under load, replaced one by one with the current build "
-          "(no format change between them: level 1 both); finalize to 2 is refused (no build runs it)")
+          "(level 2 adds rows, no segment change); finalize to 3 is refused (no build runs it), to 2 succeeds")
 def s_upgrade_rolling_l1(ctx):
     upgrade_ctx(ctx)
     acts = [(8, swap_build(1, NEW_BIN, "new")), (8.01, audit_from_start(1)),
             (18, swap_build(2, NEW_BIN, "new")), (18.01, audit_from_start(2)),
             (27, checker_with_cursor(1, back_s=20)),
             (28, swap_build(0, NEW_BIN, "new")), (28.01, audit_from_start(0)),
-            (36, finalize(1, 400, level=2))]
+            (35, finalize(1, 400, level=TEST_LEVEL)),
+            (36, finalize(1, 200, level=REAL_MAX))]
     res = run_load_scenario(ctx, 3, 45, acts, node_bins=[OLD_BIN] * 3)
-    return upgrade_checks(ctx, res, finalized=1, new_formats=False)
+    return upgrade_checks(ctx, res, finalized=REAL_MAX, new_formats=False)
 
 
 @scenario("upgrade-rollback",
-          "[two builds] 3 old nodes under load; upgrade 2 of 3 to the new build (test level 2); finalize is refused "
+          "[two builds] 3 old nodes under load; upgrade 2 of 3 to the new build (test level 3); finalize is refused "
           "(an old node is live); roll both back to the old build; nothing in the new format ever written")
 def s_upgrade_rollback(ctx):
     upgrade_ctx(ctx)
@@ -2476,7 +2483,7 @@ def s_upgrade_rollback(ctx):
 
 
 @scenario("upgrade-old-refused",
-          "[two builds] old cluster upgraded node by node to the new build (test level 2) and finalized under load; "
+          "[two builds] old cluster upgraded node by node to the new build (test level 3) and finalized under load; "
           "then an extra old node (n4) and n2 rolled back to the old build both exit 7 without writing anything; "
           "n2 comes back on the new build; the cluster is unaffected")
 def s_upgrade_old_refused(ctx):
@@ -2490,7 +2497,7 @@ def s_upgrade_old_refused(ctx):
             (36, swap_build(1, NEW_TL_BIN, "new")), (36.01, audit_from_start(1)),
             (38, checker_with_cursor(1, back_s=20))]
     res = run_load_scenario(ctx, 4, 50, acts, start_nodes=3, expect_final=3, node_bins=[OLD_BIN] * 4)
-    return upgrade_checks(ctx, res, finalized=2, new_formats=True)
+    return upgrade_checks(ctx, res, finalized=TEST_LEVEL, new_formats=True)
 
 
 def raise_race(old_idx, via_idx, delay_s):
@@ -2546,7 +2553,7 @@ def raise_race(old_idx, via_idx, delay_s):
 
 
 @scenario("upgrade-raise-race",
-          "[two builds] old cluster upgraded to the new build (test level 2), still at level 1, under load; an old node starts while a "
+          "[two builds] old cluster upgraded to the new build (test level 3), still at level 1, under load; an old node starts while a "
           "finalize runs: either the raise aborts (409) and the old node runs, or the old node exits 7; never both")
 def s_upgrade_raise_race(ctx):
     upgrade_ctx(ctx)
@@ -2558,7 +2565,7 @@ def s_upgrade_raise_race(ctx):
     res["race"] = ctx.ret.get("race")
     if not (res["race"] or {}).get("ok"):
         res.setdefault("k_fail", []).append(f"raise race: {res['race']}")
-    return upgrade_checks(ctx, res, finalized=2, new_formats=True)
+    return upgrade_checks(ctx, res, finalized=TEST_LEVEL, new_formats=True)
 
 
 def run_one(name, run_id):

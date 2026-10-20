@@ -893,8 +893,18 @@ async fn create_session_inner(
 /// Whether the passkey a sign-in recorded is still on the account; true
 /// for sign-ins without one.
 pub(super) async fn still_registered(app: &App, did: &str, auth_cred: Option<&str>) -> XResult<bool> {
-    let Some(r) = auth_cred else { return Ok(true) };
-    Ok(load(app, did).await?.creds.iter().any(|c| c.auth_ref() == r))
+    let refs: Vec<&str> = crate::federated::cred_refs(auth_cred).filter(|r| r.starts_with("pk:")).collect();
+    if refs.is_empty() {
+        return Ok(true);
+    }
+    let p = load(app, did).await?;
+    Ok(refs.iter().all(|r| p.creds.iter().any(|c| c.auth_ref() == *r)))
+}
+
+/// Every credential a sign-in recorded (passkeys, sign-in identities) is
+/// still on the account.
+pub(super) async fn credentials_live(app: &App, did: &str, auth_cred: Option<&str>) -> XResult<bool> {
+    Ok(still_registered(app, did, auth_cred).await? && super::federated::still_linked(app, did, auth_cred).await?)
 }
 
 /// Golden fixtures (`super::private_rows`).

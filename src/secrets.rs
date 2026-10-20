@@ -92,6 +92,8 @@ pub enum Purpose {
     Totp,
     /// Subject: `plc::ROTATION_KEY_SUBJECT`.
     PlcRotationKey,
+    /// A sign-in provider's client secret or key. Subject: the provider id.
+    SignInProviderSecret,
 }
 
 impl Purpose {
@@ -101,6 +103,7 @@ impl Purpose {
             Purpose::ReservedKey => "reserved-signing-key",
             Purpose::Totp => "totp-secret",
             Purpose::PlcRotationKey => "plc-rotation-key",
+            Purpose::SignInProviderSecret => "sign-in-provider-secret",
         }
     }
 }

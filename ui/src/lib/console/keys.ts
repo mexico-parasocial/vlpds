@@ -40,6 +40,7 @@ export const K = {
   subscribers: ['subscribers'] as const,
   crawlers: ['crawlers'] as const,
   domains: ['domains'] as const,
+  signInProviders: ['signInProviders'] as const,
   invites: ['invites'] as const,
 
   // system

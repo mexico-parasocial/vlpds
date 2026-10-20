@@ -33,9 +33,11 @@ no matter what its build can do. So mixed versions are safe, and rolling back is
 until you finalize. The few exceptions are listed under [Compatibility contract](#compatibility-contract).
 
 > [!NOTE]
-> Today every release runs level 1 only (`baseline`), so there hasn't been a level to finalize yet.
-> The machinery (the `cluster/version` object, the startup check, finalize and lower) is built and
-> tested with a test-only level 2.
+> Level 2 (`federated-sign-in`) is the first level after `baseline`. It's persistent and turns on
+> third-party sign-in ([OAuth and 2FA](../oauth-2fa.md#third-party-sign-in)): below it, providers can
+> be saved but none is offered and nothing of it is written. A new prefix starts at level 2. An
+> existing cluster gets it with `vlpds admin cluster finalize --level 2` once every node runs a build
+> that has it, and after that older builds exit 7. The test-only level is 3.
 
 ## Rolling deploy
 
@@ -212,7 +214,7 @@ on to get a new set of recovery codes on the Security page.
 - title: "`just upgrade-ha`"
   body: "Every `upgrade-*` scenario (`bench/ha/upgrade.sh`): rolling upgrade, rollback before finalize, old-node refusal after it, and a node starting during a raise."
 - title: Never deploy a test build
-  body: "The scenarios use the cargo feature `test-level`, which adds a fake level 2 with a different segment format. A build like that logs `TEST BUILD` at startup."
+  body: "The scenarios use the cargo feature `test-level`, which adds a fake level above the real ones with a different segment format. A build like that logs `TEST BUILD` at startup."
 ```
 
 Results of the last two-build run are in `bench/ha/RESULTS.md` ("Two-build upgrade scenarios").
