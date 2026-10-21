@@ -1144,10 +1144,13 @@ or the store got slower (so permits are held longer).
 
 ### VlpdsControlPlaneLatencyHigh
 
-**Means:** p99 of control-plane object-store requests (`ctl_*` components, i.e.
-leases, assignments and writer claims) over 1 s for 10 minutes. It's normally
-tens of ms. Every takeover step is a few of these in sequence, and the lease
-renewal is one, so past 0.4 x TTL nodes fail-stop.
+**Means:** p99 of the takeover path's control-plane object-store requests
+(`ctl_assign`, `ctl_writer` and `ctl_version`: assignments, writer claims and
+the cluster version) over 1 s for 10 minutes. It's normally tens of ms on S3 and
+a few hundred on R2. Every takeover step is a few of these in sequence, under a
+call deadline of min(TTL, 5 s). Lease renewals (`ctl_lease`) aren't in it: the
+lease alerts measure them against the TTL, starting with
+[VlpdsLeaseRenewalSlow](#vlpdsleaserenewalslow).
 
 **Confirm:** `vlpds_object_store_request_seconds` by `component` and `op` on the
 node, [VlpdsLeaseRenewalSlow](#vlpdsleaserenewalslow), and the same on other

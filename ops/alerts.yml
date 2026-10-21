@@ -753,12 +753,17 @@ groups:
           summary: "{{ $labels.instance }}: {{ $value | humanize }} object-store requests/s queue for a {{ $labels.client }} permit ({{ $labels.lane }} lane)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorepermitssaturated"
 
-      # Control-plane requests (leases, assignments, writer claims) are small
-      # GET/PUT/LISTs: ~10-50 ms. p99 over 1 s is a quarter of the renewal
-      # ceiling at the default TTL and slows every takeover step (guess).
+      # Takeover-path control-plane requests (assignments, writer claims, the
+      # cluster version) are small GET/PUT/LISTs: ~10-50 ms on S3, 100-400 ms
+      # on R2. Each runs under a takeover step's call deadline, min(TTL, 5 s),
+      # so p99 over 1 s is a fifth of it (guess). Node lease renewals
+      # (ctl_lease) are left to the VlpdsLeaseRenewal* alerts, which scale
+      # with the TTL: a flat 1 s fired on R2 write brownouts that left a
+      # 60 s lease over ten times its fail-stop margin. The storage-stats
+      # document (ctl_stats) isn't on any deadline.
       - alert: VlpdsControlPlaneLatencyHigh
         expr: >-
-          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_object_store_request_seconds_bucket{job="vlpds",component=~"ctl_.*"}[5m]))) > 1
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_object_store_request_seconds_bucket{job="vlpds",component=~"ctl_assign|ctl_writer|ctl_version"}[5m]))) > 1
         for: 10m
         labels:
           severity: ticket

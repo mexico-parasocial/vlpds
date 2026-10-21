@@ -108,6 +108,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # config lives here for both builds.
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 vlpds \
