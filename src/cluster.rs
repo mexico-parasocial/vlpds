@@ -3722,7 +3722,8 @@ mod tests {
     /// "getfail" the next GET. "slowfail": the next PUT fails after
     /// SLOW_FAIL (a write the store throttled until object_store gave up).
     /// "slowland": the next PUT lands after SLOW_LAND (throttled, then let
-    /// through).
+    /// through). "unanswered": the next PUT lands, then fails as a timeout
+    /// does (no status).
     /// `puts` logs every PUT: (key, sent, answered).
     #[derive(Debug, Default)]
     struct Stalls {
@@ -3791,6 +3792,17 @@ mod tests {
             }
             if self.take("fail", location.as_ref()) {
                 return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
+            }
+            if self.take("unanswered", location.as_ref()) {
+                self.inner.put_opts(location, payload, opts).await?;
+                let timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+                return Err(object_store::Error::Generic {
+                    store: "Stalls",
+                    source: Box::new(object_store::client::HttpError::new(
+                        object_store::client::HttpErrorKind::Timeout,
+                        timeout,
+                    )),
+                });
             }
             if self.take("landed", location.as_ref()) {
                 // applied, answer lost, and the client's retry of the same
@@ -3932,6 +3944,38 @@ mod tests {
         tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(ha.lost.load(Ordering::SeqCst), 1);
+    }
+
+    /// The control-plane client resends a renewal CAS whose attempt timed
+    /// out after the store applied it; the resend's precondition failure
+    /// is our own write, so the node carries on.
+    #[tokio::test]
+    async fn a_resent_renewal_that_had_landed_is_adopted() {
+        let stalls = Arc::new(Stalls::default());
+        let mem = Store::memory(None);
+        let raw = Arc::new(vlsync_store::throttle::LeaseWrites {
+            plain: stalls.clone(),
+            lease: stalls.clone(),
+            prefix: mem.prefix.clone(),
+            resend_gap: Duration::from_millis(10),
+            resend_within: cfg("a").renew_every,
+        });
+        let store = Store { raw, ..mem };
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        stalls.arm("unanswered", "nodes/a");
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
+        let before = stalls.puts.lock().len();
+        a.renew(&ha_dyn).await;
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 1, "the armed renewal ran");
+        let puts: Vec<String> = stalls.puts.lock()[before..].iter().map(|(k, _, _)| k.clone()).collect();
+        assert_eq!(puts, ["vlpds/nodes/a", "vlpds/nodes/a"], "resent once");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a landed renewal is no lost lease");
+        tokio::time::sleep(a.cfg.renew_every).await;
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
+        assert!(a.lease_valid());
     }
 
     /// A same-id restart whose previous incarnation's lease vanishes between

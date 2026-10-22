@@ -49,6 +49,7 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_object_store_throttled_total{kind="lease"}"#,
     r#"vlpds_object_store_throttled_total{kind="segment"}"#,
     r#"vlpds_object_store_throttled_total{kind="other"}"#,
+    "vlpds_object_store_lease_resends_total",
     r#"vlpds_shards_opened_total{result="error"}"#,
     r#"vlpds_segment_put_attempts_total{result="error"}"#,
     r#"vlpds_write_errors_total{kind="internal"}"#,
