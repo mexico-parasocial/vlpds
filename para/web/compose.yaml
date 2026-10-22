@@ -1,0 +1,36 @@
+# La app web de PARA (bskyweb: el servidor Go con el build web adentro), en
+# https://PARA_DOMAIN. Perfil web. El dominio raíz sigue respondiendo
+# /.well-known/* desde el PDS; todo lo demás llega aquí.
+#
+# El build web hornea las URLs de la plataforma, así que la imagen es por
+# dominio: CI de PARA la publica con la variable PARA_DOMAIN del repo
+# (.github/workflows/para-web-image.yml), y `make up BUILD=1` la construye aquí
+# con el PARA_DOMAIN de .env. Ver docs/APP.md.
+
+services:
+  web:
+    profiles: [web]
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/para-web:${PARA_WEB_VERSION:-local}
+    build:
+      # Ruta absoluta (el Makefile la calcula): las relativas aquí serían desde web/.
+      context: ${PARA_WEB_CONTEXT:?Ejecuta con make desde para/}
+      dockerfile: Dockerfile
+      args:
+        EXPO_PUBLIC_ENV: production
+        PARA_DOMAIN: ${PARA_DOMAIN:?Define PARA_DOMAIN en .env}
+    restart: unless-stopped
+    environment:
+      ATP_APPVIEW_HOST: https://appview.${PARA_DOMAIN}
+      HTTP_ADDRESS: ':8100'
+      CORS_ALLOWED_ORIGINS: https://${PARA_DOMAIN}
+      # Sin GrowthBook propio, nada de banderas remotas (el valor por defecto
+      # de bskyweb pediría las de Bluesky).
+      FEATURE_GATE_BOOTSTRAP: ${PARA_WEB_FEATURE_GATES:-false}
+      GROWTHBOOK_API_HOST: ${PARA_GROWTHBOOK_API_HOST:-}
+      GROWTHBOOK_CLIENT_KEY: ${PARA_GROWTHBOOK_CLIENT_KEY:-}
+      ROBOTS_DISALLOW_ALL: ${PARA_WEB_ROBOTS_DISALLOW_ALL:-false}
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${WEB_MEM:-128m}

@@ -1,0 +1,34 @@
+# Plataforma PARA sobre vlpds: un solo punto de entrada para levantarla.
+#
+# core.yaml define el núcleo (vlpds como PDS, relay, AppView, bsync, Ozone,
+# Postgres, edge). Los demás perfiles incluyen los compose que ya viven en
+# cada repo (WatZappa para Matrix, mubEZ para identidad) y les agregan
+# encima, con archivos de overrides/, lo que solo tiene sentido aquí.
+#
+# Perfiles (se eligen con `make up PROFILES=...`):
+#   core       vlpds, relay, AppView (bsky + dataplane), bsync, Ozone,
+#              Postgres, Redis, respaldos al bucket
+#   matrix     Synapse, MAS, para-idp, Element, matrix-bridge
+#   identity   mubEZ (broker M8: identidad, INE, ZKP)
+#   edge       Caddy: HTTPS y rutas públicas de todo lo anterior
+#   monitoring Alloy: métricas y logs hacia tu Prometheus/Loki
+#   local-s3   un S3 local (SeaweedFS) para probar sin nube
+#   web        la app web de PARA (bskyweb) en el dominio raíz
+#
+# Estado durable: el bucket (vlpds entero, más los respaldos) y Postgres.
+# Todo lo demás es caché o se reconstruye; ver docs/RESPALDOS.md.
+
+name: para
+
+include:
+  # Un archivo por secreto en secrets/ (secrets.yaml, docs/CONFIGURACION.md).
+  - path: secrets.yaml
+  - path: core.yaml
+  - path:
+      - ${WATZAPPA_DIR:-../../WatZappa}/docker-compose.matrix.yaml
+      - overrides/matrix.yaml
+  - path:
+      - ${MUBEZ_DIR:-../../mubEZ}/docker-compose.yml
+      - overrides/identity.yaml
+  - path: ops/compose.yaml
+  - path: web/compose.yaml

@@ -1,0 +1,41 @@
+---
+# Dónde vive la plataforma en la máquina.
+para_root: /opt/para
+
+# Los repos, cada uno fijado a una revisión (tag o commit). La plataforma vive
+# en el fork de vlpds (vlpds/para). De WatZappa y mubEZ se usan los compose,
+# la configuración y, con WATZAPPA_VERSION=local, el código para construir.
+para_repos:
+  vlpds: {url: "https://github.com/mexico-parasocial/vlpds.git", version: para/platform}
+  WatZappa: {url: "https://github.com/mexico-parasocial/WatZappa.git", version: main}
+  mubEZ: {url: "git@github.com:mexico-parasocial/mubEZ.git", version: main}
+
+# Llave de despliegue (solo lectura) para clonar repos privados. Va cifrada
+# en el inventario (sops). Vacía = los repos son públicos o ya hay acceso.
+para_git_deploy_key: ""
+
+# Todo lo de vlpds/para/.env (ver .env.example). PARA_DOMAIN, el bucket y
+# las versiones son obligatorios.
+para_env: {}
+
+# Un valor por archivo de secrets/ (scripts/secrets.sh list). Cifrado con sops.
+para_secrets: {}
+
+# env/identity.env y env/core.env (opcionales, no secretos).
+para_identity_env: {}
+para_core_env: {}
+
+para_secrets_gid: 10001
+
+# make preflight antes de levantar (bucket, secretos, DNS). Apagarlo solo para
+# depurar.
+para_preflight: true
+
+# Worker de AppView: lo decide el grupo del inventario.
+para_role: "{{ 'appview-worker' if 'para_appview' in group_names else 'primary' }}"
+# IP privada de la principal, para los workers (Postgres y bsync).
+para_primary_ip: "{{ hostvars[groups['para'][0]].para_private_ip | default('') }}"
+
+# Con WATZAPPA_VERSION o MUBEZ_VERSION en `local` (nadie publica aún esas
+# imágenes), make preflight y make up construyen en el servidor (BUILD=1).
+para_build_arg: "{{ 'BUILD=1' if 'local' in [para_env.WATZAPPA_VERSION | default('local'), para_env.MUBEZ_VERSION | default('local')] else '' }}"

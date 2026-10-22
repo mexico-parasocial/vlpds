@@ -1,0 +1,97 @@
+# PARA Matrix — public routes for the containerized edge.
+#
+# Imported by the platform's edge when the matrix profile is on (it mounts
+# an empty file otherwise). Upstreams are Compose service names, so this only
+# works from a Caddy on the same Compose network; for a Caddy on the host see
+# deploy/matrix/Caddyfile.matrix.
+#
+#   {$MATRIX_SERVER_NAME}  Synapse (client API), with MAS taking the login,
+#                          logout and refresh endpoints
+#   auth.{$PARA_DOMAIN}    MAS: the OIDC issuer apps log in through
+#   idp.{$PARA_DOMAIN}     para-idp: proves the user holds a PARA identity key
+#   chat.{$PARA_DOMAIN}    Element Web
+#
+# Federation stays closed: no 8448 listener, and deploy/matrix/hardening.yaml
+# whitelists no server. Admin APIs answer an empty 404 unless the client is on
+# loopback or the private network (PARA_OPERATOR_CIDRS).
+
+(para_matrix_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+{$MATRIX_SERVER_NAME} {
+	encode gzip
+	import para_matrix_headers
+
+	@operator {
+		path /_synapse/admin/* /_synapse/admin
+		not remote_ip {$PARA_OPERATOR_CIDRS:127.0.0.1/8 100.64.0.0/10 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}
+	}
+	handle @operator {
+		respond 404
+	}
+
+	handle /.well-known/matrix/server {
+		header Content-Type application/json
+		respond `{"m.server": "{$MATRIX_SERVER_NAME}:443"}`
+	}
+	handle /.well-known/matrix/client {
+		header Content-Type application/json
+		header Access-Control-Allow-Origin *
+		respond `{"m.homeserver": {"base_url": "https://{$MATRIX_SERVER_NAME}"}}`
+	}
+
+	# With authentication delegated, MAS serves the legacy login, logout and
+	# refresh endpoints; Synapse answers 404 for them.
+	@mas path /_matrix/client/*/login /_matrix/client/*/logout /_matrix/client/*/logout/* /_matrix/client/*/refresh
+	handle @mas {
+		reverse_proxy mas:8080 {
+			lb_try_duration 10s
+		}
+	}
+
+	handle {
+		reverse_proxy synapse:8008 {
+			lb_try_duration 10s
+		}
+	}
+}
+
+auth.{$PARA_DOMAIN} {
+	encode gzip
+	import para_matrix_headers
+
+	@operator {
+		path /api/admin/*
+		not remote_ip {$PARA_OPERATOR_CIDRS:127.0.0.1/8 100.64.0.0/10 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}
+	}
+	handle @operator {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy mas:8080 {
+			lb_try_duration 10s
+		}
+	}
+}
+
+idp.{$PARA_DOMAIN} {
+	encode gzip
+	import para_matrix_headers
+	reverse_proxy para-idp:8090 {
+		lb_try_duration 10s
+	}
+}
+
+chat.{$PARA_DOMAIN} {
+	encode gzip
+	import para_matrix_headers
+	header X-Frame-Options "SAMEORIGIN"
+	reverse_proxy element-web:80
+}

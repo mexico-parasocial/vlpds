@@ -1,0 +1,11 @@
+# Máquina worker de AppView (PARA_ROLE=appview-worker en .env). Ver
+# overrides/worker.yaml y docs/ESCALADO.md. Solo levanta bsky, dataplane y un
+# Redis local; el estado sigue en el Postgres de la máquina principal.
+
+name: para-worker
+
+include:
+  - path: secrets.yaml
+  - path:
+      - core.yaml
+      - overrides/worker.yaml

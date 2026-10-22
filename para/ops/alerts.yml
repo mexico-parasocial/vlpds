@@ -1,0 +1,132 @@
+# Alertas de la plataforma PARA, para tu Prometheus / Mimir / Grafana.
+# Cada alerta tiene su sección en docs/RUNBOOK.md (anotación runbook).
+#
+#   severity: page    alguien tiene que verla ya (usuarios afectados o datos
+#                     en riesgo)
+#   severity: ticket  se atiende en horario normal
+#
+# Las métricas las manda Alloy (ops/alloy/config.alloy, perfil monitoring).
+# Valida con: make check  (promtool check rules)
+
+groups:
+  - name: para-edge
+    rules:
+      - alert: ParaEdgeDown
+        expr: up{job="caddy"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: El edge (Caddy) no responde en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#paraedgedown
+
+      - alert: ParaUpstreamDown
+        expr: caddy_reverse_proxy_upstreams_healthy == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: Caddy no alcanza {{ $labels.upstream }} en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#paraupstreamdown
+
+      - alert: ParaEdge5xxHigh
+        expr: |
+          sum by (instance) (rate(caddy_http_request_duration_seconds_count{code=~"5.."}[5m]))
+            / sum by (instance) (rate(caddy_http_request_duration_seconds_count[5m])) > 0.05
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: Más del 5 % de las respuestas son 5xx en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#paraedge5xxhigh
+
+  - name: para-state
+    rules:
+      - alert: ParaPostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: Postgres no responde en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#parapostgresdown
+
+      - alert: ParaPostgresConnectionsHigh
+        expr: |
+          sum by (instance) (pg_stat_activity_count)
+            / max by (instance) (pg_settings_max_connections) > 0.8
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: Postgres usa más del 80 % de sus conexiones en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#parapostgresconnectionshigh
+
+      - alert: ParaBackupStale
+        expr: |
+          time() - para_backup_last_success_timestamp_seconds
+            > 2.5 * para_backup_interval_seconds
+        for: 15m
+        labels: {severity: page}
+        annotations:
+          summary: El respaldo {{ $labels.target }} no termina bien desde hace más de 2.5 intervalos
+          runbook: docs/RUNBOOK.md#parabackupstale
+
+      - alert: ParaBackupFailing
+        expr: para_backup_last_run_success == 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: El último respaldo {{ $labels.target }} falló en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#parabackupfailing
+
+  - name: para-host
+    rules:
+      - alert: ParaDiskAlmostFull
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.10
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: Queda menos del 10 % en {{ $labels.mountpoint }} ({{ $labels.instance }})
+          runbook: docs/RUNBOOK.md#paradiskalmostfull
+
+      - alert: ParaDiskFilling
+        expr: |
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 0.20
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: Queda menos del 20 % en {{ $labels.mountpoint }} ({{ $labels.instance }})
+          runbook: docs/RUNBOOK.md#paradiskalmostfull
+
+      - alert: ParaMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: Queda menos del 10 % de memoria en {{ $labels.instance }}
+          runbook: docs/RUNBOOK.md#paramemorylow
+
+      - alert: ParaHostClockSkew
+        expr: abs(node_timex_offset_seconds) > 0.05
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: El reloj de {{ $labels.instance }} se desvía más de 50 ms
+          runbook: docs/RUNBOOK.md#parahostclockskew
+
+  - name: para-services
+    rules:
+      - alert: ParaTargetDown
+        expr: up{job!~"caddy|postgres|node"} == 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: '{{ $labels.job }} no entrega métricas en {{ $labels.instance }}'
+          runbook: docs/RUNBOOK.md#paratargetdown
+
+      - alert: ParaBridgeFirehoseLagging
+        expr: para_matrix_firehose_lag_seconds > 300
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: El bridge procesa el firehose con más de 5 min de retraso
+          runbook: docs/RUNBOOK.md#parabridgefirehoselagging

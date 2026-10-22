@@ -1,0 +1,160 @@
+# Se aplica sobre WatZappa/docker-compose.matrix.yaml.
+#
+# Synapse y MAS usan el Postgres compartido de overrides/core.yaml: sus
+# configuraciones generadas siguen apuntando a synapse-db y mas-db, que ahora
+# son alias de ese servidor. Las dos bases propias del compose de WatZappa
+# quedan en el perfil legacy-matrix-db, que la plataforma nunca levanta (sirve
+# para migrar sus datos; ver docs/ACTUALIZACIONES.md).
+
+x-secrets-reader: &secrets-reader
+  group_add: ['${PARA_SECRETS_GID:-10001}']
+
+services:
+  synapse:
+    container_name: !reset null
+    profiles: [matrix]
+    depends_on: !override
+      synapse-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      SYNAPSE_CACHE_FACTOR: ${SYNAPSE_CACHE_FACTOR:-0.5}
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: ${SYNAPSE_MEM:-1g}
+  synapse-init:
+    container_name: !reset null
+    profiles: [matrix]
+  synapse-db:
+    profiles: [legacy-matrix-db]
+  mas-db:
+    profiles: [legacy-matrix-db]
+  para-idp:
+    container_name: !reset null
+    profiles: [matrix]
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-para-idp:${WATZAPPA_VERSION:-local}
+    # Solo el edge habla con él.
+    ports: !reset []
+    # Lo genera make matrix-init; opcional aquí para que `make config` valide
+    # antes de esa primera vez (preflight sí lo exige con el perfil matrix).
+    env_file: !override
+      - path: ./deploy/matrix/mas/para-idp.env
+        required: false
+    deploy:
+      resources:
+        limits:
+          memory: ${PARA_IDP_MEM:-96m}
+  mas:
+    container_name: !reset null
+    profiles: [matrix]
+    ports: !reset []
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      para-idp:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: ${MAS_MEM:-192m}
+  element-web:
+    container_name: !reset null
+    profiles: [matrix]
+    ports: !reset []
+    # La config generada por make matrix-init para PARA_DOMAIN, no la versionada
+    # (que apunta a matrix.para.social).
+    volumes: !override
+      - ./deploy/matrix/synapse/element-config.json:/app/config.json:ro
+    deploy:
+      resources:
+        limits:
+          memory: ${ELEMENT_MEM:-64m}
+  matrix-bridge:
+    container_name: !reset null
+    profiles: [matrix]
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-matrix-bridge:${WATZAPPA_VERSION:-local}
+    labels:
+      para.metrics.port: '3001'
+      para.metrics.path: /metrics
+    <<: *secrets-reader
+    # Su imagen no lee NAME_FILE: el envoltorio de la plataforma lo hace
+    # (runtime/env-from-files.sh). Sin el CMD de la imagen, se repite aquí.
+    entrypoint: ['dumb-init', '--', 'sh', '/para/env-from-files']
+    command: ['node', '--heapsnapshot-signal=SIGUSR2', '--enable-source-maps', 'dist/index.js']
+    # Todo su estado está en Postgres: ni volumen ni puerto en el host, y
+    # nada de la red externa para-edge del compose de WatZappa.
+    volumes: !override
+      - ${PLATFORM_DIR}/runtime/env-from-files.sh:/para/env-from-files:ro
+    ports: !reset []
+    networks: !override [default]
+    depends_on: !override
+      synapse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      relay:
+        condition: service_started
+    environment:
+      # El estado del bridge vive en Postgres (base bridge): el contenedor no
+      # guarda nada propio. Para traer el SQLite de un despliegue anterior:
+      # docs/ACTUALIZACIONES.md, "Bridge: de SQLite a Postgres".
+      DATABASE_URL_FILE: /run/secrets/postgres_url_bridge
+      # El firehose de vlpds renumerado por el relay: el consumidor del
+      # bridge, como @atproto/sync, no admite seq por encima de 2^53.
+      PDS_FIREHOSE_URL: ws://relay:2470
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:-matrix.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}}
+      MATRIX_ENABLE_ENCRYPTION: ${MATRIX_ENABLE_ENCRYPTION:-true}
+      PLC_URL: ${PLC_URL:-https://plc.directory}
+      # Dentro de la plataforma mubEZ se alcanza por nombre de servicio; ya no
+      # hace falta salir al host por host.docker.internal.
+      M8_BASE_URL: ${M8_BASE_URL:-http://mubez:8787/v1}
+      BRIDGE_AUTHORITY_APPVIEW_URL: ${BRIDGE_AUTHORITY_APPVIEW_URL:-https://appview.${PARA_DOMAIN}}
+      MATRIX_ADMIN_TOKEN: ''
+      MATRIX_ADMIN_TOKEN_FILE: /run/secrets/matrix_admin_token
+      MATRIX_APPSERVICE_TOKEN: ''
+      MATRIX_APPSERVICE_TOKEN_FILE: /run/secrets/matrix_appservice_token
+      MATRIX_HS_TOKEN_FILE: /run/secrets/matrix_hs_token
+      PARA_AUTHORITY_SERVICE_TOKEN_FILE: /run/secrets/authority_service_token
+    secrets:
+      - postgres_url_bridge
+      - matrix_admin_token
+      - matrix_appservice_token
+      - matrix_hs_token
+      - authority_service_token
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${BRIDGE_MEM:-384m}
+
+  # Copia incremental del media de Synapse al bucket. La llave de firma de
+  # Synapse no va al bucket: se guarda offline (docs/RESPALDOS.md).
+  backup-media:
+    profiles: [matrix]
+    labels:
+      para.metrics.port: '9101'
+    build: ${PLATFORM_DIR}/ops/backup
+    image: para-backup:local
+    restart: unless-stopped
+    group_add: ['${PARA_SECRETS_GID:-10001}']
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-auto}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX:-prod}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key_id
+      S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_access_key
+      BACKUP_INTERVAL: ${BACKUP_INTERVAL:-6h}
+      BACKUP_RETENTION: ${BACKUP_RETENTION:-14d}
+      BACKUP_TARGETS: synapse-media
+    secrets: [s3_access_key_id, s3_secret_access_key]
+    volumes:
+      - synapse_data:/sources/synapse:ro
+    deploy:
+      resources:
+        limits:
+          memory: ${BACKUP_MEM:-256m}

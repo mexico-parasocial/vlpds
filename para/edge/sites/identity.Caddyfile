@@ -1,0 +1,17 @@
+# M8 — broker de identidad (mubEZ). Lo llaman PARA, iM8 y el matrix-bridge.
+# Se monta en el edge solo con el perfil identity.
+m8.{$PARA_DOMAIN} {
+	encode gzip
+
+	# mubEZ agrega sus propias cabeceras de seguridad
+	# (SECURITY_HEADERS_ENABLED); aquí solo se fuerza HTTPS. Mientras el
+	# broker reinicia (restaura desde el bucket), Caddy reintenta 10 s.
+	reverse_proxy mubez:8787 {
+		lb_try_duration 10s
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		-Server
+	}
+}
