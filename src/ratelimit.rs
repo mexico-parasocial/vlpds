@@ -402,9 +402,19 @@ limit!(
 limit!(SPACE_CREATE, 44, "space-create", Did, "simplespace.createSpace per account", DAY, 100);
 limit!(SPACE_REGISTER, 45, "space-register", Credential, "space.registerNotify with one space credential", HOUR, 60);
 
+limit!(
+    FEDERATED_LINK_ACCOUNT,
+    46,
+    "federated-link-account",
+    Did,
+    "adding or removing a third-party sign-in on /oauth/account",
+    DAY,
+    10
+);
+
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 46] = [
+pub const BUILTIN: [&Limit; 47] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -451,6 +461,7 @@ pub const BUILTIN: [&Limit; 46] = [
     &SPACE_REVOKE_AUD,
     &SPACE_CREATE,
     &SPACE_REGISTER,
+    &FEDERATED_LINK_ACCOUNT,
 ];
 
 /// A confidential client's backend calls these for all of its users from
@@ -459,6 +470,9 @@ const OAUTH_IP_PATHS: [&str; 3] = ["/oauth/par", "/oauth/token", "/oauth/revoke"
 
 /// Checked by the handler, which renders its own page on a 429.
 const OAUTH_FORM_PATHS: [&str; 3] = ["/oauth/authorize/sign-in", "/oauth/account/sign-in", "/oauth/authorize/sign-up"];
+
+/// Third-party sign-in's pages, any method: also checked by the handler.
+const FEDERATED_PATHS: [&str; 3] = ["/oauth/federated/start", "/oauth/federated/signup", "/oauth/account/unlink"];
 
 pub const CREATE_POINTS: u32 = 3;
 pub const UPDATE_POINTS: u32 = 2;
@@ -1429,7 +1443,9 @@ pub async fn layer(
 ) -> Response {
     let path = req.uri().path();
     let post = req.method() == axum::http::Method::POST;
-    let oauth_form = post && OAUTH_FORM_PATHS.contains(&path);
+    let oauth_form = (post && OAUTH_FORM_PATHS.contains(&path))
+        || FEDERATED_PATHS.contains(&path)
+        || path.starts_with("/oauth/federated/callback/");
     let oauth_endpoint = post && OAUTH_IP_PATHS.contains(&path);
     if !oauth_form && !oauth_endpoint && (!path.starts_with("/xrpc/") || unlimited_path(path)) {
         return next.run(req).await;

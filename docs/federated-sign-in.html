@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Third-party sign-in</title>
+<style>
+:root {
+  --bg: #f4f5f2; --surface: #ffffff; --surface-2: #eef0ec;
+  --fg: #19212a; --muted: #59646d; --rule: #d6dbd5;
+  --accent: #17705f; --accent-soft: #e0efea;
+  --warn: #9a5b12; --warn-soft: #f6ecdd;
+  --bad: #a93a24; --bad-soft: #f7e4df;
+  --info: #2c5fb3; --info-soft: #e3ebf8;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11161c; --surface: #18202a; --surface-2: #1d2631;
+    --fg: #dfe6ea; --muted: #95a2ab; --rule: #2b3642;
+    --accent: #4fbf9f; --accent-soft: #17302a;
+    --warn: #e3a43a; --warn-soft: #33281a;
+    --bad: #f0806a; --bad-soft: #3a211c;
+    --info: #8fb0ff; --info-soft: #1d2840;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11161c; --surface: #18202a; --surface-2: #1d2631;
+  --fg: #dfe6ea; --muted: #95a2ab; --rule: #2b3642;
+  --accent: #4fbf9f; --accent-soft: #17302a;
+  --warn: #e3a43a; --warn-soft: #33281a;
+  --bad: #f0806a; --bad-soft: #3a211c;
+  --info: #8fb0ff; --info-soft: #1d2840;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 var(--sans); padding: 0 16px 72px; }
+.wrap { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 44px; }
+nav.toc { position: sticky; top: 24px; align-self: start; padding-top: 40px; font-size: 13px; }
+nav.toc .label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+nav.toc a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0; }
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); }
+main { min-width: 0; }
+header.top { padding: 40px 0 10px; border-bottom: 1px solid var(--rule); margin-bottom: 8px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: .04em; }
+h1 { font-size: clamp(32px, 5vw, 46px); line-height: 1.08; margin: 8px 0 12px; letter-spacing: -.015em; }
+h2 { font-size: 26px; line-height: 1.2; margin: 52px 0 8px; scroll-margin-top: 20px; letter-spacing: -.01em; }
+h3 { font-size: 17px; margin: 26px 0 4px; }
+p, li { max-width: 72ch; }
+p { margin: 10px 0; }
+.lede { font-size: 18px; }
+.meta { color: var(--muted); font-size: 14px; }
+a { color: var(--accent); }
+code { font-family: var(--mono); font-size: .86em; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+ul, ol { padding-left: 20px; }
+li { margin: 4px 0; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; margin: 20px 0; }
+.stat { background: var(--surface); padding: 14px 16px; min-width: 0; }
+.stat b { display: block; font-size: 26px; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.stat span { display: block; font-size: 13px; color: var(--muted); }
+.tablewrap { overflow-x: auto; margin: 16px 0; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; line-height: 1.45; }
+th, td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--rule); }
+th { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; background: var(--surface-2); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td code { white-space: nowrap; }
+td.wrapcode code { white-space: normal; }
+figure { margin: 20px 0; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; }
+.svgscroll { overflow-x: auto; }
+figure svg { width: 100%; min-width: 640px; height: auto; display: block; }
+figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; max-width: 80ch; }
+.decision { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 16px 0; }
+.caveat { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 16px 0; }
+pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 12px 14px; overflow-x: auto; }
+.pill { display: inline-block; font: 600 11px/1.6 var(--mono); padding: 0 7px; border-radius: 999px; border: 1px solid var(--rule); color: var(--muted); white-space: nowrap; }
+.pill.p1 { color: var(--accent); border-color: var(--accent); }
+.pill.p2 { color: var(--info); border-color: var(--info); }
+.pill.p3 { color: var(--warn); border-color: var(--warn); }
+/* SVG parts, all from tokens */
+.d-box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.5; }
+.d-acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+.d-store { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+.d-info { fill: var(--info-soft); stroke: var(--info); stroke-width: 1.5; }
+.d-badbox { fill: var(--bad-soft); stroke: var(--bad); stroke-width: 1.5; }
+.d-group { fill: none; stroke: var(--rule); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.d-band { fill: var(--surface-2); stroke: none; }
+.d-t { fill: var(--fg); font-family: var(--sans); font-size: 14px; font-weight: 600; }
+.d-s { fill: var(--muted); font-family: var(--sans); font-size: 12px; }
+.d-m { fill: var(--muted); font-family: var(--mono); font-size: 11px; }
+.d-a { fill: var(--accent); font-family: var(--sans); font-size: 12px; font-weight: 600; }
+.d-w { fill: var(--warn); font-family: var(--sans); font-size: 12px; font-weight: 600; }
+.d-x { fill: var(--bad); font-family: var(--sans); font-size: 12px; font-weight: 600; }
+.d-i { fill: var(--info); font-family: var(--sans); font-size: 12px; font-weight: 600; }
+.d-line { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+.d-life { stroke: var(--rule); stroke-width: 2; fill: none; }
+.d-accl { stroke: var(--accent); stroke-width: 2; fill: none; }
+.d-dash { stroke: var(--muted); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+.d-warnl { stroke: var(--warn); stroke-width: 2; fill: none; }
+.d-badl { stroke: var(--bad); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+.d-infol { stroke: var(--info); stroke-width: 2; fill: none; }
+.h-m { fill: var(--muted); }
+.h-a { fill: var(--accent); }
+.h-w { fill: var(--warn); }
+.h-x { fill: var(--bad); }
+.h-i { fill: var(--info); }
+@media (max-width: 860px) {
+  .wrap { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  nav.toc { display: none; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="Sections">
+  <div class="label">Third-party sign-in</div>
+  <a href="#decisions">Decisions</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#providers">Providers</a>
+  <a href="#sign-in">The sign-in</a>
+  <a href="#id-token">id_token checks</a>
+  <a href="#linking">Linking</a>
+  <a href="#storage">Storage</a>
+  <a href="#sessions">Sessions</a>
+  <a href="#signup">Signup (P2)</a>
+  <a href="#adapters">SIWE and adapters</a>
+  <a href="#level">Feature level</a>
+  <a href="#recovery">Recovery</a>
+  <a href="#threats">Threats</a>
+  <a href="#phases">Phases</a>
+  <a href="#later">Not now</a>
+</nav>
+
+<main>
+<header class="top">
+  <div class="eyebrow">vlPDS · design · third-party sign-in over OpenID Connect · phases P1 to P3</div>
+  <h1>Third-party sign-in</h1>
+  <p class="lede">An operator can let people sign in to their vlPDS account with an account they hold somewhere else: Google, Apple, a company identity provider, or a wallet through an adapter. vlPDS speaks one protocol to all of them, OpenID Connect, and has no provider built in. A provider sign-in is one more way past the password step. The account's own second factors still apply, email stays required, and an identity is never matched by its email.</p>
+  <p class="meta">Status: design for review. Nothing here is built yet. P1 is sign-in and linking for existing accounts, P2 is signup with a provider identity, P3 is SIWE and other non-OIDC methods through an adapter.</p>
+</header>
+
+<div class="stats">
+  <div class="stat"><b>1</b><span>protocol vlPDS speaks to providers: OpenID Connect, code flow with PKCE</span></div>
+  <div class="stat"><b>0</b><span>providers in the code. Each one is an operator config entry</span></div>
+  <div class="stat"><b>(iss, sub)</b><span>the identity key. Never the email, never the provider's name</span></div>
+  <div class="stat"><b>level 2</b><span>a new feature level, so a mixed-version cluster never half-supports it</span></div>
+</div>
+
+<section>
+<h2 id="decisions">Decisions</h2>
+<div class="decision">
+  <p><b>Email stays required</b> for every account, provider signups included, because moderation runs on it.</p>
+  <p><b>A provider sign-in does not replace the account's second factor.</b> An account with TOTP, passkeys or the email factor still gets that step after the provider says yes.</p>
+  <p><b>vlPDS speaks only OIDC.</b> Sign-In with Ethereum, GitHub, Discord or anything custom comes through an OIDC adapter the operator runs (Dex, Authentik, Keycloak, siwe-oidc and the like). None of them is built in.</p>
+</div>
+<p>From those three, the rest of the design follows a few rules. One generic OIDC relying party with every provider as config. An identity is the issuer plus the subject from a validated <code>id_token</code>, held cluster-wide by a claim object. The flow's state is bound to the browser that started it. Linking takes a fresh sign-in on that browser. An account always keeps at least one way in. The whole feature waits for a feature level.</p>
+</section>
+
+<section>
+<h2 id="architecture">Architecture</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 -24 900 494" role="img" aria-labelledby="f1t">
+  <title id="f1t">Components: the browser and OAuth clients talk to any vlPDS node; the node's federated sign-in module drives an OIDC client against operator-configured providers and adapters, and keeps its config, claims and rows in the bucket.</title>
+  <defs>
+    <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+    <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-a"/></marker>
+    <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-w"/></marker>
+  </defs>
+  <path d="M96 40 L96 0 L850 0 L850 46" class="d-dash" marker-end="url(#am)"/>
+  <text x="428" y="-8" text-anchor="middle" class="d-s">the browser goes to the provider and back: state, nonce, PKCE</text>
+  <rect x="16" y="40" width="160" height="72" rx="6" class="d-box"/>
+  <text x="96" y="68" text-anchor="middle" class="d-t">Browser</text>
+  <text x="96" y="86" text-anchor="middle" class="d-s">vlpds-device cookie</text>
+  <text x="96" y="102" text-anchor="middle" class="d-m">SameSite=Lax</text>
+  <rect x="16" y="196" width="160" height="66" rx="6" class="d-box"/>
+  <text x="96" y="224" text-anchor="middle" class="d-t">OAuth client app</text>
+  <text x="96" y="244" text-anchor="middle" class="d-s">PAR · code · DPoP tokens</text>
+  <rect x="16" y="370" width="160" height="74" rx="6" class="d-box"/>
+  <text x="96" y="398" text-anchor="middle" class="d-t">Operator</text>
+  <text x="96" y="416" text-anchor="middle" class="d-s">console page · CLI</text>
+  <text x="96" y="432" text-anchor="middle" class="d-m">admin XRPC</text>
+
+  <rect x="214" y="16" width="384" height="438" rx="8" class="d-group"/>
+  <text x="230" y="38" class="d-a">any vlPDS node · feature level ≥ 2</text>
+  <rect x="232" y="52" width="166" height="70" rx="6" class="d-acc"/>
+  <text x="315" y="78" text-anchor="middle" class="d-t">Sign-in pages</text>
+  <text x="315" y="96" text-anchor="middle" class="d-m">/oauth/authorize</text>
+  <text x="315" y="111" text-anchor="middle" class="d-m">/oauth/account</text>
+  <rect x="414" y="52" width="166" height="70" rx="6" class="d-acc"/>
+  <text x="497" y="78" text-anchor="middle" class="d-t">Federated sign-in</text>
+  <text x="497" y="96" text-anchor="middle" class="d-s">start · callback</text>
+  <text x="497" y="111" text-anchor="middle" class="d-s">link · unlink</text>
+  <rect x="232" y="146" width="166" height="76" rx="6" class="d-box"/>
+  <text x="315" y="172" text-anchor="middle" class="d-t">Provider config</text>
+  <text x="315" y="190" text-anchor="middle" class="d-s">in memory, re-read 10 s</text>
+  <text x="315" y="206" text-anchor="middle" class="d-s">and on a peer's nudge</text>
+  <rect x="414" y="146" width="166" height="76" rx="6" class="d-box"/>
+  <text x="497" y="172" text-anchor="middle" class="d-t">OIDC client</text>
+  <text x="497" y="190" text-anchor="middle" class="d-s">discovery · JWKS cache</text>
+  <text x="497" y="206" text-anchor="middle" class="d-s">token · id_token checks</text>
+  <rect x="232" y="246" width="348" height="58" rx="6" class="d-box"/>
+  <text x="406" y="270" text-anchor="middle" class="d-t">Sessions, as today</text>
+  <text x="406" y="290" text-anchor="middle" class="d-s">device sign-ins · OAuth · account page, plus fed:…</text>
+  <rect x="232" y="328" width="166" height="58" rx="6" class="d-box"/>
+  <text x="315" y="352" text-anchor="middle" class="d-t">Second factors</text>
+  <text x="315" y="372" text-anchor="middle" class="d-s">TOTP · passkey · email</text>
+  <rect x="414" y="328" width="166" height="58" rx="6" class="d-box"/>
+  <text x="497" y="352" text-anchor="middle" class="d-t">Sign-in log</text>
+  <text x="497" y="372" text-anchor="middle" class="d-s">new-device alerts · mail</text>
+
+  <rect x="636" y="16" width="248" height="236" rx="8" class="d-group"/>
+  <text x="652" y="38" class="d-a">operator-chosen providers</text>
+  <rect x="652" y="50" width="216" height="46" rx="6" class="d-info"/>
+  <text x="760" y="70" text-anchor="middle" class="d-t">OIDC providers</text>
+  <text x="760" y="87" text-anchor="middle" class="d-s">Google · Apple · a company IdP</text>
+  <rect x="652" y="110" width="216" height="58" rx="6" class="d-info"/>
+  <text x="760" y="132" text-anchor="middle" class="d-t">OIDC adapter</text>
+  <text x="760" y="150" text-anchor="middle" class="d-s">Dex · Authentik · Keycloak</text>
+  <text x="760" y="163" text-anchor="middle" class="d-s">siwe-oidc · …</text>
+  <rect x="652" y="190" width="216" height="46" rx="6" class="d-box"/>
+  <text x="760" y="210" text-anchor="middle" class="d-t">Upstream</text>
+  <text x="760" y="227" text-anchor="middle" class="d-s">GitHub · Discord · a wallet (SIWE)</text>
+  <line x1="760" y1="190" x2="760" y2="172" class="d-line" marker-end="url(#am)"/>
+
+  <rect x="636" y="282" width="248" height="172" rx="8" class="d-store"/>
+  <text x="652" y="304" class="d-w">bucket</text>
+  <text x="652" y="330" class="d-m">config/signin-providers.json</text>
+  <text x="652" y="350" class="d-m">fedid/{sha256(iss \0 sub)} → DID</text>
+  <text x="652" y="370" class="d-m">p/{did}\0fedid</text>
+  <text x="652" y="390" class="d-m">p/oauth:fed:{state}\0oauth/fed</text>
+  <text x="652" y="418" class="d-s">secrets only KEK-wrapped,</text>
+  <text x="652" y="436" class="d-s">never in clear, never a file</text>
+
+  <line x1="176" y1="80" x2="228" y2="80" class="d-line" marker-end="url(#am)"/>
+  <line x1="176" y1="229" x2="228" y2="100" class="d-line" marker-end="url(#am)"/>
+  <line x1="398" y1="87" x2="410" y2="87" class="d-line"/>
+  <line x1="497" y1="122" x2="497" y2="142" class="d-line" marker-end="url(#am)"/>
+  <line x1="398" y1="184" x2="410" y2="184" class="d-line"/>
+  <path d="M580 160 L648 120" class="d-accl" marker-end="url(#aa)"/>
+  <text x="604" y="168" class="d-a">token</text>
+  <text x="604" y="182" class="d-a">JWKS</text>
+  <path d="M580 275 L632 318" class="d-warnl" marker-end="url(#aw)"/>
+  <text x="586" y="318" class="d-w">rows</text>
+  <path d="M176 420 L632 420" class="d-warnl" marker-end="url(#aw)"/>
+  <text x="404" y="412" text-anchor="middle" class="d-w">put · remove provider (CAS)</text>
+</svg>
+</div>
+<figcaption>Every node can run every step. Config is a bucket object every node keeps in memory, and with no provider in it there are no buttons and the routes 404. Claims and rows go to their owner like any other private row, and the browser carries the flow between the node and the provider.</figcaption>
+</figure>
+<p>The new code is one module (<code>src/federated/</code>) plus small hooks in the OAuth pages, the sign-in log and the session checks. It doesn't add a session kind. A provider sign-in ends in the same device sign-in and the same tokens a password does, with one more credential reference on them.</p>
+</section>
+
+<section>
+<h2 id="providers">Providers are config</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 200" role="img" aria-labelledby="f2t">
+  <title id="f2t">Provider config lifecycle: the operator saves through the console or CLI, the node CAS-writes the bucket object and nudges peers, every node re-reads within 10 seconds, and secrets are wrapped before the write.</title>
+  <defs>
+    <marker id="bm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+  </defs>
+  <rect x="16" y="64" width="150" height="66" rx="6" class="d-box"/>
+  <text x="91" y="92" text-anchor="middle" class="d-t">Operator</text>
+  <text x="91" y="112" text-anchor="middle" class="d-s">putSignInProvider</text>
+  <rect x="210" y="64" width="170" height="66" rx="6" class="d-acc"/>
+  <text x="295" y="92" text-anchor="middle" class="d-t">Validate</text>
+  <text x="295" y="112" text-anchor="middle" class="d-s">fetch discovery once</text>
+  <rect x="424" y="64" width="170" height="66" rx="6" class="d-acc"/>
+  <text x="509" y="92" text-anchor="middle" class="d-t">Wrap secrets</text>
+  <text x="509" y="112" text-anchor="middle" class="d-s">KEK, AAD = purpose + id</text>
+  <rect x="638" y="20" width="246" height="66" rx="6" class="d-store"/>
+  <text x="761" y="48" text-anchor="middle" class="d-t">config/signin-providers.json</text>
+  <text x="761" y="68" text-anchor="middle" class="d-s">If-Match CAS · audit entry</text>
+  <rect x="638" y="114" width="246" height="66" rx="6" class="d-box"/>
+  <text x="761" y="142" text-anchor="middle" class="d-t">Every node</text>
+  <text x="761" y="162" text-anchor="middle" class="d-s">nudged now · re-read ≤ 10 s</text>
+  <line x1="166" y1="97" x2="206" y2="97" class="d-line" marker-end="url(#bm)"/>
+  <line x1="380" y1="97" x2="420" y2="97" class="d-line" marker-end="url(#bm)"/>
+  <line x1="594" y1="88" x2="634" y2="60" class="d-line" marker-end="url(#bm)"/>
+  <line x1="761" y1="86" x2="761" y2="110" class="d-line" marker-end="url(#bm)"/>
+</svg>
+</div>
+<figcaption>The same machinery as the added handle domains (<code>src/handle_domains.rs</code>): one object, a conditional write, a nudge to every peer, and a conditional GET every 10 s. An unreadable object keeps the last good set.</figcaption>
+</figure>
+
+<div class="tablewrap"><table>
+<thead><tr><th>field</th><th>what it is</th><th>notes</th></tr></thead>
+<tbody>
+<tr><td><code>id</code></td><td>the operator's short name, <code>[a-z0-9-]</code>, 1 to 32</td><td>in URLs and labels only. Renaming it changes nothing about identities</td></tr>
+<tr><td><code>name</code>, <code>icon</code></td><td>button text and an optional icon</td><td>icon: a <code>data:image/…</code> URI of 16 KiB at most, so the pages' CSP (<code>img-src 'self' data:</code>) stays as it is</td></tr>
+<tr><td><code>issuer</code></td><td>the OIDC issuer URL</td><td>https (http only in dev mode or to loopback). Discovery's <code>issuer</code> must equal it byte for byte. Unique among providers</td></tr>
+<tr><td><code>clientId</code></td><td>this PDS's client id at the provider</td><td>the redirect URI to register is <code>{public_url}/oauth/federated/callback/{id}</code>, one per provider, checked against the flow&#39;s provider (RFC 9700 §4.4.2)</td></tr>
+<tr><td><code>clientAuth</code></td><td><code>client_secret_basic</code>, <code>client_secret_post</code> or <code>private_key_jwt</code></td><td>a secret, or a P-256 key and key id. For the "client secret is a JWT we sign" variant some providers need, <code>signedSecret</code> names the JWT's issuer (a team id), audience and lifetime, and vlPDS mints and caches it with the key</td></tr>
+<tr><td><code>scopes</code></td><td>default <code>openid email</code></td><td><code>openid</code> is always sent</td></tr>
+<tr><td><code>responseMode</code></td><td><code>query</code> or <code>form_post</code></td><td>some providers require <code>form_post</code> when they return a name or email</td></tr>
+<tr><td><code>signup</code></td><td><code>off</code>, <code>invite</code> or <code>open</code></td><td>P1 ships sign-in and linking only, so P1 treats every value as <code>off</code></td></tr>
+<tr><td><code>trustEmail</code></td><td>use the provider's <code>email_verified</code></td><td>prefills and confirms the email at signup (P2). Never used to find or link an account</td></tr>
+<tr><td><code>requiredClaims</code></td><td>exact-match claim filters</td><td>e.g. <code>{"hd": "example.com"}</code> to admit one hosted domain</td></tr>
+<tr><td><code>idTokenAlgs</code></td><td>the <code>alg</code> allowlist</td><td>default RS256, PS256, ES256, EdDSA. Never <code>none</code> or an HMAC</td></tr>
+</tbody></table></div>
+
+<pre>{
+  "providers": [{
+    "id": "google", "name": "Google", "icon": "data:image/svg+xml;base64,…",
+    "issuer": "https://accounts.google.com",
+    "clientId": "1234.apps.googleusercontent.com",
+    "clientAuth": {"method": "client_secret_basic", "secret": {"wrapped": "vw1.G….…"}},
+    "scopes": ["openid", "email"], "responseMode": "query",
+    "signup": "off", "trustEmail": true
+  }, {
+    "id": "apple", "name": "Apple", "issuer": "https://appleid.apple.com",
+    "clientId": "org.example.pds",
+    "clientAuth": {"method": "client_secret_post", "key": {"wrapped": "vw1.G….…"}, "keyId": "ABC123",
+                   "signedSecret": {"issuer": "TEAMID", "lifetimeSecs": 3600}},
+    "responseMode": "form_post", "signup": "off"
+  }]
+}</pre>
+<p>Secrets never sit in the object in the clear. The admin API takes a plaintext value and stores it wrapped under the KEK (new purpose <code>sign-in-provider-secret</code>, subject the provider id). There is no file form: an admin API that names files would let any operator login read a file on the node and post it to a token endpoint of its choosing. The list call says a secret is stored, never its value. <code>rewrapSecrets</code> rewraps them with the rest.</p>
+<p>Admin surface: <code>vlpds.admin.listSignInProviders</code>, <code>putSignInProvider</code> (create or replace, <code>ifVersion</code>), <code>removeSignInProvider</code>, the CLI's <code>vlpds admin signin-provider list|put|remove</code> and a console page. Saves and removals are audited (<code>signin_provider.put</code>, <code>signin_provider.remove</code>).</p>
+</section>
+
+<section>
+<h2 id="sign-in">The sign-in</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 720" role="img" aria-labelledby="f3t">
+  <title id="f3t">Sequence of a provider sign-in on the OAuth page, including the form_post handoff: start creates a device-bound state row, the provider returns a code by query or by a cross-site POST that is stashed and handed to a same-origin GET, the node checks the device, exchanges the code with PKCE, validates the id_token, finds the account by its identity claim, runs the account's second factor and continues to consent.</title>
+  <defs>
+    <marker id="cm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+    <marker id="ca" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-a"/></marker>
+    <marker id="cw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-w"/></marker>
+  </defs>
+  <rect x="20" y="290" width="866" height="168" rx="6" class="d-band"/>
+  <rect x="50" y="12" width="140" height="36" rx="6" class="d-box"/>
+  <text x="120" y="35" text-anchor="middle" class="d-t">Browser</text>
+  <rect x="370" y="12" width="160" height="36" rx="6" class="d-acc"/>
+  <text x="450" y="35" text-anchor="middle" class="d-t">vlPDS</text>
+  <rect x="710" y="12" width="160" height="36" rx="6" class="d-info"/>
+  <text x="790" y="35" text-anchor="middle" class="d-t">Provider</text>
+  <line x1="120" y1="48" x2="120" y2="710" class="d-life"/>
+  <line x1="450" y1="48" x2="450" y2="710" class="d-life"/>
+  <line x1="790" y1="48" x2="790" y2="710" class="d-life"/>
+
+  <line x1="120" y1="76" x2="446" y2="76" class="d-line" marker-end="url(#cm)"/>
+  <text x="130" y="70" class="d-m">1 GET /oauth/authorize?request_uri=…</text>
+  <line x1="450" y1="104" x2="124" y2="104" class="d-line" marker-end="url(#cm)"/>
+  <text x="140" y="98" class="d-s">page: password · passkey · provider links</text>
+
+  <line x1="120" y1="138" x2="446" y2="138" class="d-accl" marker-end="url(#ca)"/>
+  <text x="130" y="132" class="d-m">2 GET /oauth/federated/start?provider=…</text>
+  <rect x="462" y="118" width="230" height="58" rx="5" class="d-store"/>
+  <text x="472" y="136" class="d-m">state row oauth:fed:{state}</text>
+  <text x="472" y="152" class="d-s">provider · purpose · request id</text>
+  <text x="472" y="168" class="d-s">device id · 10 min · single use</text>
+  <line x1="450" y1="198" x2="124" y2="198" class="d-line" marker-end="url(#cm)"/>
+  <text x="140" y="192" class="d-s">303: state, nonce, S256 challenge</text>
+  <line x1="120" y1="226" x2="786" y2="226" class="d-line" marker-end="url(#cm)"/>
+  <text x="470" y="220" class="d-m">3 authorize</text>
+  <rect x="704" y="238" width="172" height="40" rx="5" class="d-box"/>
+  <text x="790" y="262" text-anchor="middle" class="d-s">user signs in there</text>
+
+  <text x="32" y="310" class="d-a">query</text>
+  <line x1="790" y1="326" x2="124" y2="326" class="d-line" marker-end="url(#cm)"/>
+  <text x="470" y="320" class="d-m">4a 303 → GET /callback?code&amp;state[&amp;iss]</text>
+  <text x="140" y="344" class="d-s">top-level GET: Lax cookie sent</text>
+  <text x="32" y="368" class="d-w">form_post</text>
+  <line x1="790" y1="384" x2="454" y2="384" class="d-warnl" marker-end="url(#cw)"/>
+  <text x="470" y="378" class="d-m">4b POST /callback · cross-site, no cookie</text>
+  <line x1="450" y1="414" x2="124" y2="414" class="d-warnl" marker-end="url(#cw)"/>
+  <text x="140" y="408" class="d-s">stash the code under h, 303</text>
+  <line x1="120" y1="444" x2="446" y2="444" class="d-warnl" marker-end="url(#cw)"/>
+  <text x="130" y="438" class="d-m">GET /callback?handoff={state}.{h}</text>
+
+  <rect x="462" y="472" width="300" height="42" rx="5" class="d-acc"/>
+  <text x="472" y="490" class="d-s">state's device id == this cookie's</text>
+  <text x="472" y="506" class="d-s">consume the state row (conditional delete)</text>
+
+  <line x1="450" y1="540" x2="786" y2="540" class="d-accl" marker-end="url(#ca)"/>
+  <text x="460" y="534" class="d-m">5 token: code + verifier + client auth</text>
+  <line x1="790" y1="562" x2="454" y2="562" class="d-line" marker-end="url(#cm)"/>
+  <text x="560" y="556" class="d-m">id_token</text>
+  <rect x="462" y="572" width="300" height="42" rx="5" class="d-acc"/>
+  <text x="472" y="590" class="d-s">validate id_token (JWKS by kid), then</text>
+  <text x="472" y="606" class="d-s">fedid/{h(iss,sub)} → DID, listed in its row</text>
+
+  <line x1="450" y1="642" x2="124" y2="642" class="d-line" marker-end="url(#cm)"/>
+  <text x="140" y="636" class="d-s">6 second factor, if the account has one</text>
+  <line x1="120" y1="668" x2="446" y2="668" class="d-line" marker-end="url(#cm)"/>
+  <text x="130" y="662" class="d-m">code · passkey · recovery code</text>
+  <line x1="450" y1="698" x2="124" y2="698" class="d-accl" marker-end="url(#ca)"/>
+  <text x="140" y="692" class="d-s">7 signed in (fed:…) → consent → code</text>
+</svg>
+</div>
+<figcaption>The provider button is a GET link, so the sign-in page's CSP <code>form-action</code> stays as it is (browsers apply <code>form-action</code> to the redirect after a form post). The form_post branch exists because the cross-site POST arrives without the <code>SameSite=Lax</code> device cookie; the node stashes the result and checks the device on a same-origin GET.</figcaption>
+</figure>
+<ul>
+  <li><b>Bound to the browser.</b> The state row records the device id of the cookie that started the flow, and the callback refuses any other. A link an attacker started can't finish in someone else's browser, which closes login CSRF.</li>
+  <li><b>Nothing secret in the row.</b> The nonce and the PKCE verifier are HMACs of the state under a key derived from <code>jwt_secret</code>, so any node recomputes them and a copy of the bucket gives neither. The row holds what the callback needs to check and where to go next.</li>
+  <li><b>Used once.</b> The callback deletes the row with a conditional write before it calls the token endpoint, so a replayed callback or handoff gets "already used". The OAuth request it continues gets the same 10 minutes, since the provider's own sign-in can take longer than the page's usual 5.</li>
+  <li><b>Identity only from the id_token.</b> There is no userinfo fallback. A failed check ends the sign-in.</li>
+  <li><b>The account's factors.</b> After the identity resolves, the sign-in continues exactly where a correct password would: a trusted browser skips the second step, otherwise TOTP, a passkey, a recovery code or the email code. Lockouts, the sign-in log and new-device alerts are the existing ones.</li>
+  <li><b>Unknown identity.</b> P1 says no account uses this identity and points to signing in another way and adding it. It never looks for an account with the same email. P2 offers signup when the provider allows it.</li>
+</ul>
+<p>The same buttons appear on <code>/oauth/account</code> (the device's account page). The account page app at <code>/account</code> gets them in P2, when accounts without a password appear.</p>
+</section>
+
+<section>
+<h2 id="id-token">id_token checks</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>check</th><th>rule</th><th>why</th></tr></thead>
+<tbody>
+<tr><td>signature</td><td>compact JWS. <code>kid</code> required, key from the provider's JWKS. <code>alg</code> in the provider's allowlist and matching the key (RS256/PS256 with an RSA key of 2048 bits or more, ES256 with P-256, EdDSA with Ed25519). A key's <code>use</code> and <code>alg</code>, when present, must agree</td><td>no <code>none</code>, no HMAC keyed with a public key, no guessing among keys</td></tr>
+<tr><td>unknown <code>kid</code></td><td>refetch the JWKS, at most once a minute per provider, then fail</td><td>providers rotate keys; a flood of made-up kids can't turn into a flood of fetches</td></tr>
+<tr><td><code>iss</code></td><td>equals the provider's issuer exactly</td><td>the provider the state names, not one that answers</td></tr>
+<tr><td><code>aud</code>, <code>azp</code></td><td><code>aud</code> is or contains our client id. With more than one audience, <code>azp</code> must be present and equal it, and when present it must always equal it</td><td>a token minted for another client isn't ours</td></tr>
+<tr><td><code>exp</code>, <code>iat</code>, <code>nbf</code></td><td>not expired, not issued in the future, issued in the last 10 min, 60 s of skew</td><td>a fresh token from this exchange</td></tr>
+<tr><td><code>nonce</code></td><td>equals the state's</td><td>binds the token to this flow and this browser</td></tr>
+<tr><td><code>sub</code></td><td>a non-empty string of at most 255 bytes</td><td>the identity's key, with <code>iss</code></td></tr>
+<tr><td>required claims</td><td>each configured claim equals its value</td><td>e.g. one hosted domain</td></tr>
+<tr><td>authorization response <code>iss</code></td><td>when the callback carries one (RFC 9207) it equals the issuer, and it is required when discovery says the provider sends it</td><td>mix-up between providers that share the callback URL</td></tr>
+</tbody></table></div>
+<p>Discovery (<code>{issuer}/.well-known/openid-configuration</code>), the JWKS and the token endpoint go through the SSRF-guarded client, unless the issuer itself is a non-public address (an adapter on the operator's network), whose endpoints are then fetched as configured. Plain http only to a loopback issuer or in dev mode. Fetches are single-flight per URL and a failure is remembered for 10 s. Both are cached for an hour (a failed refresh keeps the last good copy for a day), capped at 256 KiB, with 10 s deadlines. <code>email_verified</code> is accepted as a boolean or the strings <code>"true"</code>/<code>"false"</code>, since some providers send strings.</p>
+</section>
+
+<section>
+<h2 id="linking">Linking and unlinking</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 380" role="img" aria-labelledby="f4t">
+  <title id="f4t">State machine of one identity on one account: not linked, pending while the state row lives, claimed once the fedid object names the DID, linked when the account's row lists it; unlinking needs another credential and revokes sessions; a removed provider leaves identities dormant.</title>
+  <defs>
+    <marker id="sm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+    <marker id="sa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-a"/></marker>
+    <marker id="sx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-x"/></marker>
+  </defs>
+  <rect x="20" y="130" width="140" height="64" rx="32" class="d-box"/>
+  <text x="90" y="158" text-anchor="middle" class="d-t">Not linked</text>
+  <text x="90" y="176" text-anchor="middle" class="d-s">no claim, no row</text>
+  <rect x="236" y="130" width="140" height="64" rx="32" class="d-box"/>
+  <text x="306" y="158" text-anchor="middle" class="d-t">Pending</text>
+  <text x="306" y="176" text-anchor="middle" class="d-s">state row · 10 min</text>
+  <rect x="452" y="130" width="140" height="64" rx="32" class="d-box"/>
+  <text x="522" y="158" text-anchor="middle" class="d-t">Claimed</text>
+  <text x="522" y="176" text-anchor="middle" class="d-s">fedid/… → this DID</text>
+  <rect x="668" y="130" width="140" height="64" rx="32" class="d-acc"/>
+  <text x="738" y="158" text-anchor="middle" class="d-t">Linked</text>
+  <text x="738" y="176" text-anchor="middle" class="d-s">row lists (iss, sub)</text>
+  <rect x="668" y="290" width="140" height="64" rx="32" class="d-store"/>
+  <text x="738" y="318" text-anchor="middle" class="d-t">Dormant</text>
+  <text x="738" y="336" text-anchor="middle" class="d-s">provider removed</text>
+
+  <line x1="160" y1="150" x2="232" y2="150" class="d-accl" marker-end="url(#sa)"/>
+  <text x="196" y="104" text-anchor="middle" class="d-a">Add (GET + CSRF)</text>
+  <text x="196" y="120" text-anchor="middle" class="d-s">fresh sign-in here, ≤ 10 min</text>
+  <line x1="376" y1="150" x2="448" y2="150" class="d-accl" marker-end="url(#sa)"/>
+  <text x="412" y="104" text-anchor="middle" class="d-a">callback ok</text>
+  <text x="412" y="120" text-anchor="middle" class="d-s">conditional create</text>
+  <line x1="592" y1="150" x2="664" y2="150" class="d-accl" marker-end="url(#sa)"/>
+  <text x="628" y="104" text-anchor="middle" class="d-a">row CAS</text>
+  <text x="628" y="120" text-anchor="middle" class="d-s">+ mail the owner</text>
+
+  <path d="M306 194 L306 262 L96 262 L96 198" class="d-badl" marker-end="url(#sx)"/>
+  <text x="206" y="250" text-anchor="middle" class="d-x">expired · other browser · failed check</text>
+  <path d="M522 194 L522 290 L84 290 L84 198" class="d-badl" marker-end="url(#sx)"/>
+  <text x="300" y="282" text-anchor="middle" class="d-x">held by another account: refused</text>
+  <path d="M540 194 L540 324 L72 324 L72 198" class="d-badl" marker-end="url(#sx)"/>
+  <text x="300" y="316" text-anchor="middle" class="d-x">row write fails: release the claim</text>
+
+  <path d="M738 130 L738 40 L90 40 L90 126" class="d-line" marker-end="url(#sm)"/>
+  <text x="414" y="30" text-anchor="middle" class="d-t">Remove</text>
+  <text x="414" y="58" text-anchor="middle" class="d-s">fresh sign-in · a password, a passkey or another identity must remain · revoke what it signed in · mail</text>
+  <path d="M752 194 L752 286" class="d-line" marker-end="url(#sm)"/>
+  <path d="M724 286 L724 198" class="d-line" marker-end="url(#sm)"/>
+  <text x="764" y="236" class="d-s">removed</text>
+  <text x="764" y="252" class="d-s">from config</text>
+  <text x="650" y="236" text-anchor="end" class="d-s">same issuer</text>
+  <text x="650" y="252" text-anchor="end" class="d-s">added back</text>
+  <text x="830" y="372" text-anchor="end" class="d-s">dormant: no button, no sign-in, Remove still works</text>
+</svg>
+</div>
+<figcaption>The claim object makes an identity belong to one account cluster-wide; the account's row is what counts. A claim without a row (a link that died between the two writes) is taken over once it is older than the claim grace and its holder doesn't list it, the same rule handle and email claims follow.</figcaption>
+</figure>
+<p><b>Where.</b> Adding and removing happen on <code>/oauth/account</code>, the server-rendered page tied to the browser's device cookie, never through a bearer-token API. A fresh sign-in there (password with its second factor, a passkey, or an identity already linked, within the last 10 minutes on this browser) is the step-up, so a stolen account-page token can't add a way into the account. The account page app's Security tab lists the identities (<code>vlpds.server.listFederatedIdentities</code>) and sends the user to <code>/oauth/account</code> to change them. Add is a GET link carrying a CSRF token with its issue time, good for the same 10 minutes (a POST would trip <code>form-action</code> on the redirect to the provider), and it asks the provider to let the user pick an account (<code>prompt=select_account</code>), so a link never silently takes whichever account the browser is signed in to there. Remove is a form post.</p>
+<p><b>Limits.</b> 10 identities per account, one per issuer. Linking is rate-limited per account (<code>federated-link-account</code>, 10 a day). Every add and remove mails the owner ("Your Account's Sign-in Settings Changed").</p>
+<p><b>Never by email.</b> An identity is linked only by someone already signed in to the account. Its email is kept as a label for the list and nothing else, and later sign-ins don't update the account's email.</p>
+</section>
+
+<section>
+<h2 id="storage">Storage</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 330" role="img" aria-labelledby="f5t">
+  <title id="f5t">Where federated sign-in keeps things: two bucket objects and three kinds of private rows, plus a credential reference on existing session rows.</title>
+  <rect x="16" y="16" width="420" height="300" rx="8" class="d-store"/>
+  <text x="32" y="40" class="d-w">bucket objects</text>
+  <rect x="32" y="54" width="388" height="112" rx="6" class="d-box"/>
+  <text x="44" y="76" class="d-m">{prefix}/config/signin-providers.json</text>
+  <text x="44" y="96" class="d-s">every provider; secrets KEK-wrapped</text>
+  <text x="44" y="114" class="d-s">CAS by version; re-read by every node every 10 s</text>
+  <text x="44" y="132" class="d-s">absent: no providers</text>
+  <text x="44" y="152" class="d-s">old builds never read it</text>
+  <rect x="32" y="180" width="388" height="120" rx="6" class="d-box"/>
+  <text x="44" y="202" class="d-m">{prefix}/fedid/{hex sha256(iss \0 sub)}</text>
+  <text x="44" y="222" class="d-s">body: the DID. Conditional create, like handle/ and email/</text>
+  <text x="44" y="240" class="d-s">stale takeover: older than 15 min and its holder</text>
+  <text x="44" y="256" class="d-s">doesn't list the identity (or has no account)</text>
+  <text x="44" y="276" class="d-s">released on unlink and on account deletion</text>
+
+  <rect x="464" y="16" width="420" height="300" rx="8" class="d-store"/>
+  <text x="480" y="40" class="d-w">private rows, at their owner</text>
+  <rect x="480" y="54" width="388" height="84" rx="6" class="d-box"/>
+  <text x="492" y="76" class="d-m">p/{did}\0fedid</text>
+  <text x="492" y="96" class="d-s">[{iss, sub, provider, display, addedAt, lastUsedAt}]</text>
+  <text x="492" y="114" class="d-s">written only by conditional write; at most 10</text>
+  <rect x="480" y="150" width="388" height="84" rx="6" class="d-box"/>
+  <text x="492" y="172" class="d-m">p/oauth:fed:{state}\0oauth/fed</text>
+  <text x="492" y="192" class="d-s">{provider, purpose, request id or DID, device id,</text>
+  <text x="492" y="210" class="d-s">expiresAt, handoff?}; swept by the OAuth GC</text>
+  <rect x="480" y="246" width="388" height="54" rx="6" class="d-box"/>
+  <text x="492" y="268" class="d-m">auth_cred "fed:{24 hex}" on sessions + devices</text>
+  <text x="492" y="286" class="d-s">and pending_2fa_cred on the device row</text>
+</svg>
+</div>
+<figcaption>New rows get golden fixtures (<code>testdata/formats/L2/private/federated.json</code>, the provider config under <code>control/</code>) and decoders in <code>check_private_row</code>, like every row kind before them.</figcaption>
+</figure>
+<p>The identity hash is SHA-256 over the issuer, a zero byte and the subject, so two issuers can't collide on a subject and the object name says nothing about who the user is. The credential reference on sessions is the first 12 bytes of that hash, the same size as a passkey's <code>pk:</code> reference. When a passkey is the second factor after a provider sign-in, the session records both (<code>fed:… pk:…</code>), and removing either ends it.</p>
+</section>
+
+<section>
+<h2 id="sessions">Sessions and revocation</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>event</th><th>what happens</th><th>the existing mechanism it reuses</th></tr></thead>
+<tbody>
+<tr><td>provider sign-in</td><td>reads the credential epoch, then checks the account's row still lists the identity, then records a device sign-in with <code>fed:…</code></td><td><code>epoch_for_login</code>, which checks the password hash the same way</td></tr>
+<tr><td>a device sign-in is used</td><td>dropped if the identity was unlinked since</td><td><code>device_accounts</code>, as for a removed passkey</td></tr>
+<tr><td>code exchange</td><td>refused if the identity was unlinked since the approval, checked before and after the session is written</td><td><code>code_grant</code>'s passkey checks</td></tr>
+<tr><td>unlink</td><td>deletes the OAuth and account-page sessions it signed in</td><td><code>revoke_signed_in_with(auth_ref)</code></td></tr>
+<tr><td>password change, takedown, revoke-all</td><td>ends federated sign-ins like any other</td><td>the credential epoch</td></tr>
+<tr><td>app passwords, <code>createSession</code></td><td>unchanged. No app password is minted for anyone</td><td></td></tr>
+</tbody></table></div>
+<p>An unlink racing a sign-in is safe the way a passkey removal is: the removal writes the row before it scans for sessions, and a sign-in checks the row again after it writes its session, so one of them sees the other.</p>
+</section>
+
+<section>
+<h2 id="signup">Signup with a provider <span class="pill p2">P2</span></h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 230" role="img" aria-labelledby="f6t">
+  <title id="f6t">Signup order: an unknown identity on a provider that allows signup shows a prefilled form, then the handle, email and identity claims, the PLC genesis, the identity row and the account write; a definite failure releases the claims and tombstones the DID.</title>
+  <defs>
+    <marker id="um" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+    <marker id="ux" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-x"/></marker>
+  </defs>
+  <rect x="16" y="40" width="156" height="74" rx="6" class="d-box"/>
+  <text x="94" y="66" text-anchor="middle" class="d-t">Unknown identity</text>
+  <text x="94" y="84" text-anchor="middle" class="d-s">signup: invite or open</text>
+  <text x="94" y="100" text-anchor="middle" class="d-s">one-time, this browser</text>
+  <rect x="194" y="40" width="156" height="74" rx="6" class="d-box"/>
+  <text x="272" y="66" text-anchor="middle" class="d-t">Form</text>
+  <text x="272" y="84" text-anchor="middle" class="d-s">handle · email prefilled</text>
+  <text x="272" y="100" text-anchor="middle" class="d-s">invite by policy</text>
+  <rect x="372" y="40" width="156" height="74" rx="6" class="d-acc"/>
+  <text x="450" y="66" text-anchor="middle" class="d-t">Claims</text>
+  <text x="450" y="84" text-anchor="middle" class="d-s">handle · email</text>
+  <text x="450" y="100" text-anchor="middle" class="d-s">+ fedid object</text>
+  <rect x="550" y="40" width="156" height="74" rx="6" class="d-acc"/>
+  <text x="628" y="66" text-anchor="middle" class="d-t">PLC genesis</text>
+  <text x="628" y="84" text-anchor="middle" class="d-s">the directory's 200</text>
+  <rect x="728" y="40" width="156" height="74" rx="6" class="d-acc"/>
+  <text x="806" y="66" text-anchor="middle" class="d-t">Row, then account</text>
+  <text x="806" y="84" text-anchor="middle" class="d-s">fedid row, the repo</text>
+  <text x="806" y="100" text-anchor="middle" class="d-s">no password</text>
+  <line x1="172" y1="77" x2="190" y2="77" class="d-line" marker-end="url(#um)"/>
+  <line x1="350" y1="77" x2="368" y2="77" class="d-line" marker-end="url(#um)"/>
+  <line x1="528" y1="77" x2="546" y2="77" class="d-line" marker-end="url(#um)"/>
+  <line x1="706" y1="77" x2="724" y2="77" class="d-line" marker-end="url(#um)"/>
+  <path d="M806 114 L806 176 L450 176 L450 118" class="d-badl" marker-end="url(#ux)"/>
+  <text x="628" y="164" text-anchor="middle" class="d-x">definite failure: release, delete the row, tombstone</text>
+  <text x="628" y="206" text-anchor="middle" class="d-s">ambiguous outcome: ours if the account carries this request's new signing key</text>
+</svg>
+</div>
+</figure>
+<ul>
+  <li>The internal create path takes no password; public <code>createAccount</code> still requires one. Such an account has an empty password hash, which every build's password check already refuses.</li>
+  <li>Email is required. With <code>trustEmail</code> and <code>email_verified</code> the form is prefilled and the address is marked confirmed. The email policy (disposable domains) and uniqueness apply either way.</li>
+  <li>Invites follow the provider's policy (<code>invite</code> needs one, <code>open</code> doesn't) and <code>--invite-required</code> still applies on top.</li>
+  <li>The ambiguous-outcome check in account creation compares the password hash today, which an account without a password doesn't have. It compares the signing public key instead: a fresh key per request, already on the account, so the per-create nonce costs no new field.</li>
+  <li>The account page app gets provider buttons too. The provider sign-in runs on the server pages (second factor included), and a one-time, device-bound handoff gives the app a session (<code>vlpds.server.createFederatedSession</code>), so tokens never ride in a URL. It's the full account-page session <code>createSession</code> gives this server's own page, so the OAuth-only switch doesn't apply to it, as it doesn't to the page's password sign-in.</li>
+  <li>Each provider makes at most <code>signupsPerDay</code> accounts a UTC day (default 100, 0 for no cap), counted cluster-wide, on top of the per-IP <code>create-account</code> limit.</li>
+</ul>
+</section>
+
+<section>
+<h2 id="adapters">SIWE and other non-OIDC methods <span class="pill p3">P3</span></h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 170" role="img" aria-labelledby="f7t">
+  <title id="f7t">A wallet signs a SIWE message for an operator-run adapter, which acts as an OIDC provider to vlPDS; vlPDS sees only an issuer and a subject.</title>
+  <defs>
+    <marker id="wm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+  </defs>
+  <rect x="16" y="50" width="190" height="70" rx="6" class="d-box"/>
+  <text x="111" y="78" text-anchor="middle" class="d-t">Wallet</text>
+  <text x="111" y="98" text-anchor="middle" class="d-s">signs an EIP-4361 message</text>
+  <rect x="300" y="40" width="270" height="90" rx="6" class="d-info"/>
+  <text x="435" y="68" text-anchor="middle" class="d-t">OIDC adapter (operator runs it)</text>
+  <text x="435" y="88" text-anchor="middle" class="d-s">verifies the signature, issues an id_token</text>
+  <text x="435" y="106" text-anchor="middle" class="d-m">sub = eip155:1:0xabc…</text>
+  <rect x="664" y="50" width="220" height="70" rx="6" class="d-acc"/>
+  <text x="774" y="78" text-anchor="middle" class="d-t">vlPDS</text>
+  <text x="774" y="98" text-anchor="middle" class="d-s">just another OIDC provider</text>
+  <line x1="206" y1="85" x2="296" y2="85" class="d-line" marker-end="url(#wm)"/>
+  <line x1="570" y1="85" x2="660" y2="85" class="d-line" marker-end="url(#wm)"/>
+  <text x="615" y="78" text-anchor="middle" class="d-m">OIDC</text>
+</svg>
+</div>
+</figure>
+<p>No code in vlPDS knows what a wallet is. The operator guide covers running an adapter in front of a non-OIDC method, what its subject should be (stable, never reassigned) and which response mode to pick. An interop test drives a mock SIWE adapter end to end: a wallet key signs a SIWE message, the adapter checks it and issues an id_token, and vlPDS signs in the linked account. The identity key is still the adapter's issuer plus its subject, so changing adapters or issuer URLs strands identities, and the guide says so.</p>
+</section>
+
+<section>
+<h2 id="level">Feature level 2</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 210" role="img" aria-labelledby="f8t">
+  <title id="f8t">Before finalize the cluster stays at level 1: providers can be saved but nothing federated is offered or written. After finalizing level 2, sign-in, linking and signup turn on, and builds without level 2 refuse to start.</title>
+  <defs>
+    <marker id="lm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+  </defs>
+  <rect x="16" y="30" width="276" height="140" rx="8" class="d-box"/>
+  <text x="32" y="56" class="d-t">Level 1, any mix of builds</text>
+  <text x="32" y="80" class="d-s">old build: no federated code at all</text>
+  <text x="32" y="100" class="d-s">new build: provider config can be saved</text>
+  <text x="32" y="120" class="d-s">no buttons, start/callback 404</text>
+  <text x="32" y="140" class="d-s">no claim, row or fed: ref written</text>
+  <text x="32" y="160" class="d-a">rollback: redeploy the old image</text>
+  <rect x="336" y="64" width="210" height="72" rx="8" class="d-store"/>
+  <text x="441" y="92" text-anchor="middle" class="d-t">cluster finalize --level 2</text>
+  <text x="441" y="112" text-anchor="middle" class="d-s">every live node's window has 2</text>
+  <rect x="616" y="30" width="268" height="140" rx="8" class="d-acc"/>
+  <text x="632" y="56" class="d-t">Level 2</text>
+  <text x="632" y="80" class="d-s">sign-in, linking, signup per provider</text>
+  <text x="632" y="100" class="d-s">fedid claims and rows, fed: refs</text>
+  <text x="632" y="120" class="d-s">builds without level 2 exit 7</text>
+  <text x="632" y="140" class="d-s">before reading anything</text>
+  <text x="632" y="160" class="d-x">persistent: forward-fix only</text>
+  <line x1="292" y1="100" x2="332" y2="100" class="d-line" marker-end="url(#lm)"/>
+  <line x1="546" y1="100" x2="612" y2="100" class="d-line" marker-end="url(#lm)"/>
+</svg>
+</div>
+<figcaption>Gating reads the node's own view of <code>cluster/version</code>, not a process-wide value. A fresh prefix starts at its first node's highest level, so a new deployment has it from the start; an existing cluster turns it on with a finalize after every node runs a build that knows level 2.</figcaption>
+</figure>
+<p>Why a level and not only a flag: an old build doesn't know <code>fed:</code> credential references or the fedid row, so a mixed cluster could sign someone in on a new node and then let an old node keep a session that an unlink should have ended. A level keeps those bytes from existing until no old build can run. It is persistent because the claims, rows and references live in the bucket. Old builds fail safe anyway: they never read the config object, an empty password hash never verifies, and an unknown credential reference reads as "removed", so their device sign-ins drop. The level makes that a guarantee instead of a property of today's code.</p>
+<p>This is the first real level after <code>baseline</code>, so it also moves the test-only level to 3 and records <code>testdata/formats/L2</code>. The level-2 fixtures freeze with the first release that has it.</p>
+</section>
+
+<section>
+<h2 id="recovery">Recovery</h2>
+<ul>
+  <li><b>No password (P2 accounts).</b> The email reset works as "set a password". A user who loses the provider account and the inbox needs the operator, as with a lost password and inbox today.</li>
+  <li><b>Own your identity.</b> The docs recommend a user-held PLC rotation key (the Security tab already adds one), so a user can move the account even if this PDS or a provider goes away.</li>
+  <li><b>A provider removed.</b> Its identities go dormant: no button, no sign-in, still listed and removable. Adding a provider with the same issuer brings them back. Accounts that only had that provider recover through the email reset.</li>
+  <li><b>Apple specifics, in the operator guide.</b> A user may share a private relay address, and mail to it is delivered only after the operator registers the sending domain with Apple. Apple sends the user's name only on the first authorization, so vlPDS never depends on it.</li>
+</ul>
+</section>
+
+<section>
+<h2 id="threats">Threats</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>attack</th><th>mitigation</th></tr></thead>
+<tbody>
+<tr><td>Login CSRF: the victim's browser finishes a flow the attacker started, signing in as the attacker or linking the attacker's identity</td><td>state bound to the device cookie that started it; form_post results checked on a same-origin GET; link starts only from a CSRF-protected link on a freshly signed-in device</td></tr>
+<tr><td>Code interception or injection</td><td>PKCE S256 with a verifier per state; the code goes only to the token endpoint of the provider the state names</td></tr>
+<tr><td>id_token replay or substitution</td><td>nonce per state; exact <code>iss</code>; <code>aud</code>/<code>azp</code>; fresh <code>iat</code>; state deleted before the exchange</td></tr>
+<tr><td>Algorithm confusion</td><td>allowlist without <code>none</code> or HMAC; <code>alg</code> must match the key type; <code>kid</code> required</td></tr>
+<tr><td>JWKS refetch storm from made-up kids</td><td>refetch at most once a minute per provider; the cached keys stay in use</td></tr>
+<tr><td>Identity from an unvalidated source</td><td><code>sub</code> only from a validated id_token; no userinfo fallback</td></tr>
+<tr><td>Mix-up between providers</td><td>a callback URL per provider, checked against the state&#39;s provider; the state names the provider; <code>iss</code> checked in the token and in the authorization response when present</td></tr>
+<tr><td>A provider&#39;s discovery pointing this node at its own network</td><td>a public issuer&#39;s token and JWKS endpoints go through the SSRF-guarded client; only an issuer that is itself a non-public address is fetched as configured</td></tr>
+<tr><td>Takeover through a matching email at another provider</td><td>never find or link an account by email; identity key is (iss, sub)</td></tr>
+<tr><td>Provider renamed or two configs for one issuer</td><td>identities keyed by issuer, never the provider id; one provider per issuer</td></tr>
+<tr><td>Stolen account-page token adds a lasting way in</td><td>no bearer-token link API; link needs a full sign-in on this device in the last 10 min; the owner is mailed on every change</td></tr>
+<tr><td>Second factor bypass through a provider</td><td>the account's second factors still apply after a provider sign-in</td></tr>
+<tr><td>Locking oneself out by unlinking</td><td>refused unless a password, a passkey or another identity remains, held by conditional writes on those rows</td></tr>
+<tr><td>A session outlives its unlink</td><td><code>fed:</code> refs on every session; unlink revokes them; device sign-ins and codes are checked when used</td></tr>
+<tr><td>A compromised provider signs in as its users</td><td>inherent in trusting an issuer. Second factors still apply, <code>requiredClaims</code> narrow who gets in, and removing the provider makes its identities dormant at once</td></tr>
+<tr><td>Provider secrets read from a bucket copy</td><td>KEK-wrapped with the provider id in the associated data; never returned by the API; no file form an operator login could point at the node&#39;s own files</td></tr>
+<tr><td>A mixed cluster half-supporting the feature</td><td>feature level 2; nothing federated is written before it, and old builds exit 7 after it</td></tr>
+<tr><td>Open redirect through start or callback</td><td>no caller-supplied return URL; the destination comes from the state row (an OAuth request, <code>/oauth/account</code> or <code>/account</code>)</td></tr>
+<tr><td>Look-alike provider buttons</td><td>names escaped; icons only as small <code>data:</code> images under the pages' CSP; only the operator configures providers</td></tr>
+<tr><td>Orphan DIDs or half-made accounts at signup</td><td>claims before the PLC genesis, a tombstone on a definite failure, the signing key decides an ambiguous one</td></tr>
+<tr><td>Callback floods amplified into outbound calls</td><td>per-IP sign-in limits on start and callback; no outbound call without a live state row</td></tr>
+</tbody></table></div>
+</section>
+
+<section>
+<h2 id="phases">Phases</h2>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 200" role="img" aria-labelledby="f9t">
+  <title id="f9t">Phases: the design doc, then P1 sign-in and linking for existing accounts, P2 signup and the account page app, P3 SIWE through an adapter, then a release and a per-operator finalize.</title>
+  <defs>
+    <marker id="pm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="h-m"/></marker>
+  </defs>
+  <line x1="30" y1="60" x2="870" y2="60" class="d-line" marker-end="url(#pm)"/>
+  <circle cx="70" cy="60" r="8" class="d-acc"/>
+  <circle cx="250" cy="60" r="8" class="d-acc"/>
+  <circle cx="460" cy="60" r="8" class="d-info"/>
+  <circle cx="640" cy="60" r="8" class="d-store"/>
+  <circle cx="810" cy="60" r="8" class="d-box"/>
+  <text x="70" y="40" text-anchor="middle" class="d-a">this doc</text>
+  <text x="250" y="40" text-anchor="middle" class="d-a">P1</text>
+  <text x="460" y="40" text-anchor="middle" class="d-i">P2</text>
+  <text x="640" y="40" text-anchor="middle" class="d-w">P3</text>
+  <text x="810" y="40" text-anchor="middle" class="d-t">release</text>
+  <text x="70" y="92" text-anchor="middle" class="d-s">review</text>
+  <text x="250" y="92" text-anchor="middle" class="d-s">config, OIDC client,</text>
+  <text x="250" y="108" text-anchor="middle" class="d-s">sign-in, link, unlink,</text>
+  <text x="250" y="124" text-anchor="middle" class="d-s">level 2, mock-IdP tests</text>
+  <text x="460" y="92" text-anchor="middle" class="d-s">signup with a provider,</text>
+  <text x="460" y="108" text-anchor="middle" class="d-s">account page app sign-in,</text>
+  <text x="460" y="124" text-anchor="middle" class="d-s">set a password by reset</text>
+  <text x="640" y="92" text-anchor="middle" class="d-s">adapter guide,</text>
+  <text x="640" y="108" text-anchor="middle" class="d-s">SIWE interop test</text>
+  <text x="810" y="92" text-anchor="middle" class="d-s">minor version;</text>
+  <text x="810" y="108" text-anchor="middle" class="d-s">each operator finalizes</text>
+  <text x="810" y="124" text-anchor="middle" class="d-s">level 2 when ready</text>
+  <text x="450" y="176" text-anchor="middle" class="d-s">one change request per phase, each stacked on the last</text>
+</svg>
+</div>
+</figure>
+<div class="tablewrap"><table>
+<thead><tr><th>phase</th><th>ships</th><th>tests</th></tr></thead>
+<tbody>
+<tr><td><span class="pill p1">P1</span></td><td>provider config (bucket object, admin XRPC, CLI, console page), the OIDC client (discovery, JWKS, the four client auth forms, PKCE, nonce, id_token checks), state rows, the callback with the form_post handoff, sign-in for accounts with a linked identity, link and unlink on <code>/oauth/account</code> and the Security tab's list, the claim and row with fixtures, feature level 2, operator docs</td><td>an in-process mock OIDC provider driving authorize → callback → consent → token; a negative test per check (wrong iss, aud, azp, nonce, alg, kid, expired, future iat, replayed state, another browser's state, replayed handoff); unknown-kid refetch and its rate limit; unlink of the last credential refused; unlink revokes sessions; TOTP still required; level 1 refuses everything federated</td></tr>
+<tr><td><span class="pill p2">P2</span></td><td>signup with a provider identity, accounts without a password, invite policy, the signing-key create check, provider sign-in on the account page app</td><td>signup per policy, email prefill and confirmation, failures release claims and tombstone, the reset sets a password</td></tr>
+<tr><td><span class="pill p3">P3</span></td><td>operator guide for adapters (SIWE named generically), Apple notes</td><td>SIWE through a mock adapter end to end</td></tr>
+</tbody></table></div>
+</section>
+
+<section>
+<h2 id="later">Not now</h2>
+<ul>
+  <li>Built-in SIWE, GitHub or any non-OIDC method. Adapters cover them.</li>
+  <li>Userinfo. Display claims come from the id_token; a userinfo call would only add display data, and only with the same <code>sub</code>.</li>
+  <li>Operator-side unlink and a per-account identity view in the console beyond the list.</li>
+  <li>Front- or back-channel logout from providers. A provider sign-out doesn't end vlPDS sessions, as with any password manager's autofill.</li>
+  <li>Encrypted id_tokens (JWE) and request objects to providers.</li>
+  <li>A provider step-up for what asks for the password: an account made with a provider sets a password by the email reset before it can delete itself, remove a passkey or reactivate after deactivating.</li>
+  <li>An option to end the sessions a provider signed in when the operator removes it. Today its identities go dormant and their sessions run out on their own.</li>
+</ul>
+</section>
+</main>
+</div>
+</body>
+</html>

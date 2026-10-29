@@ -1845,12 +1845,17 @@ async fn rewrap_secrets(
             }
         }
     }
-    let stale = keys + totp + reserved;
+    let (providers, provider_blobs, provider_errors) =
+        super::federated::rewrap_provider_secrets(&app, check, dry).await;
+    provider_blobs.iter().for_each(|b| note_version(b));
+    errors.extend(provider_errors);
+    let stale = keys + totp + reserved + providers;
     tracing::info!(
         accounts,
         signing_keys = keys,
         totp,
         reserved,
+        providers,
         errors = errors.len(),
         dry_run = dry,
         kek = app.secrets.current_kid(),
@@ -1862,7 +1867,7 @@ async fn rewrap_secrets(
     if !dry {
         let detail = json!({
             "kek": app.secrets.current_kid(), "accounts": accounts, "signingKeys": keys, "totpSecrets": totp,
-            "reservedKeys": reserved, "failed": failed, "shards": coverage["scanned"].as_array().map_or(0, Vec::len),
+            "reservedKeys": reserved, "providerSecrets": providers, "failed": failed, "shards": coverage["scanned"].as_array().map_or(0, Vec::len),
         });
         let who = Who::of(&creds, inp.actor.as_deref(), ip);
         audit(&app, &who, "secrets.rewrap", Some(&node_subject(&app)), None, None, Some(detail)).await?;
@@ -1878,6 +1883,7 @@ async fn rewrap_secrets(
             "signingKeys": keys,
             "totpSecrets": totp,
             "reservedKeys": reserved,
+            "providerSecrets": providers,
             "failed": failed,
             "errors": errors,
             // per kid with readable versions (Vault): the lowest still stored

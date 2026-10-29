@@ -4444,6 +4444,85 @@ offers; vlpds's TOTP (`vlpds.server.*Totp`) stays as a second option.
   against the same lockout. With TOTP on, a password login's code is
   checked as TOTP only (Precedence above).
 
+## Third-party sign-in (`src/federated`, `src/xrpc/federated.rs`; level 2)
+
+Design, diagrams and threat table: `docs/federated-sign-in.html`. One
+generic OpenID Connect relying party; every provider is operator config
+(`{prefix}/config/signin-providers.json`, reloaded like the handle domains:
+CAS on save, a nudge to peers, a conditional GET every 10 s). Secrets and
+keys are only ever KEK-wrapped (`Purpose::SignInProviderSecret`, subject the
+provider id; no file form, since an admin API naming files could read any
+file on the node and post it to a token endpoint), and `rewrapSecrets`
+covers them. Each provider has its own callback path
+(`/oauth/federated/callback/{id}`, checked against the state's provider). A
+public issuer's discovered endpoints go through the guarded client; only an
+issuer that is itself a non-public address (an adapter on the operator's
+network) has its endpoints fetched as configured. Fetches are single-flight
+per URL, a failure is cached for 10 s, and stale copies serve at most a day.
+Saves and removals are refused below level 2.
+- **Identity** = (issuer, `sub` of a validated id_token). Cluster-wide
+  uniqueness by a conditional create of `fedid/{sha256(iss \0 sub)}` holding
+  the DID (`server::claim_with`: the handle/email claim with an async
+  "does the holder still stand on it" check, here "its `fedid` row lists the
+  identity"); the account's `p/{did}\0fedid` row is what counts. Never
+  matched by email.
+- **Flow state** `p/oauth:fed:{state}\0oauth/fed`: provider, purpose,
+  request id or DID, the device id, 10 min. The nonce and PKCE verifier are
+  HMACs of the state under a key derived from `jwt_secret`. The callback
+  requires the state's device id to be the request's `vlpds-device` cookie
+  and deletes the row by a conditional write before the code exchange.
+  `form_post` results are stashed on the row under a one-time id and handed
+  to a same-origin GET. The OAuth GC sweeps expired rows.
+- **Sign-in** reads the credential epoch, then checks the row still lists the
+  identity (the federated `epoch_for_login`), and continues exactly where a
+  correct password does (`oauth::after_first_step`): trusted browser, second
+  factor, sign-in log, `finish_device_sign_in`. The pending second step keeps
+  the first factor (`Device.pending_2fa_first`). Sessions record `fed:{12 bytes
+  of the hash, hex}`, space-separated from a passkey's `pk:` when one was the
+  second factor; `passkeys::credentials_live` checks both kinds where
+  `still_registered` used to, and `revoke_signed_in_with` matches either.
+- **Link/unlink** only on `/oauth/account`, with a sign-in on that device in
+  the last 10 min (`oauth::fresh_sign_in`); link starts are GET links with a
+  per-device, per-account CSRF token. Unlink is refused unless a password, a
+  passkey or another identity remains (conditional on the `fedid` and
+  `passkeys` rows), then releases the claim and revokes. Account deletion
+  releases every claim.
+- **Feature level 2** (`federated-sign-in`, persistent): gated per node on its
+  own view of `cluster/version` (`federated::level`), so nothing federated is
+  offered or written below it; builds without it exit 7 once it's active.
+- **Signup** (P2): an unknown identity on a provider with `signup` on gets
+  a one-time ticket (a `purpose: "signup"` state row holding the identity,
+  15 min, this browser) and the form; `/oauth/federated/signup` creates the
+  account through `create_account_checked` with `federated` set: no
+  password (the public method still requires one), the identity's claim
+  next to the handle's and the email's, its row written before the repo, a
+  definite failure releasing all three and tombstoning the DID. The
+  ambiguous-outcome check compares the new signing key, not the password
+  hash. The ticket is spent only once the account exists; a second account
+  can't be made with it, since the claim names the first.
+  `signupsPerDay` (default 100, 0: no cap) is counted per provider and UTC
+  day in a private row (`fedsignup:{id}:{day}`, swept after two days),
+  taken right before the account is created. The public path never makes a
+  password-less account: an empty or blank password is "Password is
+  required" everywhere but the provider signup.
+- **The account page app**: a sign-in it started (`app=1`) marks the
+  device's account `app_handoff_until` (2 min), and
+  `vlpds.server.createFederatedSession` (same origin, the device cookie)
+  trades it once (a conditional write of the device row, then a durable
+  claim of the handoff) for a full legacy session under the sign-in's epoch
+  and credential references, as `createSession` gives this server's own page.
+- **Other methods** (SIWE, GitHub, …) only through an OIDC adapter the
+  operator runs: vlpds sees an issuer and a subject. The interop test drives
+  a mock SIWE adapter (the mock provider in adapter mode: an EIP-4361
+  challenge, a `personal_sign` signature recovered to the wallet's address,
+  checked against web3.js's documented vector) through signup, sign-in,
+  linking to a password account and a wallet claiming another's address;
+  the identity is (the adapter's issuer, `eip155:1:0x…`).
+Tests: `tests/all/federated.rs` (an in-process mock provider: link, sign-in
+to tokens, form_post handoff, every id_token check, unknown-kid refetch, state
+binding, TOTP, unlink and its revocations, dormant providers, the CLI, level
+1, signup, the account page app, SIWE through an adapter), `federated::*` unit tests (claims, RS256/PS256/ES256/EdDSA, keys).
+
 ## PLC identity (`src/plc`)
 
 Accounts get real `did:plc` identities, as on the reference PDS: the DID is
@@ -5000,8 +5079,9 @@ roll back a bad build, and never be able to strand data in a format a
 running node can't read.
 
 **Built (phase 1, steps 1-5 of the plan below):** level 1 = the formats
-of day one (VLSEG06 etc., `vlsync-store/src/version.rs` `LEVELS`; this build runs
-`1..=1`); `cluster/version` with the startup gate, the post-lease re-check,
+of day one (VLSEG06 etc., `vlsync-store/src/version.rs` `LEVELS`; builds
+ran `1..=1` until level 2, `federated-sign-in`, the first real level after
+it: "Third-party sign-in"); `cluster/version` with the startup gate, the post-lease re-check,
 exit 7 `incompatible_level`, per-TTL observation and the raise protocol
 (`Cluster::finalize_level`, `vlpds.admin.setFeatureLevel`, `vlpds admin
 cluster finalize`); lease and hello fields; the tolerance fixes;
@@ -5047,7 +5127,8 @@ effect at the next segment). Not built yet: everything under "Later".
 | Layout | `assign/layout`, `slots::Layout` | `version` = routing generation, not format | **(built)** `flatten extra` on `Layout` and its `op` (`Reshard`); every layout write derives from the one read. `ShardRange` is closed |
 | Writer claim | `writers/{w:03}` | none | n/a |
 | Retention report | `retain/{log_id}`, `retention::Report` | none | **(built)** `#[serde(default)]` (written by its log's owner only; no `extra`) |
-| Global claims | `handle/{h}`, `email/{sha256}` | none (existence + small body) | n/a |
+| Global claims | `handle/{h}`, `email/{sha256}`, `fedid/{sha256}` (level 2) | none (existence + small body) | n/a |
+| Sign-in providers | `config/signin-providers.json`, `federated::config::Doc` (level 2) | `version` = CAS revision | serde drops unknown fields on read; the save endpoint is strict |
 | Blobs | `blob/{did}/{cid}`, `blob-gc/`, `blob-tmp/` | content-addressed | n/a |
 | Rate-limit config | `config/ratelimits.json`, `ratelimit/config.rs` `Doc` | `version` = CAS revision; `deny_unknown_fields` on save | **(built)** the stored object is read with `parse_stored`: unknown fields dropped with a warning, the rest applies; the save endpoint stays strict |
 | Wrapped secrets | `vw1.{kid}.{b64}` in rows/files (`secrets.rs` `WRAP_VERSION`), AAD `vlpds-secret-v1\0…` | yes, explicit | `Malformed` |

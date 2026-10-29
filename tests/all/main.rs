@@ -60,6 +60,7 @@ mod export_order;
 mod export_scan;
 mod fast_failover;
 mod feature_levels;
+mod federated;
 mod file_uploads;
 mod firehose_backfill;
 mod firehose_fanout;

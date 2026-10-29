@@ -26,7 +26,16 @@ const RULES: Record<string, Rule> = {
   domain: { lists: [K.domains] },
   invite: { lists: [K.invites] },
   config: {
-    entity: (id) => (id === 'ratelimits' ? [K.ratelimits] : id === 'appview-override' ? [K.appviewOverride] : id === 'crawlers' ? [K.crawlers] : [K.cluster, K.config]),
+    entity: (id) =>
+      id === 'ratelimits'
+        ? [K.ratelimits]
+        : id === 'appview-override'
+          ? [K.appviewOverride]
+          : id === 'crawlers'
+            ? [K.crawlers]
+            : id === 'signin-providers'
+              ? [K.signInProviders]
+              : [K.cluster, K.config],
   },
   ratelimits: { entity: () => [K.ratelimits] },
   'appview-override': { entity: () => [K.appviewOverride] },

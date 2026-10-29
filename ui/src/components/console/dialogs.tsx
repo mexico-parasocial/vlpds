@@ -234,6 +234,7 @@ export function FormDialog({
   busy,
   disabled,
   error,
+  wide,
   onSubmit,
   onCancel,
 }: {
@@ -245,12 +246,14 @@ export function FormDialog({
   busy?: boolean
   disabled?: boolean
   error?: unknown
+  /** A long form: wider, with the body flush left. */
+  wide?: boolean
   onSubmit: () => void
   onCancel: () => void
 }) {
   return (
     <form
-      className="cx-dlg"
+      className={`cx-dlg${wide ? ' wide' : ''}`}
       role="dialog"
       aria-modal="true"
       aria-labelledby="cx-dlg-t"
