@@ -1,0 +1,14 @@
+.env
+env/*.env
+!env/*.env.example
+# Un archivo por secreto; solo el README se versiona.
+secrets/*
+!secrets/README.md
+# make dev: llaves y estado del entorno local
+.dev/
+# Inventarios reales de Ansible (el de ejemplo sí se versiona).
+deploy/ansible/inventories/*
+!deploy/ansible/inventories/example/
+
+# Python bytecode de scripts auxiliares.
+__pycache__/

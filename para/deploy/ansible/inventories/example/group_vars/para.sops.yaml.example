@@ -1,0 +1,48 @@
+# Secretos del inventario. NO lo uses así: copia a para.sops.yaml, llénalo y
+# cífralo en su lugar:
+#
+#   sops --encrypt --in-place inventories/<nombre>/group_vars/para.sops.yaml
+#
+# (la llave age va en .sops.yaml; ver deploy/ansible/README.md). El plugin
+# community.sops lo descifra al correr el playbook. Para sacar estos valores
+# de una máquina existente: make secrets-import, luego copia cada archivo.
+#
+# Los nombres son los de scripts/secrets.sh list. postgres_url,
+# postgres_url_bridge y postgres_url_relay no van: se derivan de
+# postgres_password. vlpds_plc_rotation_key va envuelta con vlpds_kek: genera
+# los dos en tu máquina con `make secrets` y copia los archivos aquí.
+para_secrets:
+  postgres_password: "openssl rand -hex 32"
+  s3_access_key_id: "del proveedor del bucket"
+  s3_secret_access_key: "del proveedor del bucket"
+  vlpds_jwt_secret: "openssl rand -hex 32"
+  vlpds_admin_token: "openssl rand -hex 32"
+  vlpds_internal_token: "openssl rand -hex 32"
+  vlpds_kek: "openssl rand -hex 32  (respaldo offline)"
+  vlpds_plc_rotation_key: "vw1.… de make secrets  (respaldo offline)"
+  vlpds_rate_limit_bypass_key: "openssl rand -hex 32"
+  relay_admin_password: "openssl rand -hex 32"
+  bsky_service_signing_key: "openssl rand -hex 32  (respaldo offline)"
+  bsky_admin_passwords: "openssl rand -hex 32"
+  bsync_api_key: "openssl rand -hex 32"
+  ozone_signing_key: "openssl rand -hex 32  (respaldo offline)"
+  ozone_admin_password: "openssl rand -hex 32"
+  authority_service_token: "openssl rand -hex 32"
+  civic_delegation_resolver_secret: "openssl rand -hex 32"
+  m8_jwt_secret: "openssl rand -hex 32"
+  m8_app_key: "openssl rand -hex 32"
+  m8_cookie_secret: "openssl rand -hex 32"
+  m8_curp_pepper: "openssl rand -hex 32  (respaldo offline)"
+  m8_civic_vote_proof_secret: "openssl rand -hex 32"
+  m8_issuer_private_jwk: '{"kty":"OKP","crv":"Ed25519",...}  (respaldo offline)'
+  m8_issuer_public_jwk: '{"kty":"OKP","crv":"Ed25519",...}'
+  matrix_admin_token: "de Synapse, tras crear el admin"
+  matrix_appservice_token: "as_token del registro del bridge"
+  matrix_hs_token: "hs_token del registro del bridge"
+
+para_git_deploy_key: |
+  -----BEGIN OPENSSH PRIVATE KEY-----
+  (llave de solo lectura para clonar los repos privados)
+  -----END OPENSSH PRIVATE KEY-----
+
+common_tailscale_authkey: "tskey-auth-..."

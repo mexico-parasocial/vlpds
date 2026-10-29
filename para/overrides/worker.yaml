@@ -1,0 +1,37 @@
+# Solo para compose.worker.yaml: una máquina extra que sirve AppView.
+#
+# bsky y dataplane no guardan nada propio, así que crecer es arrancarlos en
+# otra máquina contra el mismo Postgres (el de la principal, por la red
+# privada). Esta máquina corre su propio Redis (es solo caché) y publica bsky
+# en su IP privada; la principal lo agrega a APPVIEW_WORKERS y Caddy reparte.
+#
+# El secreto postgres_url de un worker apunta a la IP privada de la principal
+# (el rol de Ansible lo escribe así). Un worker no recibe ningún otro secreto
+# que los de bsky.
+
+services:
+  bsky:
+    profiles: [appview-worker]
+    depends_on: !override
+      dataplane:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      BSKY_BSYNC_URL: http://${PARA_PRIMARY_IP:?Define PARA_PRIMARY_IP (IP privada de la principal)}:2586
+    ports:
+      - '${PARA_PRIVATE_BIND:?Define PARA_PRIVATE_BIND (IP privada de este worker)}:2584:2584'
+    # Una réplica por máquina: el puerto publicado no se puede repetir. Para
+    # más capacidad, otra máquina.
+    deploy:
+      replicas: 1
+  # Solo sirve consultas: indexar el firehose y bsync es trabajo del
+  # dataplane de la principal (dos indexarían todo dos veces).
+  dataplane:
+    profiles: [appview-worker]
+    depends_on: !reset {}
+    environment:
+      BSKY_REPO_PROVIDER: ''
+      BSKY_BSYNC_URL: 
+  redis:
+    profiles: [appview-worker]

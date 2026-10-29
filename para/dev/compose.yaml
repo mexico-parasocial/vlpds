@@ -1,0 +1,179 @@
+# Entorno local de PARA con vlpds como PDS (make dev).
+#
+# Todo comparte la red del contenedor `net`: dentro de cada servicio y desde
+# esta Mac, localhost:<puerto> es lo mismo. Así las URLs que quedan en los
+# documentos DID (el PDS en localhost:2583, el AppView en localhost:2584)
+# funcionan para todos, como en los bancos de prueba de vlpds.
+#
+# Nada persiste: vlpds corre en memoria, Postgres en tmpfs y el volumen del
+# relay es anónimo (make dev-down lo borra).
+name: para-vlpds-dev
+
+x-shared: &shared
+  network_mode: service:net
+  depends_on:
+    net:
+      condition: service_started
+
+services:
+  net:
+    image: alpine:3.20
+    command: ['sleep', 'infinity']
+    init: true
+    ports:
+      - '127.0.0.1:2582:2582' # PLC
+      - '127.0.0.1:2583:2583' # vlpds
+      - '127.0.0.1:2584:2584' # AppView
+      - '127.0.0.1:2470:2470' # relay
+
+  postgres:
+    <<: *shared
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-para.sql:ro
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'postgres', '-h', '127.0.0.1']
+      interval: 1s
+      retries: 30
+
+  # did-method-plc publica imágenes solo para amd64; se construye del mismo
+  # commit que usan los bancos de prueba de vlpds.
+  plc:
+    <<: *shared
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git#9c8ea2fe23b89a5c1011246cbb4957dad9dbf7db
+      dockerfile: packages/server/Dockerfile
+    image: para-plc:9c8ea2f
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_CREDS_JSON: '{"host":"127.0.0.1","password":"postgres","database":"plc"}'
+      DB_MIGRATE_CREDS_JSON: '{"host":"127.0.0.1","password":"postgres","database":"plc"}'
+      ENABLE_MIGRATIONS: 'true'
+      PORT: '2582'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:2582/_health']
+      interval: 1s
+      retries: 60
+
+  vlpds:
+    <<: *shared
+    image: ${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}
+    depends_on:
+      plc:
+        condition: service_healthy
+    command:
+      - --memory
+      - --dev-mode
+      - --no-rate-limits
+      # Sin anunciarse a nadie: el relay no acepta localhost por su
+      # requestCrawl público; up.sh lo registra directamente.
+      - --crawlers=
+    environment:
+      VLPDS_PUBLIC_URL: http://localhost:2583
+      VLPDS_HANDLE_DOMAIN: test
+      VLPDS_PLC_URL: http://localhost:2582
+      VLPDS_PLC_MODE: directory
+      VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: ${DEV_PLC_ROTATION_KEY:?make dev la genera}
+      VLPDS_APPVIEW: http://localhost:2584,did:web:localhost%3A2584
+      VLPDS_LOG_FORMAT: text
+
+  # Relay de indigo entre vlpds y los consumidores en TypeScript. vlpds
+  # numera su firehose con unix_micros × 256 + escritor (sin secuenciador
+  # global), y esos seq pasan de 2^53: @atproto/sync los rechaza. El relay
+  # vuelve a numerar con seq consecutivos, como en la red de ATProto.
+  relay:
+    <<: *shared
+    build:
+      context: https://github.com/bluesky-social/indigo.git#162dca49278b59fef7745f72ae7b641dc27f4d83
+      dockerfile: cmd/relay/Dockerfile
+      args:
+        # Su Dockerfile llama a git describe.
+        BUILDKIT_CONTEXT_KEEP_GIT_DIR: '1'
+    image: para-relay:162dca4
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Anónimo y no tmpfs: sus archivos de eventos tienen que sobrevivir a un
+    # reinicio del relay mientras su Postgres los recuerde.
+    volumes:
+      - /data/relay
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/relay
+      RELAY_API_BIND: ':2470'
+      RELAY_PLC_HOST: http://localhost:2582
+      RELAY_PERSIST_DIR: /data/relay
+      RELAY_ADMIN_PASSWORD: dev-relay-admin
+      # vlpds de desarrollo habla HTTP en localhost.
+      RELAY_ALLOW_INSECURE_HOSTS: 'true'
+
+  bsync:
+    <<: *shared
+    # De WatZappa main (incluye el arreglo de su Dockerfile, WatZappa#14).
+    build:
+      context: https://github.com/mexico-parasocial/WatZappa.git#ea85ae3561e8d104fa46a7ec0fa7ee51cfc91cf9
+      dockerfile: services/bsync/Dockerfile
+    image: ${BSYNC_IMAGE:-para-bsync:ea85ae3}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BSYNC_PORT: '2586'
+      BSYNC_DB_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/bsync
+      BSYNC_DB_MIGRATE: 'true'
+      BSYNC_API_KEYS: dev-bsync-key
+
+  # El AppView de WatZappa: la imagen, más api.js y dataplane.js de
+  # ../runtime (ver su README).
+  dataplane:
+    <<: *shared
+    image: ${BSKY_IMAGE:-para-core-bsky:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      relay:
+        condition: service_started
+    command: ['node', '--enable-source-maps', 'dataplane.js']
+    volumes:
+      - ../runtime/bsky/dataplane.js:/app/services/bsky/dataplane.js:ro
+    environment:
+      BSKY_DB_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/appview
+      BSKY_DATAPLANE_PORT: '2585'
+      BSKY_DID_PLC_URL: http://localhost:2582
+      BSKY_REPO_PROVIDER: ws://localhost:2470
+      LOG_ENABLED: 'true'
+      LOG_LEVEL: ${DATAPLANE_LOG_LEVEL:-info}
+      BSKY_BSYNC_URL: http://localhost:2586
+      BSKY_BSYNC_API_KEY: dev-bsync-key
+      BSKY_BSYNC_HTTP_VERSION: '1.1'
+      BSKY_DISABLE_SSRF_PROTECTION: 'true'
+
+  appview:
+    <<: *shared
+    image: ${BSKY_IMAGE:-para-core-bsky:latest}
+    depends_on:
+      dataplane:
+        condition: service_started
+      bsync:
+        condition: service_started
+    command: ['node', '--enable-source-maps', 'api.js']
+    volumes:
+      - ../runtime/bsky/api.js:/app/services/bsky/api.js:ro
+    environment:
+      BSKY_PORT: '2584'
+      BSKY_PUBLIC_URL: http://localhost:2584
+      BSKY_SERVER_DID: did:web:localhost%3A2584
+      BSKY_DID_PLC_URL: http://localhost:2582
+      BSKY_DATAPLANE_URLS: http://localhost:2585
+      BSKY_DATAPLANE_HTTP_VERSION: '1.1'
+      BSKY_BSYNC_URL: http://localhost:2586
+      BSKY_BSYNC_API_KEY: dev-bsync-key
+      BSKY_BSYNC_HTTP_VERSION: '1.1'
+      BSKY_ADMIN_PASSWORDS: dev-admin
+      BSKY_SERVICE_SIGNING_KEY: ${DEV_BSKY_SIGNING_KEY:?make dev la genera}
+      MOD_SERVICE_DID: did:web:localhost%3A2584
+      BSKY_DISABLE_SSRF_PROTECTION: 'true'
