@@ -183,7 +183,12 @@ pub(super) async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XRe
     Ok(held)
 }
 
-async fn submit(app: &Arc<App>, did: Arc<str>, writes: Vec<Write>, swap_commit: Option<Cid>) -> XResult<CommitAck> {
+pub(super) async fn submit(
+    app: &Arc<App>,
+    did: Arc<str>,
+    writes: Vec<Write>,
+    swap_commit: Option<Cid>,
+) -> XResult<CommitAck> {
     // held by the queued message, so a handler that goes away doesn't free
     // its slot while its write still sits queued
     let Ok(permit) = app.write_permits.clone().try_acquire_owned() else {
@@ -251,7 +256,7 @@ async fn submit(app: &Arc<App>, did: Arc<str>, writes: Vec<Write>, swap_commit: 
     })
 }
 
-fn commit_json(ack: &CommitAck) -> J {
+pub(super) fn commit_json(ack: &CommitAck) -> J {
     json!({"cid": ack.commit.to_string(), "rev": ack.rev.to_string()})
 }
 
@@ -289,11 +294,15 @@ async fn create_record(State(app): AppState, Auth(creds): Auth, body: RecordBody
     check_path(&inp.collection, inp.rkey.as_deref())?;
     check_rkey_slur(inp.rkey.as_deref())?;
     let rkey = inp.rkey.unwrap_or_else(|| app.tids.next().to_string());
+    let para_head = super::para::head_guard(&app, &did, inp.collection.starts_with("com.para.")).await?;
+    if app.config.para.enabled {
+        super::para::check_write(&app, &did, &inp.collection, &rkey, &inp.record.to_json()).await?;
+    }
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
         encode_record(&mut inp.record, &inp.collection, &rkey, inp.validate, schema.as_deref())?;
     let _held = check_blobs(&app, &did, &decls).await?;
-    let swap = parse_cid_opt(&inp.swap_commit)?;
+    let swap = parse_cid_opt(&inp.swap_commit)?.or(para_head);
     let path = format!("{}/{}", inp.collection, rkey);
     let ack = submit(
         &app,
@@ -365,10 +374,15 @@ async fn put_record(State(app): AppState, Auth(creds): Auth, body: RecordBody) -
     creds.need_repo(&inp.collection, "update")?;
     check_path(&inp.collection, Some(&inp.rkey))?;
     check_rkey_slur(Some(&inp.rkey))?;
+    let para_head = super::para::head_guard(&app, &did, inp.collection.starts_with("com.para.")).await?;
+    super::para::check_action(&app, &inp.collection, "update")?;
+    if app.config.para.enabled {
+        super::para::check_write(&app, &did, &inp.collection, &inp.rkey, &inp.record.to_json()).await?;
+    }
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
         encode_record(&mut inp.record, &inp.collection, &inp.rkey, inp.validate, schema.as_deref())?;
-    let swap = parse_cid_opt(&inp.swap_commit)?;
+    let swap = parse_cid_opt(&inp.swap_commit)?.or(para_head);
     let swap_record = parse_swap_record(&inp.swap_record)?;
     let path = format!("{}/{}", inp.collection, inp.rkey);
     // Writing the record it already holds is a no-op with no `commit` field
@@ -415,8 +429,10 @@ async fn delete_record(State(app): AppState, Auth(creds): Auth, Json(inp): Json<
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::DELETE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
     creds.need_repo(&inp.collection, "delete")?;
+    let para_head = super::para::head_guard(&app, &did, inp.collection.starts_with("com.para.")).await?;
+    super::para::check_action(&app, &inp.collection, "delete")?;
     check_path(&inp.collection, Some(&inp.rkey))?;
-    let swap = parse_cid_opt(&inp.swap_commit)?;
+    let swap = parse_cid_opt(&inp.swap_commit)?.or(para_head);
     let swap_record = parse_cid_opt(&inp.swap_record)?.map(Some);
     // A no-op, as in the reference: the worker would otherwise emit an empty
     // commit whose CAR lacks the unchanged MST root, which relays reject.
@@ -467,7 +483,15 @@ async fn apply_writes(State(app): AppState, Auth(creds): Auth, body: RecordBody)
         check_repo_write(creds.did(), points)?;
     }
     let did = authed_repo(&app, &creds, &inp.repo).await?;
-    let swap = parse_cid_opt(&inp.swap_commit)?;
+    let para_head = super::para::head_guard(
+        &app,
+        &did,
+        inp.writes
+            .iter()
+            .any(|w| w.get("collection").and_then(|v| v.as_str()).is_some_and(|c| c.starts_with("com.para."))),
+    )
+    .await?;
+    let swap = parse_cid_opt(&inp.swap_commit)?.or(para_head);
     if inp.writes.len() > crate::worker::MAX_COMMIT_OPS {
         return Err(XrpcError::bad(
             "InvalidRequest",
@@ -488,6 +512,7 @@ async fn apply_writes(State(app): AppState, Auth(creds): Auth, body: RecordBody)
             _ => "delete",
         };
         creds.need_repo(&collection, action)?;
+        super::para::check_action(&app, &collection, action)?;
         check_path(&collection, rkey.as_deref())?;
         if action != "delete" {
             check_rkey_slur(rkey.as_deref())?;
@@ -509,6 +534,9 @@ async fn apply_writes(State(app): AppState, Auth(creds): Auth, body: RecordBody)
             statuses.push(None);
             writes.push(Write::Delete { collection, rkey, swap: None });
             continue;
+        }
+        if app.config.para.enabled {
+            super::para::check_write(&app, &did, &collection, &rkey, &value.to_json()).await?;
         }
         let (cid, bytes, blobs, status, d) =
             encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
@@ -752,6 +780,9 @@ async fn describe_repo(State(app): AppState, Query(q): Query<RepoQ>) -> XResult<
 /// imported commit's signature nor its `did` is checked: only its contents
 /// are used.
 async fn import_repo(State(app): AppState, Auth(creds): Auth, headers: HeaderMap, body: Body) -> XResult<StatusCode> {
+    if app.config.para.enabled {
+        return super::para::migration::import_reviewed(app, creds, headers, body).await;
+    }
     let did = creds.user_did()?.to_string();
     creds.need_account("repo", "manage")?;
     if super::server::is_takendown_account(&app.account(&did).await?) {

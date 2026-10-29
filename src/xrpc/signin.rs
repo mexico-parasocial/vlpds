@@ -242,7 +242,8 @@ pub(super) async fn factors(app: &App, acct: &Account) -> XResult<String> {
 
 /// Whether a second factor is asked for on a password sign-in.
 pub(super) async fn factor_enabled(app: &App, acct: &Account) -> XResult<bool> {
-    Ok(super::email2fa::enabled(acct)
+    Ok(super::para::account::enabled(app, &acct.did).await?
+        || super::email2fa::enabled(acct)
         || crate::totp::enabled_for(app, acct).await?
         || super::passkeys::has_any(app, &acct.did).await?)
 }
@@ -255,6 +256,9 @@ pub(super) fn trust_days(app: &App) -> u32 {
 /// Whether this browser may skip the second factor for `acct`. `epoch` is
 /// the one the sign-in's password check read.
 pub(super) async fn trusted(app: &App, acct: &Account, epoch: &str, device_id: &str) -> XResult<bool> {
+    if super::para::account::enabled(app, &acct.did).await? {
+        return Ok(false);
+    }
     if trust_days(app) == 0 {
         return Ok(false);
     }

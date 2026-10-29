@@ -35,6 +35,7 @@ pub fn routes() -> Router<Arc<App>> {
         .merge(super::changes::internal_routes())
         .merge(super::console::internal_routes())
         .merge(super::console_storage::internal_routes())
+        .merge(super::para::internal_routes())
 }
 
 /// For HA tests and ops.

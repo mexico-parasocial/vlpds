@@ -91,7 +91,7 @@ const FAILED_TEXT: Record<SignInFailure, string> = {
 function CanSignIn({ a, k, t, i, sec, held, mail }: { a: Who; k: ChipKind; t: string; i?: AccountInfo; sec: Load<AccountSecurity>; held: HeldKey[]; mail?: MailEntry }) {
   const s = sec.data
   const now = Date.now()
-  const factors = s ? [s.totp.enabled && 'authenticator', s.passkeys.length && plural(s.passkeys.length, 'passkey'), s.emailCode.enabled && 'email code'].filter(Boolean) : []
+  const factors = s ? [s.im8?.enabled && 'iM8 wallet', s.totp.enabled && 'authenticator', s.passkeys.length && plural(s.passkeys.length, 'passkey'), s.emailCode.enabled && 'email code'].filter(Boolean) : []
   const locks = (s?.lockouts ?? []).filter((l) => l.lockedUntil && l.lockedUntil > now)
   const good = s?.recentSignIns.find((x) => !x.failed)
   const day = (s?.recentSignIns ?? []).filter((x) => x.failed && now - x.at < 86_400_000)
@@ -160,7 +160,7 @@ function CanSignIn({ a, k, t, i, sec, held, mail }: { a: Who; k: ChipKind; t: st
 
 function Security({ a, sec }: { a: Who; sec: Load<AccountSecurity> }) {
   const s = sec.data
-  const factors = s ? [s.passkeys.length ? plural(s.passkeys.length, 'passkey') : '', s.totp.enabled ? 'authenticator app' : '', s.emailCode.enabled ? 'email code' : ''].filter(Boolean) : []
+  const factors = s ? [s.im8?.enabled ? 'iM8 wallet' : '',s.passkeys.length ? plural(s.passkeys.length, 'passkey') : '', s.totp.enabled ? 'authenticator app' : '', s.emailCode.enabled ? 'email code' : ''].filter(Boolean) : []
   return (
     <Sec title="Sign-in & two-factor" digest={!s ? '…' : factors.length ? factors.join(' · ') : s.oauthOnly ? 'OAuth only' : 'password only'} open right={<Src>getAccountSecurity</Src>}>
       {sec.error ? (
@@ -197,6 +197,7 @@ function Security({ a, sec }: { a: Who; sec: Load<AccountSecurity> }) {
               { chip: onOff(s.passkeys.length > 0) },
             ],
             ['Authenticator app', s.totp.enabled ? (s.totp.enabledAt ? `since ${date(s.totp.enabledAt)}` : 'set up') : <span className="muted">not set up</span>, { chip: onOff(s.totp.enabled) }],
+            ['iM8 wallet', s.im8?.enabled ? 'required at sign-in' : 'not set up', {chip:onOff(!!s.im8?.enabled)}],
             ['Email code', s.emailCode.enabled ? (s.emailCode.since ? `since ${date(s.emailCode.since)}` : 'set up') : <span className="muted">not set up</span>, { chip: onOff(s.emailCode.enabled) }],
             [
               'Recovery codes',

@@ -83,6 +83,7 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
         pending_2fa: None,
         pending_2fa_failures: 0,
         pending_2fa_epoch: String::new(),
+        pending_2fa_auth_cred: None,
         trusted_until: 0,
     };
     rows.push((did.into(), o::session_key("ses-passkey"), enc(&ses)));
@@ -95,7 +96,10 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 9] = [
+    let checks: [Check; 12] = [
+        super::para::account::check_row,
+        super::para::alpha::check_row,
+        super::para::migration::check_row,
         super::server::check_row,
         super::admin::check_row,
         super::email2fa::check_row,
@@ -222,6 +226,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         pending_2fa: Some((did.into(), 1_790_000_060)),
         pending_2fa_failures: 1,
         pending_2fa_epoch: String::new(),
+        pending_2fa_auth_cred: None,
         trusted_until: 0,
     };
     let authz =

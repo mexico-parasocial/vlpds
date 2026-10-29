@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type JSX } from 'react'
-import { ErrorNotice, Field, Loading, Notice, Spinner, Topbar } from '../../components/ui'
+import { CopyText, ErrorNotice, Field, Loading, Notice, Spinner, Topbar } from '../../components/ui'
 import { useLoad, useSession } from '../../lib/hooks'
 import { Link, match, navigate, syncRoute, useSearch } from '../../lib/router'
 import { acall, call, setSession, signOut, XrpcError, errText } from '../../lib/xrpc'
@@ -113,6 +113,8 @@ function SignIn() {
   const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
+  const [im8, setIm8] = useState<{ challenge: string }>()
+  const [walletPasskey,setWalletPasskey] = useState<{did:string;credential:AssertionJson}>()
   const [step, setStep] = useState<Step>('password')
   const [trust, setTrust] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -150,10 +152,18 @@ function SignIn() {
   const finishPasskey = async (credential: AssertionJson, did?: string) => {
     const owner = did ?? didOfUserHandle(credential.userHandle)
     if (!owner) throw new Error('Passkey not recognized')
-    const out = await call('vlpds.server.createPasskeySession', {
-      body: { did: owner, credential, trustDevice: did && trust ? true : undefined },
-    })
-    setSession(out)
+    try {
+      const out = await call('vlpds.server.createPasskeySession', {
+        body: { did: owner, credential, trustDevice: did && trust ? true : undefined },
+      })
+      setSession(out)
+    } catch(e) {
+      if (!(e instanceof XrpcError) || e.error !== 'AuthFactorTokenRequired') throw e
+      setWalletPasskey({did:owner,credential})
+      setIdentifier(owner)
+      setStep('code')
+      setIm8(await call('vlpds.para.getIm8Challenge',{params:{identifier:owner}}))
+    }
   }
 
   const run = async (fn: () => Promise<void>) => {
@@ -187,7 +197,7 @@ function SignIn() {
     autofill.current?.abort()
     void run(async () => {
       try {
-        const out = await call('com.atproto.server.createSession', {
+        const out = walletPasskey ? await call('vlpds.server.createPasskeySession',{body:{...walletPasskey,authFactorToken:code.trim()}}) : await call('com.atproto.server.createSession', {
           body: {
             identifier: identifier.trim().replace(/^@/, ''),
             password,
@@ -200,6 +210,7 @@ function SignIn() {
         if (err instanceof XrpcError && err.error === 'AuthFactorTokenRequired') {
           if (step !== 'password') throw err
           setStep('code')
+          if (err.message.includes('iM8 wallet')) setIm8(await call('vlpds.para.getIm8Challenge', { params: { identifier: identifier.trim().replace(/^@/, '') } }))
         } else if (err instanceof XrpcError && err.error === 'PasskeyRequired') {
           if (step !== 'password') throw err
           setStep('passkey')
@@ -210,6 +221,8 @@ function SignIn() {
 
   const back = () => {
     setStep('password')
+    setWalletPasskey(undefined)
+    setIm8(undefined)
     setCode('')
     setError(undefined)
   }
@@ -246,7 +259,7 @@ function SignIn() {
                 <>
                   <h1>Two-factor check</h1>
                   <p className="sub">
-                    {step === 'passkey' ? (
+                    {im8 ? <>Copy the challenge into your iM8 wallet, check the server and account, and paste its sign-in approval below.</> : step === 'passkey' ? (
                       <>
                         Use your passkey for <b>{identifier}</b>. Lost it? Enter one of your recovery codes instead.
                       </>
@@ -257,7 +270,8 @@ function SignIn() {
                     )}
                   </p>
                   {!!error && <Notice kind="err">{errText(error)}</Notice>}
-                  {canPasskey && (
+                  {im8 && <><CopyText text={im8.challenge} /><button type="button" className="btn" onClick={() => run(async () => setIm8(await call('vlpds.para.getIm8Challenge', { params: { identifier: identifier.trim().replace(/^@/, '') } })))}>Get fresh wallet challenge</button></>}
+                  {canPasskey && !im8 && (
                     <button type="button" className="btn primary wide" onClick={usePasskey} disabled={busy} style={{ marginBottom: 14 }}>
                       {busy && <Spinner />}
                       Use your passkey
@@ -265,7 +279,7 @@ function SignIn() {
                   )}
                   {/* password managers pick the account's one-time code by the username beside it */}
                   <input type="text" className="sr-only" autoComplete="username" value={identifier} readOnly tabIndex={-1} aria-hidden="true" />
-                  <Field label={step === 'passkey' ? 'Recovery code' : 'Authentication code'}>
+                  <Field label={im8 ? 'iM8 approval token' : step === 'passkey' ? 'Recovery code' : 'Authentication code'}>
                     <input
                       type="text"
                       id="totp"
@@ -273,7 +287,7 @@ function SignIn() {
                       className="code"
                       value={code}
                       onChange={(e) => setCode(e.target.value)}
-                      inputMode={step === 'passkey' ? undefined : 'numeric'}
+                      inputMode={im8 || step === 'passkey' ? undefined : 'numeric'}
                       autoComplete="one-time-code"
                       required
                       autoFocus={step === 'code'}

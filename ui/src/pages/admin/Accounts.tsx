@@ -56,6 +56,7 @@ export const accountState = accountTone
 export function TwoFactor({ f }: { f: AccountRow['secondFactors'] }) {
   return (
     <span className="cx-2fa">
+      {f.im8 && <span className="on" title="Independent iM8 wallet authentication on">iM8</span>}
       <span className={f.passkeys ? 'on' : ''} title={plural(f.passkeys, 'passkey')}>
         PK{f.passkeys > 1 ? f.passkeys : ''}
       </span>

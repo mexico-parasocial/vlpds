@@ -512,6 +512,16 @@ async fn xrpc_target(
     req: Request,
 ) -> Result<(Request, Option<String>), Response> {
     let nsid = req.uri().path().strip_prefix("/xrpc/").unwrap_or("");
+    if nsid == "vlpds.para.getIm8Challenge" {
+        let identifier = req.uri().query().and_then(|q| {
+            crate::oauth::util::parse_form(q).into_iter().find(|(k, _)| k == "identifier").map(|(_, v)| v)
+        });
+        let did = match identifier {
+            Some(i) => resolve_ident(router, app, &i).await,
+            None => None,
+        };
+        return Ok((req, did));
+    }
     if !nsid.starts_with("com.atproto.") && !nsid.starts_with("vlpds.") {
         // e.g. tools.ozone.moderation.getRepo?did= still routes by caller
         let sub = token_sub(&req);

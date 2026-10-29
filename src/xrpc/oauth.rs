@@ -668,6 +668,7 @@ pub(crate) async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device
         pending_2fa: None,
         pending_2fa_failures: 0,
         pending_2fa_epoch: String::new(),
+        pending_2fa_auth_cred: None,
         trusted_until: 0,
     };
     store::put_device(app, &d).await?;
@@ -1203,6 +1204,8 @@ struct Pending {
     /// The code was mailed to this (obfuscated) address: the only factor.
     email_hint: Option<String>,
     totp: bool,
+    im8: bool,
+    im8_challenge: Option<String>,
     /// `allowCredentials` for the passkey button; empty without passkeys.
     passkeys: Vec<J>,
     /// It has passkeys, every one flagged as copied.
@@ -1211,16 +1214,32 @@ struct Pending {
 
 impl Pending {
     async fn of(app: &App, acct: &Account, factor: &super::email2fa::Factor) -> Result<Pending, OAuthError> {
+        let im8 = matches!(factor, super::email2fa::Factor::Im8);
         let email_hint = match factor {
             super::email2fa::Factor::Email { hint } => Some(hint.clone()),
             _ => None,
         };
-        let all = if email_hint.is_some() { Default::default() } else { super::passkeys::load(app, &acct.did).await? };
+        let all = if im8 || email_hint.is_some() {
+            Default::default()
+        } else {
+            super::passkeys::load(app, &acct.did).await?
+        };
         let passkeys = super::passkeys::descriptors(&all);
         Ok(Pending {
             did: acct.did.clone(),
             handle: acct.handle.clone(),
-            totp: email_hint.is_none() && crate::totp::enabled_for(app, acct).await?,
+            totp: !im8 && email_hint.is_none() && crate::totp::enabled_for(app, acct).await?,
+            im8,
+            im8_challenge: if im8 {
+                Some(
+                    super::para::account::login_challenge(app, &acct.did).await?["challenge"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .into(),
+                )
+            } else {
+                None
+            },
             email_hint,
             flagged: !all.creds.is_empty() && passkeys.is_empty(),
             passkeys,
@@ -1440,39 +1459,47 @@ async fn sign_in_inner(
     let has_passkeys = super::passkeys::has_any(app, &acct.did).await?;
     // a trusted browser skips every factor, whichever are set up
     let trusted = password_step && super::signin::trusted(app, &acct, &epoch, &device.id).await?;
-    let mut auth_cred = None;
-    let checked = match (trusted, posted_assertion(f).filter(|_| !password_step)) {
-        (true, _) => Ok(()),
-        (false, Some(a)) => {
-            let ex = super::passkeys::Expect {
-                purpose: "2fa",
-                binding: passkey_binding(&device.id, req.flow_key, Some(&acct.did)),
-                require_uv: false,
-            };
-            match super::passkeys::use_passkey(app, &acct.did, &a, &ex).await {
-                Ok(used) => {
-                    auth_cred = Some(used.cred.auth_ref());
-                    Ok(())
-                }
-                Err(super::passkeys::UseErr::Server(e)) => return Err(e.into()),
-                Err(super::passkeys::UseErr::Refused(_)) => {
-                    sign_in_failed(app, req, For::Did(&acct.did), R::WrongCode).await;
-                    device.pending_2fa_failures += 1;
-                    if device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES {
-                        device.pending_2fa = None;
-                        device.pending_2fa_failures = 0;
-                        store::put_device(app, device).await?;
-                        return Ok(SignIn::Failed(ident, LoginError::Passkey));
+    if password_step {
+        device.pending_2fa_auth_cred = None;
+    }
+    let mut auth_cred = if password_step { None } else { device.pending_2fa_auth_cred.clone() };
+    let im8 = super::para::account::enabled(app, &acct.did).await?;
+    let checked = if im8 {
+        super::email2fa::check_second_factor(app, &acct, code, false, false).await
+    } else {
+        match (trusted, posted_assertion(f).filter(|_| !password_step)) {
+            (true, _) => Ok(()),
+            (false, Some(a)) => {
+                let ex = super::passkeys::Expect {
+                    purpose: "2fa",
+                    binding: passkey_binding(&device.id, req.flow_key, Some(&acct.did)),
+                    require_uv: false,
+                };
+                match super::passkeys::use_passkey(app, &acct.did, &a, &ex).await {
+                    Ok(used) => {
+                        auth_cred = Some(used.cred.auth_ref());
+                        Ok(())
                     }
-                    store::put_device(app, device).await?;
-                    let p = Pending::of(app, &acct, &super::email2fa::Factor::Passkey).await?;
-                    return Ok(SignIn::NeedFactorErr(p, LoginError::Passkey));
+                    Err(super::passkeys::UseErr::Server(e)) => return Err(e.into()),
+                    Err(super::passkeys::UseErr::Refused(_)) => {
+                        sign_in_failed(app, req, For::Did(&acct.did), R::WrongCode).await;
+                        device.pending_2fa_failures += 1;
+                        if device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES {
+                            device.pending_2fa = None;
+                            device.pending_2fa_failures = 0;
+                            store::put_device(app, device).await?;
+                            return Ok(SignIn::Failed(ident, LoginError::Passkey));
+                        }
+                        store::put_device(app, device).await?;
+                        let p = Pending::of(app, &acct, &super::email2fa::Factor::Passkey).await?;
+                        return Ok(SignIn::NeedFactorErr(p, LoginError::Passkey));
+                    }
                 }
             }
+            // TOTP, a recovery code with passkeys, else the email factor (which
+            // mails the code on the password step)
+            (false, None) => super::email2fa::check_second_factor(app, &acct, code, false, has_passkeys).await,
         }
-        // TOTP, a recovery code with passkeys, else the email factor (which
-        // mails the code on the password step)
-        (false, None) => super::email2fa::check_second_factor(app, &acct, code, false, has_passkeys).await,
     };
     match checked {
         Ok(()) => {}
@@ -1513,6 +1540,8 @@ async fn sign_in_inner(
     }
     let factor = if trusted {
         Some("trusted")
+    } else if im8 {
+        Some("im8")
     } else if auth_cred.is_some() {
         Some("passkey")
     } else if password_step {
@@ -1578,6 +1607,14 @@ async fn passwordless_sign_in(
     let ctx = super::signin::Ctx { ip: req.ip, user_agent: req.user_agent, device_id: Some(&device_id) };
     let method = super::signin::Method::Passkey(req.client_id.map(String::from));
     super::signin::record(app, &acct, method, Some("passkey"), &ctx).await;
+    if super::para::account::enabled(app, &did).await? {
+        device.pending_2fa = Some((did.clone(), now_secs()));
+        device.pending_2fa_epoch = epoch;
+        device.pending_2fa_failures = 0;
+        device.pending_2fa_auth_cred = Some(used.cred.auth_ref());
+        store::put_device(app, device).await?;
+        return Ok(SignIn::NeedFactor(Pending::of(app, &acct, &super::email2fa::Factor::Im8).await?));
+    }
     finish_device_sign_in(app, device, did, epoch, Some(used.cred.auth_ref())).await
 }
 
@@ -1591,6 +1628,7 @@ async fn finish_device_sign_in(
 ) -> Result<SignIn, OAuthError> {
     let now = now_secs();
     device.pending_2fa = None;
+    device.pending_2fa_auth_cred = None;
     device.pending_2fa_failures = 0;
     device.accounts.retain(|a| a.did != did);
     device.accounts.push(DeviceAccount { did: did.clone(), authenticated_at: now, auth_epoch: epoch, auth_cred });
@@ -1613,6 +1651,8 @@ fn second_factor_form<'a>(p: &'a Pending, pk: &'a Option<(String, String, String
     ui::Second {
         email_hint: p.email_hint.as_deref(),
         totp: p.totp,
+        im8: p.im8,
+        im8_challenge: p.im8_challenge.as_deref(),
         trust_days,
         passkey: pk.as_ref().map(|(c, r, a)| ui::PasskeyUi { challenge: c, rp_id: r, allow: a }),
         flagged: p.flagged,

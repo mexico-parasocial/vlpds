@@ -395,6 +395,14 @@ struct Args {
     /// Default AppView for proxied requests: "<url>,<service did>".
     #[arg(long, env = "VLPDS_APPVIEW")]
     appview: Option<String>,
+
+    /// Native PARA commands and mandatory pre-commit policies.
+    #[arg(long, env = "VLPDS_PARA", default_value_t = false)]
+    para: bool,
+    #[arg(long, env = "VLPDS_PARA_VOTE_VERIFIER_URL")]
+    para_vote_verifier_url: Option<String>,
+    #[arg(long, env = "VLPDS_PARA_DELEGATION_VERIFIER_URL")]
+    para_delegation_verifier_url: Option<String>,
     /// Another AppView for the accounts in --appview-override-accounts, for
     /// the methods in --appview-override-methods: "<url>,<service did>". The
     /// DID is the service-auth audience and isn't resolved. Like --appview's,
@@ -1490,7 +1498,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
         full_every: opt_duration(&args.full_compaction_every)?,
         ..Default::default()
     });
+    let para = vlpds::para::Config::new(
+        args.para,
+        args.para_vote_verifier_url.clone(),
+        args.para_delegation_verifier_url.clone(),
+    )?;
     let cfg = Config {
+        para,
         public_url: args.public_url.clone(),
         handle_domain: args.handle_domain.clone(),
         service_did: args.service_did.clone(),

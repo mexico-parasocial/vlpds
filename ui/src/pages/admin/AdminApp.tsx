@@ -12,6 +12,7 @@ import { Link, match } from '../../lib/router'
 import { basic, call, setAdminOperator, setAdminToken, XrpcError } from '../../lib/xrpc'
 import { Accounts } from './Accounts'
 import { AppviewOverride } from './AppviewOverride'
+import { Chat } from './Chat'
 import { Cluster } from './Cluster'
 import './clusterDetails'
 import { Config } from './Config'
@@ -80,6 +81,8 @@ function route(p: string): Route {
     case '/admin/appview':
     case '/admin/appview-override':
       return { section: S.appview, page: <AppviewOverride /> }
+    case '/admin/chat':
+      return { section: S.chat, page: <Chat /> }
     case '/admin/config':
       return { section: S.config, page: <Config /> }
   }

@@ -15,6 +15,7 @@ pub use crate::appview_override::AppviewOverride;
 /// No Debug: it holds secrets (tokens, S3/SMTP credentials, KEK config).
 #[derive(Clone)]
 pub struct Config {
+    pub para: crate::para::Config,
     pub public_url: String,
     pub handle_domain: String,
     pub service_did: String,
@@ -306,6 +307,7 @@ impl Default for Config {
             disk_cache_shard_bytes: None,
             appview: None,
             appview_override: None,
+            para: crate::para::Config::default(),
             report_service: None,
             appview_cdn_url_pattern: None,
             crawlers: Vec::new(),

@@ -243,7 +243,7 @@ pub enum ImportStep {
     /// Refused as an import is (inactive account, key rotating or
     /// unavailable) and while another driver's import is staged here; one
     /// whose driver is gone is moved to the garbage first.
-    Begin { nonce: u64, ticket: oneshot::Sender<ImportTicket> },
+    Begin { nonce: u64, expected_head: Option<Cid>, ticket: oneshot::Sender<ImportTicket> },
     /// Rows of the staged generation, no frame.
     Rows { nonce: u64, epoch: u64, muts: Vec<Mutation> },
     /// Makes the staged generation the repo's in one entry: a commit over
@@ -2164,7 +2164,10 @@ fn import_step(
         st.imports.staging.is_some_and(|s| s.nonce == nonce) && st.partition.epoch == epoch
     };
     match step {
-        ImportStep::Begin { nonce, ticket } => {
+        ImportStep::Begin { nonce, expected_head, ticket } => {
+            if expected_head.is_some_and(|head| head != st.head.commit) {
+                return Err(WriteError::InvalidSwap("Destination changed since PARA import review".into()));
+            }
             if let Some(status) = st.account.status.as_ref().filter(|s| *s != "deactivated") {
                 return Err(if status == "deleted" {
                     WriteError::RepoNotFound

@@ -208,6 +208,7 @@ async fn account_row(app: &App, p: &Partition, a: &Account) -> XResult<J> {
         .and_then(|v| serde_json::from_slice::<super::passkeys::Passkeys>(&v).ok())
         .map_or(0, |p| p.creds.len());
     let totp = crate::totp::enabled_for(app, a).await?;
+    let im8 = super::para::account::enabled(app, did).await?;
     let extra = |k: &str| a.extra.get(k).and_then(|v| v.as_str()).map(String::from);
     let mut row = json!({
         "did": did,
@@ -219,7 +220,7 @@ async fn account_row(app: &App, p: &Partition, a: &Account) -> XResult<J> {
         "shard": p.id.0,
         "node": node_id(app),
         "invitesDisabled": a.extra.get("invitesDisabled").and_then(|v| v.as_bool()).unwrap_or(false),
-        "secondFactors": {"passkeys": passkeys, "totp": totp, "emailCode": super::email2fa::enabled(a)},
+        "secondFactors": {"passkeys": passkeys, "totp": totp,"im8":im8, "emailCode": super::email2fa::enabled(a)},
         "blobBytes": usage.as_ref().map_or(0, |u| u.bytes),
         "overQuota": usage.as_ref().is_some_and(|u| u.over),
     });
@@ -254,7 +255,13 @@ fn passes(f: Filter, row: &J, locked: &std::collections::HashSet<String>) -> boo
         Filter::Deactivated => status == "deactivated",
         Filter::Takendown => status == "takendown",
         Filter::Unconfirmed => row["emailConfirmed"] == false,
-        Filter::No2fa => status == "active" && sf["passkeys"] == 0 && sf["totp"] == false && sf["emailCode"] == false,
+        Filter::No2fa => {
+            status == "active"
+                && sf["passkeys"] == 0
+                && sf["totp"] == false
+                && sf["im8"] == false
+                && sf["emailCode"] == false
+        }
         Filter::Attention => {
             row["emailConfirmed"] == false
                 || row["overQuota"] == true
@@ -697,6 +704,7 @@ async fn get_account_security(State(app): AppState, Auth(creds): Auth, Query(q):
         "secondFactorRequired": super::signin::factor_enabled(&app, &acct).await?,
         "passkeys": passkeys,
         "totp": {"enabled": totp.enabled(), "enabledAt": totp.enabled_at},
+        "im8": {"enabled":super::para::account::enabled(&app,did).await?},
         "emailCode": {
             "enabled": super::email2fa::enabled(&acct),
             "since": acct.extra.get(super::email2fa::FLAG).and_then(|v| v.as_str()),

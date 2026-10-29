@@ -217,6 +217,8 @@ pub struct Second<'a> {
     /// The code was emailed to this (obfuscated) address: the only factor.
     pub email_hint: Option<&'a str>,
     pub totp: bool,
+    pub im8: bool,
+    pub im8_challenge: Option<&'a str>,
     /// Offer to trust this browser for this many days (0: don't).
     pub trust_days: u32,
     /// The account's passkeys.
@@ -348,6 +350,15 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
     b.push_str(&format!("<form method=\"post\" action=\"{}\">", e(f.action)));
     b.push_str(&hidden_fields);
     match &f.second {
+        Some(s) if s.im8 => b.push_str(&format!(
+            "{username}<p>Copy this challenge into your iM8 wallet. Check the account and server, then approve the sign-in.</p>\
+<label for=\"im8-challenge\">Wallet challenge</label>\
+<input type=\"text\" id=\"im8-challenge\" value=\"{}\" readonly aria-label=\"Wallet challenge\">\
+<label for=\"code\">iM8 approval token</label>\
+<input type=\"password\" id=\"code\" name=\"code\" autocomplete=\"off\" maxlength=\"4096\" required autofocus>\
+<input type=\"hidden\" name=\"step\" value=\"2fa\">",
+            e(s.im8_challenge.unwrap_or_default())
+        )),
         Some(Second { email_hint: Some(hint), trust_days, .. }) => b.push_str(&format!(
             "<p>We sent a sign-in code to <b>{}</b>.</p>{username}\
 <label for=\"code\">Sign-in code from your email</label>\

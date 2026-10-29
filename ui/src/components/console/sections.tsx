@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 // The console's information architecture: one entry per sidebar item, in order. `key` is the
 // letter after `g`; `aliases` are older paths that still land in the section.
 
-export type SectionId = 'overview' | 'nodes' | 'storage' | 'firehose' | 'accounts' | 'moderation' | 'limits' | 'domains' | 'spaces' | 'mail' | 'appview' | 'config'
+export type SectionId = 'overview' | 'nodes' | 'storage' | 'firehose' | 'accounts' | 'moderation' | 'limits' | 'domains' | 'spaces' | 'mail' | 'appview' | 'config' | 'chat'
 
 export type Section = { id: SectionId; label: string; short?: string; key: string; group: '' | 'Cluster' | 'People' | 'System'; path: string; aliases?: string[]; icon: ReactNode; alpha?: boolean }
 
@@ -126,6 +126,10 @@ export const SECTIONS: Section[] = [
         <circle cx="8" cy="8" r="2" fill="currentColor" />
       </>,
     ),
+  },
+  {
+    id: 'chat', label: 'Chat', key: 'h', group: 'System', path: '/admin/chat',
+    icon: svg(<path d="M2 2h12v9H8l-4 3v-3H2Z" {...s} />),
   },
   {
     id: 'mail',

@@ -1,0 +1,8 @@
+- Native PARA commands authenticate through `Auth`, bind the repository to `creds.user_did()`, and check every collection/action with `need_repo`.
+- Capture the caller's head before authorization reads. Submit the whole command through `repo::submit` with that head as `swap_commit`; never write into another account's repository.
+- Generic create/put/applyWrites must retain the same PARA gate, independent of `validate`. Authority events are append-only. Imports require an operator's exact-CAR review and an inactive owner repository, plus the worker's expected-head guard.
+- M8 verification is fail-closed, status-only, with no redirects or session credentials. AppView reads use method-bound service JWTs and bounded bodies.
+- Founder invitations and activation must be signed by the creator; acceptance signs only the invitee's membership. Peer reads must use mTLS/internal authentication with bounds.
+- Alpha allocation, invitation use and approval must share a single private CAS. Invitation administration is admin-only; fresh rollouts default closed.
+- iM8 authentication uses independent, purpose-bound, expiring wallet signatures, never an M8 session obtained through PDS OAuth. Consume proofs durably; factor changes replace the credential epoch and revoke sessions atomically. Every login path must enforce enrolled factors even with PARA disabled.
+- Change canonical schemas in WatZappa first; regenerate `lexicons/para.json` with `para/scripts/sync-native-lexicons.py`. Backend implementation does not close frontend, private-state migration, live-service, restart or cluster validation gates.

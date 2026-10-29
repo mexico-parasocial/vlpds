@@ -29,6 +29,7 @@ pub mod key_rotation;
 pub mod mfa;
 pub mod moderation;
 pub mod oauth;
+mod para;
 pub mod passkeys;
 #[doc(hidden)]
 pub mod private_rows;
@@ -292,6 +293,7 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(mfa::routes())
                 .merge(identity::routes())
                 .merge(repo::routes())
+                .merge(para::routes())
                 .merge(sync::routes())
                 .merge(blobs::routes())
                 .merge(admin::routes())

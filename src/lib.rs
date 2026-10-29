@@ -53,3 +53,6 @@ pub mod totp;
 pub mod webauthn;
 pub mod worker;
 pub mod xrpc;
+
+/// Native PARA write policy and proof verification.
+pub mod para;

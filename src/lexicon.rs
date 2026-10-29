@@ -28,8 +28,11 @@ use vlatproto::cbor::{JsonValue, Value};
 use vlatproto::syntax;
 
 static BUNDLE: LazyLock<Lexicons> = LazyLock::new(|| {
-    let docs: HashMap<String, J> =
+    let mut docs: HashMap<String, J> =
         serde_json::from_str(include_str!("../lexicons/bundle.json")).expect("bundled lexicons");
+    docs.extend(
+        serde_json::from_str::<HashMap<String, J>>(include_str!("../lexicons/para.json")).expect("PARA lexicons"),
+    );
     Lexicons::compile(docs.iter().map(|(k, d)| (k.as_str(), d)), None)
 });
 

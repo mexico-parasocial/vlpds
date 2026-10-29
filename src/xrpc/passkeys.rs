@@ -779,6 +779,7 @@ struct CreateSessionIn {
     credential: AssertionIn,
     #[serde(default)]
     trust_device: bool,
+    auth_factor_token: Option<String>,
 }
 
 /// `vlpds.server.createPasskeySession`: the legacy session `createSession`
@@ -830,6 +831,7 @@ async fn create_session_inner(
     // read before the check: a revoke-all racing this sign-in lands first
     // (and voids it) or after
     let epoch = super::server::auth_epoch(app, &did).await?;
+    super::para::account::check_login(app, &did, inp.auth_factor_token.as_deref()).await?;
     let cdj = decode_capped(&inp.credential.client_data_json, MAX_CDJ_B64).map_err(refuse)?;
     let challenge = webauthn::client_data_challenge(&cdj).map_err(refuse)?;
     let key = challenge_key(app);
