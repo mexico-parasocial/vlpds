@@ -1132,7 +1132,8 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
             feed_did = feed_generator_did(app, pq).await?;
             fwd.aud = Some(&feed_did);
             fwd.lxm = GET_FEED_SKELETON;
-        } else if let Some(kind) = read_after_write::Kind::of(&lxm) {
+        } else if let Some(kind) = read_after_write::Kind::of(&lxm).filter(|k| !k.is_para() || app.config.para.enabled)
+        {
             return read_after_write::proxy(app, &target, fwd, &acct, kind).await;
         }
     }

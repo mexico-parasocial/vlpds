@@ -616,6 +616,202 @@ async fn rev_older_than_every_record_is_ignored() {
     assert_eq!(s.xrpc.get("app.bsky.feed.getTimeline", &[], &a.auth()).await.ok()["feed"], json!([]));
 }
 
+// PARA feeds (WatZappa api/com/para/feed)
+// ---------------------------------------
+
+async fn setup_para() -> (Arc<Stub>, TestServer) {
+    let (stub, url) = spawn_stub().await;
+    let s = TestServer::spawn_with(|c| {
+        c.appview = Some((url, APPVIEW_DID.into()));
+        c.para.enabled = true;
+    })
+    .await;
+    (stub, s)
+}
+
+/// A `com.para.post`, replying to (root, parent) when given.
+async fn para_post(s: &TestServer, a: &TestAccount, text: &str, reply: Option<(&RecordRef, &RecordRef)>) -> RecordRef {
+    let mut record = json!({"$type": "com.para.post", "text": text, "createdAt": now_iso(), "flairs": ["|#Sanidad"]});
+    if let Some((root, parent)) = reply {
+        record["reply"] = json!({"root": strong(root), "parent": strong(parent)});
+    }
+    s.create_record(a, "com.para.post", record).await
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// A PARA read as the app sends it: always naming the AppView.
+async fn para_get(s: &TestServer, nsid: &str, query: &[(&str, &str)], a: &TestAccount) -> Resp {
+    let rb = reqwest::Client::new()
+        .get(format!("{}/xrpc/{nsid}", s.url))
+        .query(query)
+        .header("authorization", format!("Bearer {}", a.access))
+        .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"));
+    s.xrpc.send(rb).await
+}
+
+/// PARA's flat PostView, as the AppView would serve it.
+fn para_view(r: &RecordRef, did: &str, text: &str, created_at: &str) -> J {
+    json!({"uri": r.uri, "cid": r.cid, "author": did, "text": text, "createdAt": created_at})
+}
+
+fn uris(v: &J) -> Vec<&str> {
+    v.as_array().unwrap().iter().map(|p| p["uri"].as_str().unwrap()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn para_feeds_get_new_posts() {
+    let (stub, s) = setup_para().await;
+    let a = s.create_account("rawpfeed").await;
+    let b = s.create_account("rawpfeedb").await;
+    let p0 = para_post(&s, &a, "indexed", None).await;
+    let bp = para_post(&s, &b, "someone else", None).await;
+    stub.set_rev(&rev(&s, &a.did).await);
+    stub.set(
+        "com.para.feed.getTimeline",
+        json!({"feed": [para_view(&bp, &b.did, "someone else", OLD)], "cursor": "t1"}),
+    );
+    stub.set("com.para.feed.getAuthorFeed", json!({"feed": [para_view(&p0, &a.did, "indexed", OLD)]}));
+
+    let p1 = para_post(&s, &a, "fresh", None).await;
+    let bsky = s.post(&a, "a bsky post").await;
+
+    // getTimeline: the new PARA post first as a flat PostView; no bsky posts
+    let r = para_get(&s, "com.para.feed.getTimeline", &[], &a).await;
+    assert!(lag(&r).is_some());
+    let j = r.ok();
+    assert_eq!(uris(&j["feed"]), [p1.uri.as_str(), bp.uri.as_str()], "{j}");
+    let post = &j["feed"][0];
+    assert_eq!(post["cid"], p1.cid);
+    assert_eq!(post["author"], a.did);
+    assert_eq!(post["text"], "fresh");
+    assert_eq!(post["flairs"], json!(["|#Sanidad"]));
+    assert!(post.get("record").is_none() && post.get("replyRoot").is_none());
+    assert!(post["createdAt"].as_str().unwrap() > OLD);
+    assert_eq!(j["feed"][1], para_view(&bp, &b.did, "someone else", OLD));
+    assert_eq!(j["cursor"], "t1");
+    assert!(!uris(&j["feed"]).contains(&bsky.uri.as_str()));
+
+    // getAuthorFeed: own (by DID or handle) gets it, someone else's doesn't
+    for actor in [a.did.as_str(), a.handle.as_str()] {
+        let j = para_get(&s, "com.para.feed.getAuthorFeed", &[("actor", actor)], &a).await.ok();
+        assert_eq!(uris(&j["feed"]), [p1.uri.as_str(), p0.uri.as_str()], "{actor}");
+    }
+    let j = para_get(&s, "com.para.feed.getAuthorFeed", &[("actor", &b.did)], &a).await.ok();
+    assert_eq!(uris(&j["feed"]), [p0.uri.as_str()]);
+
+    // the AppView caught up: nothing merged
+    stub.set_rev(&rev(&s, &a.did).await);
+    let r = para_get(&s, "com.para.feed.getTimeline", &[], &a).await;
+    assert_eq!(lag(&r), None);
+    assert_eq!(uris(&r.ok()["feed"]), [bp.uri.as_str()]);
+}
+
+/// Without PARA the feeds are proxied as they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn para_feeds_need_para() {
+    let (stub, s) = setup().await;
+    let a = s.create_account("rawpoff").await;
+    para_post(&s, &a, "indexed", None).await;
+    stub.set_rev(&rev(&s, &a.did).await);
+    stub.set("com.para.feed.getTimeline", json!({"feed": []}));
+    para_post(&s, &a, "fresh", None).await;
+    let r = para_get(&s, "com.para.feed.getTimeline", &[], &a).await;
+    assert_eq!(lag(&r), None);
+    assert_eq!(r.ok()["feed"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn para_threads_get_new_replies() {
+    let (stub, s) = setup_para().await;
+    let a = s.create_account("rawpthread").await;
+    let p0 = para_post(&s, &a, "root", None).await;
+    stub.set_rev(&rev(&s, &a.did).await);
+    stub.set(
+        &format!("com.para.feed.getPostThread {}", p0.uri),
+        json!({"post": para_view(&p0, &a.did, "root", OLD), "parents": [], "replies": []}),
+    );
+    let r1 = para_post(&s, &a, "reply", Some((&p0, &p0))).await;
+    let r2 = para_post(&s, &a, "reply to reply", Some((&p0, &r1))).await;
+    let other = para_post(&s, &a, "unrelated", None).await;
+
+    // the root's thread gets both replies, newest first
+    let r = para_get(&s, "com.para.feed.getPostThread", &[("uri", &p0.uri)], &a).await;
+    assert!(lag(&r).is_some());
+    let j = r.ok();
+    assert_eq!(j["post"], para_view(&p0, &a.did, "root", OLD));
+    assert_eq!(j["parents"], json!([]));
+    assert_eq!(uris(&j["replies"]), [r2.uri.as_str(), r1.uri.as_str()], "{j}");
+    assert_eq!(j["replies"][0]["replyRoot"], p0.uri);
+    assert_eq!(j["replies"][0]["replyParent"], r1.uri);
+
+    // a post the AppView doesn't have (a 400 or a 404): built from the
+    // records since its rev, so p0 (older) isn't among the parents
+    for status in [400, 404] {
+        stub.set_status(
+            &format!("com.para.feed.getPostThread {}", r2.uri),
+            status,
+            json!({"error": "InvalidRequest", "message": "not found"}),
+        );
+        let r = para_get(&s, "com.para.feed.getPostThread", &[("uri", &r2.uri)], &a).await;
+        assert!(lag(&r).is_some());
+        let j = r.ok();
+        assert_eq!(j["post"]["uri"], r2.uri);
+        assert_eq!(uris(&j["parents"]), [r1.uri.as_str()], "{status}: {j}");
+        assert_eq!(uris(&j["replies"]), [r1.uri.as_str()], "the root's other replies");
+    }
+
+    // no rev: from the store, every parent up to the root
+    stub.set_rev("");
+    let r = para_get(&s, "com.para.feed.getPostThread", &[("uri", &r2.uri)], &a).await;
+    assert!(lag(&r).is_some());
+    let j = r.ok();
+    assert_eq!(uris(&j["parents"]), [p0.uri.as_str(), r1.uri.as_str()], "{j}");
+    assert!(!uris(&j["replies"]).contains(&other.uri.as_str()));
+
+    // someone else's missing post stays an error
+    let b = s.create_account("rawpthreadb").await;
+    let bp = para_post(&s, &b, "theirs", None).await;
+    stub.set_status(&format!("com.para.feed.getPostThread {}", bp.uri), 404, json!({"error": "NotFound"}));
+    let r = para_get(&s, "com.para.feed.getPostThread", &[("uri", &bp.uri)], &a).await;
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn para_get_posts_fills_missing() {
+    let (stub, s) = setup_para().await;
+    let a = s.create_account("rawpposts").await;
+    let b = s.create_account("rawppostsb").await;
+    let p0 = para_post(&s, &a, "indexed", None).await;
+    let bp = para_post(&s, &b, "theirs", None).await;
+    stub.set_rev(&rev(&s, &a.did).await);
+    stub.set("com.para.feed.getPosts", json!({"posts": [para_view(&p0, &a.did, "indexed", OLD)]}));
+    let p1 = para_post(&s, &a, "fresh", None).await;
+
+    // the requester's new post and someone else's on this PDS, in the order asked
+    let q = [("uris", p1.uri.as_str()), ("uris", p0.uri.as_str()), ("uris", bp.uri.as_str())];
+    let r = para_get(&s, "com.para.feed.getPosts", &q, &a).await;
+    assert!(lag(&r).is_some());
+    let j = r.ok();
+    assert_eq!(uris(&j["posts"]), [p1.uri.as_str(), p0.uri.as_str(), bp.uri.as_str()], "{j}");
+    assert_eq!(j["posts"][1], para_view(&p0, &a.did, "indexed", OLD));
+    assert_eq!(j["posts"][2]["author"], b.did);
+    assert_eq!(j["posts"][2]["text"], "theirs");
+
+    // without a rev too
+    stub.set_rev("");
+    let j = para_get(&s, "com.para.feed.getPosts", &q, &a).await.ok();
+    assert_eq!(uris(&j["posts"]), [p1.uri.as_str(), p0.uri.as_str(), bp.uri.as_str()]);
+
+    // nothing missing (or nothing on this PDS): the AppView's answer as is
+    let gone = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/com.para.post/3jzfcijpj2z2a";
+    let r = para_get(&s, "com.para.feed.getPosts", &[("uris", p0.uri.as_str()), ("uris", gone)], &a).await;
+    assert_eq!(lag(&r), None);
+    assert_eq!(r.ok(), json!({"posts": [para_view(&p0, &a.did, "indexed", OLD)]}));
+}
+
 /// getFeed's token is for the feed generator (reference getFeed.ts): aud =
 /// the generator's DID from its record, lxm = getFeedSkeleton.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
