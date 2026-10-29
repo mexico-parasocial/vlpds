@@ -23,7 +23,7 @@
 
 # --- web UI -----------------------------------------------------------------
 # the UI build is the same on every platform, so it runs natively
-FROM --platform=$BUILDPLATFORM node:26-bookworm-slim AS ui
+FROM --platform=$BUILDPLATFORM node:26.12.1-bookworm-slim AS ui
 WORKDIR /src/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund

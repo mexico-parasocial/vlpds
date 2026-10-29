@@ -2479,7 +2479,7 @@ def s_upgrade_rollback(ctx):
             (36, swap_build(1, OLD_BIN, "old (rollback)")), (36.01, audit_from_start(1)),
             (38, checker_with_cursor(2, back_s=25))]
     res = run_load_scenario(ctx, 3, 50, acts, node_bins=[OLD_BIN] * 3)
-    return upgrade_checks(ctx, res, finalized=1, new_formats=False)
+    return upgrade_checks(ctx, res, finalized=REAL_MAX, new_formats=False)
 
 
 @scenario("upgrade-old-refused",

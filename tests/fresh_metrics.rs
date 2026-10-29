@@ -36,6 +36,7 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_lease_events_total{event="peer_refused"}"#,
     r#"vlpds_lease_events_total{event="lost"}"#,
     r#"vlpds_lease_events_total{event="renewal_landed"}"#,
+    r#"vlpds_lease_events_total{event="join_landed"}"#,
     r#"vlpds_lease_events_total{event="revalidated"}"#,
     r#"vlpds_lease_renew_errors_total{kind="timeout"}"#,
     r#"vlpds_lease_renew_errors_total{kind="error"}"#,

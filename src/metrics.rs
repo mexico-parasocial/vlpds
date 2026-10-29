@@ -492,6 +492,7 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
             "lease_recreated",
             "history_full",
             "join_lease_moved",
+            "join_landed",
             "shutdown_fence_failed",
             "renewal_landed",
             "revalidated",
