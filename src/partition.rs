@@ -1306,12 +1306,18 @@ fn spawn_compactor(
     tokio::spawn(async move {
         let polling = compaction_polling();
         let mut fast = polling == CompactionPolling::Fast;
+        let mut backoff = COMPACTOR_RESTART_MIN;
+        let mut closed_watch = watch.clone();
         loop {
-            let (compactor, worker) = match build_compactor(&path, &raw, codec, fast, cache_id, &label).await {
+            let started = std::time::Instant::now();
+            let built = build_compactor(&path, &raw, codec, fast, cache_id, &label).await;
+            let (compactor, worker) = match built {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(%path, "compaction worker failed to start: {e}");
-                    return;
+                    if !restart_after_error(&path, &mut closed_watch, &mut backoff, started, &e.to_string()).await {
+                        return;
+                    }
+                    continue;
                 }
             };
             // SlateDB marks the DB closed *before* its final memtable flush,
@@ -1328,9 +1334,16 @@ fn spawn_compactor(
                 let _ = tokio::time::timeout(CLOSE_GRACE, gone).await;
             };
             let mut switch = false;
+            let mut failed = None;
             tokio::select! {
-                r = compactor.run() => if let Err(e) = r { tracing::warn!(%path, "compactor exited: {e}") },
-                r = worker.run() => if let Err(e) = r { tracing::warn!(%path, "compaction worker exited: {e}") },
+                r = compactor.run() => failed = Some(match r {
+                    Err(e) => format!("compactor exited: {e}"),
+                    Ok(()) => "compactor exited".to_string(),
+                }),
+                r = worker.run() => failed = Some(match r {
+                    Err(e) => format!("compaction worker exited: {e}"),
+                    Ok(()) => "compaction worker exited".to_string(),
+                }),
                 _ = closed => {}
                 _ = mode_change(&watch, fast), if polling == CompactionPolling::Adaptive => switch = true,
             }
@@ -1338,6 +1351,12 @@ fn spawn_compactor(
             // restarted worker picks them up again
             let _ = compactor.stop().await;
             let _ = worker.stop().await;
+            if let Some(e) = failed {
+                if !restart_after_error(&path, &mut closed_watch, &mut backoff, started, &e).await {
+                    return;
+                }
+                continue;
+            }
             if !switch {
                 return;
             }
@@ -1346,6 +1365,48 @@ fn spawn_compactor(
             tracing::debug!(%path, fast, "compaction polling switched");
         }
     });
+}
+
+const COMPACTOR_RESTART_MIN: Duration = Duration::from_secs(1);
+const COMPACTOR_RESTART_MAX: Duration = Duration::from_secs(60);
+/// A compactor that ran this long before failing starts its backoff over.
+const COMPACTOR_HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+/// Sleeps the backoff before a compactor restart; false if the DB closed
+/// meanwhile (or before), when the task should end instead. A dead compactor
+/// otherwise lets L0 grow until writes stall.
+async fn restart_after_error(
+    path: &str,
+    watch: &mut tokio::sync::watch::Receiver<slatedb::DbStatus>,
+    backoff: &mut Duration,
+    started: std::time::Instant,
+    err: &str,
+) -> bool {
+    if db_closed(watch) {
+        return false;
+    }
+    if started.elapsed() >= COMPACTOR_HEALTHY_RUN {
+        *backoff = COMPACTOR_RESTART_MIN;
+    }
+    let delay = *backoff;
+    *backoff = (delay * 2).min(COMPACTOR_RESTART_MAX);
+    tracing::warn!(%path, delay_ms = delay.as_millis() as u64, "compaction stopped, restarting: {err}");
+    crate::metrics::COMPACTOR_RESTARTS.inc();
+    let closed = async {
+        while !db_closed(watch) {
+            if watch.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => !db_closed(watch),
+        _ = closed => false,
+    }
+}
+
+fn db_closed(watch: &tokio::sync::watch::Receiver<slatedb::DbStatus>) -> bool {
+    watch.borrow().close_reason.is_some()
 }
 
 /// While the writer's L0 runs deep, re-reads its manifest every
@@ -1661,6 +1722,35 @@ mod tests {
             Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes())
         );
         db.close().await.unwrap();
+    }
+
+    /// A failed compactor waits out a doubling backoff that a long run
+    /// resets, and gives up once the DB is closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compactor_restart_backoff() {
+        let store = Store { prefix: "compact-backoff".into(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        let mut watch = db.subscribe();
+        let before = crate::metrics::COMPACTOR_RESTARTS.get();
+        let mut backoff = COMPACTOR_RESTART_MIN;
+        let now = std::time::Instant::now();
+        for want in [2, 4] {
+            assert!(restart_after_error("p", &mut watch, &mut backoff, now, "boom").await);
+            assert_eq!(backoff, Duration::from_secs(want));
+        }
+        let long_ago = now - COMPACTOR_HEALTHY_RUN;
+        assert!(restart_after_error("p", &mut watch, &mut backoff, long_ago, "boom").await);
+        assert_eq!(backoff, COMPACTOR_RESTART_MIN * 2);
+        assert!(crate::metrics::COMPACTOR_RESTARTS.get() >= before + 3);
+        backoff = COMPACTOR_RESTART_MAX;
+        let sleeping = tokio::spawn({
+            let mut watch = watch.clone();
+            async move { restart_after_error("p", &mut watch, &mut backoff, now, "boom").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        db.close().await.unwrap();
+        assert!(!tokio::time::timeout(Duration::from_secs(5), sleeping).await.unwrap().unwrap());
+        assert!(!restart_after_error("p", &mut watch, &mut backoff, now, "boom").await);
     }
 
     /// Counts GETs of SST objects.
