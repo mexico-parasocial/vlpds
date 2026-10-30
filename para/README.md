@@ -1,16 +1,19 @@
 # PARA sobre vlpds
 
 El backend de PARA con [vlpds](https://vlpds.jazco.dev/docs/overview) como
-PDS, en el fork `mexico-parasocial/vlpds`. Esta carpeta no contiene código de
-servicios: une los de cada repo (WatZappa, mubEZ, PARA) y agrega solo lo que
+PDS, en el fork `mexico-parasocial/vlpds`. Esta carpeta coordina los servicios
+de WatZappa, mubEZ y PARA y agrega lo que
 pertenece a la plataforma: perfiles, secretos, el edge, el relay, respaldos,
-monitoreo y diagnóstico. No cambia nada de WatZappa.
+monitoreo y diagnóstico. Las extensiones de escritura de PARA viven en Rust
+en `src/xrpc/para/`; sus contratos se mantienen en los lexicons de WatZappa.
 
 > **Dos variantes conviven.** Esta es la de vlpds. La tradicional, con el PDS
 > en TypeScript de WatZappa, está en [docs/tradicional/](docs/tradicional/README.md).
 > En qué se diferencian y qué falta en vlpds: [docs/VLPDS.md](docs/VLPDS.md).
-> Lo más importante: **las escrituras propias de PARA (`com.para.*`) todavía no
-> funcionan con vlpds**.
+> El fork incorpora comandos nativos, invitaciones con firma del creador,
+> factores iM8 independientes y estado alpha durable. **La migración de usuarios
+> existentes sigue cerrada hasta completar la validación integral**; ver
+> [escrituras nativas](docs/NATIVE-PARA-WRITES.md) antes de migrar usuarios.
 
 ```
                          internet (80/443)
@@ -55,7 +58,7 @@ cp .env.example .env     # PARA_DOMAIN, bucket, perfil
 sudo make secrets        # incluida la KEK y la llave PLC envuelta; guarda las offline
 make matrix-init         # una vez, si usas Matrix
 make preflight BUILD=1
-make up BUILD=1          # construye las imágenes de WatZappa y del relay aquí
+make up BUILD=1          # construye el fork Rust, WatZappa y el relay aquí
 make verify
 make invite              # la primera cuenta
 ```
@@ -75,6 +78,8 @@ make invite              # la primera cuenta
 | | |
 | --- | --- |
 | **[Libreto](docs/LIBRETO.md)** | Cada comando, en orden, con lo que debe salir; lo que hay que saber cada vez; las herramientas de DX |
+| [vlRelay](docs/vlrelay.md) | El relay por defecto: identidad y transporte, bucket, pruebas, cambio desde rsky |
+| [Relay Rust de rsky](docs/RSKY-RELAY.md) | La alternativa (`PARA_RELAY=rsky`): fuente fijada, parche PARA, estado durable |
 | [vlpds frente a tradicional](docs/VLPDS.md) | Qué cambia, la brecha de `com.para.*`, por qué el relay, el fork, Spaces |
 | [Desarrollo](docs/DESARROLLO.md) | `make dev`, mubEZ y la app contra el entorno local |
 | [Despliegue](docs/DESPLIEGUE.md) | Una máquina de cero, a mano o con Ansible |
@@ -109,3 +114,7 @@ make invite              # la primera cuenta
   que se montan mientras su imagen no se pueda construir.
 - `make check` valida todo con Docker. Requiere Docker Compose v2.24 o
   superior (`include` con varios archivos y `!override`/`!reset`).
+
+El ensayo aislado y persistente del chat se opera con `make chat-staging-up`,
+`make chat-staging-verify` y `make chat-staging-smoke`. Ver
+[staging de chat](docs/CHAT-STAGING.md) para construcción, snapshots y gates.

@@ -39,7 +39,7 @@ esac
 profile="$(cfg PARA_PROFILE)"; profile="${profile:-tiny}"
 if [ -f "$HERE/profiles/$profile.env" ]; then ok "Perfil $profile"; else fail "No existe profiles/$profile.env" "PARA_PROFILE=tiny o standard"; fi
 for p in $(echo "$PROFILES" | tr ',' ' '); do
-  case "$p" in core|matrix|identity|edge|monitoring) ;; local-s3) warn "PROFILES incluye local-s3: es solo para pruebas" ;; *) fail "Perfil de Compose desconocido: $p" ;; esac
+  case "$p" in core|matrix|governance|identity|edge|monitoring) ;; local-s3) warn "PROFILES incluye local-s3: es solo para pruebas" ;; *) fail "Perfil de Compose desconocido: $p" ;; esac
 done
 versions="WATZAPPA_VERSION MUBEZ_VERSION"
 has_profile web && versions="$versions PARA_WEB_VERSION"
@@ -52,11 +52,47 @@ for v in $versions; do
     *) ok "$v=$tag" ;;
   esac
 done
-vimg="$(cfg VLPDS_IMAGE)"; vimg="${vimg:-ghcr.io/jazware/vlpds:1.1.0}"
+vimg="$(cfg VLPDS_IMAGE)"; vimg="${vimg:-para-vlpds:para-native-local}"
 case "${vimg##*:}" in
-  latest|main|"$vimg") fail "VLPDS_IMAGE=$vimg no es una versión fija" "Usa ghcr.io/jazware/vlpds:X.Y.Z" ;;
+  latest|main|"$vimg") fail "VLPDS_IMAGE=$vimg no es una versión fija" "Usa una imagen del fork nativo con tag inmutable" ;;
+  para-native-local) if [ "${BUILD:-0}" = 1 ]; then warn "VLPDS_IMAGE=$vimg: fork local (BUILD=1)"
+                      else fail "El fork nativo local debe compilarse" "Usa BUILD=1 o una imagen de CI con tag inmutable"; fi ;;
   *) ok "VLPDS_IMAGE=$vimg" ;;
 esac
+if [ "$(cfg VLPDS_PARA)" != false ]; then
+  case "$vimg" in
+    ghcr.io/jazware/vlpds:*|ghcr.io/jazware/vlpds@*) fail "La imagen upstream no implementa PARA" "Construye el fork nativo con BUILD=1 y usa un tag propio" ;;
+  esac
+fi
+relay="$(cfg PARA_RELAY)"; relay="${relay:-vlrelay}"
+if [ "$relay" = vlrelay ]; then
+  rimg="$(cfg VLRELAY_IMAGE)"; rimg="${rimg:-para-vlrelay:1.0.0}"
+  case "${rimg##*:}" in
+    main|latest|"$rimg") fail "VLRELAY_IMAGE=$rimg no es una versión fija" "Usa un tag semver (1.0.0) o sha-<commit>" ;;
+    *) ok "PARA_RELAY=vlrelay ($rimg, docs/vlrelay.md)" ;;
+  esac
+  # El default cambió de rsky a vlRelay: una instalación con estado de rsky
+  # no se pasa sola a otro espacio de cursores.
+  if [ -z "${PARA_RELAY_SET:-}" ] && docker volume inspect para_rsky_relay_data >/dev/null 2>&1; then
+    fail "Esta máquina ya corre rsky (volumen para_rsky_relay_data) y PARA_RELAY no está fijado" \
+      "PARA_RELAY=rsky en .env para seguir igual, o migra: docs/vlrelay.md, \"Cambiar de relay\""
+  fi
+  [ -n "$(cfg VLRELAY_S3_ENDPOINT)$(cfg S3_ENDPOINT)" ] \
+    || fail "vlRelay necesita S3_ENDPOINT" "Su estado vive en el bucket (S3_PREFIX/vlrelay)"
+  case "$(cfg RELAY_STREAM_ID)" in
+    rsky-*) fail "RELAY_STREAM_ID=$(cfg RELAY_STREAM_ID) es el espacio de cursores de rsky" \
+      "vlRelay usa otro (vlrelay-v1): docs/vlrelay.md, \"Cambiar de relay\"" ;;
+  esac
+else
+  rtag="$(cfg RELAY_VERSION)"; rtag="${rtag:-e96634e-para1}"
+  case "$rtag" in
+    main|latest|local) fail "RELAY_VERSION=$rtag no es inmutable" "Usa el tag de rsky con su parche PARA" ;;
+    *) ok "RELAY_VERSION=$rtag (rsky, relay/source.env)" ;;
+  esac
+fi
+if [ -n "$(cfg RELAY_COMMIT)" ]; then
+  fail "RELAY_COMMIT pertenece al despliegue anterior de Indigo" "Migra siguiendo docs/RSKY-RELAY.md; rsky se fija en relay/source.env"
+fi
 for v in S3_BUCKET S3_PREFIX; do
   if [ -n "$(cfg "$v")" ]; then ok "$v=$(cfg "$v")"; else fail "$v vacío" "El bucket es donde vive el estado; defínelo en .env"; fi
 done
@@ -90,10 +126,38 @@ if has_profile matrix; then
     fail "MAS está configurado para localhost: nadie fuera de la máquina podrá iniciar sesión en el chat" \
       "docs/MATRIX.md, \"MAS generado para localhost\""
   fi
+  mas_config="$WATZAPPA_DIR/deploy/matrix/mas/config.yaml"
+  if [ -f "$mas_config" ] && { ! grep -q '01K3ZQD8N7P0J5R2T9V4W6X8YD' "$mas_config" || ! grep -q 'name: adminapi' "$mas_config"; }; then
+    fail "MAS necesita el cliente privado de revocación; borrar dispositivos solo en Synapse no cierra refresh tokens" \
+      "Conservar llaves y preparar la actualización: docs/CHAT-STAGING.md, Revocación y configuración existente"
+  fi
   [ -f "$WATZAPPA_DIR/deploy/matrix/synapse/element-config.json" ] ||
     warn "Element usará la config versionada (matrix.para.social)" "make matrix-init la genera para $DOMAIN"
   [ -f "$WATZAPPA_DIR/deploy/matrix/synapse/para-bridge-registration.yaml" ] ||
     warn "No hay registro del appservice del bridge: Synapse no le empujará eventos" "docs/MATRIX.md, \"Registro del appservice\""
+fi
+
+# El bridge se construye desde WATZAPPA_DIR (BUILD=1) y su compose sale de ahí:
+# tiene que ser un checkout con lo que piden los perfiles.
+bridge_src="$WATZAPPA_DIR/services/matrix-bridge/src"
+if has_profile matrix || has_profile governance; then
+  missing_code=""
+  if has_profile matrix && [ ! -f "$bridge_src/mas-admin.ts" ]; then
+    missing_code="$missing_code revocación en MAS (mas-admin.ts)"
+  fi
+  if has_profile governance && [ ! -f "$bridge_src/chat-mode.ts" ]; then
+    missing_code="$missing_code modo sin chat (chat-mode.ts)"
+  fi
+  if [ -z "$missing_code" ]; then ok "El bridge de WATZAPPA_DIR tiene lo que piden los perfiles"
+  elif [ "${BUILD:-0}" = 1 ]; then
+    fail "El bridge de $WATZAPPA_DIR no tiene:$missing_code" "Apunta WATZAPPA_DIR al checkout al día (.env.example)"
+  else
+    warn "El checkout de $WATZAPPA_DIR no tiene:$missing_code; la imagen WATZAPPA_VERSION tiene que traerlo" "Apunta WATZAPPA_DIR al checkout al día (.env.example)"
+  fi
+fi
+
+if has_profile governance && ! has_profile matrix; then
+  ok "Chat apagado: el bridge sirve solo gobernanza (docs/MATRIX.md, \"Sin chat\")"
 fi
 
 # --- 2 -----------------------------------------------------------------------------

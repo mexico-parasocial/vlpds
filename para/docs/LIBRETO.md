@@ -45,9 +45,9 @@ Si no están así, pon sus rutas en `.env` (`WATZAPPA_DIR`, `MUBEZ_DIR`,
 
 **Lo que hay que saber cada vez que la levantas:**
 
-1. **Las escrituras `com.para.*` no funcionan con vlpds** (crear comunidad,
-   unirse, votar, factor de correo…). Es una brecha conocida, no un fallo de
-   tu entorno: [VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara).
+1. **El fork nativo implementa nueve comandos de repositorio**; todavía faltan
+   invitaciones de fundadores, factores iM8, alpha y un import revisado. La
+   imagen upstream no contiene estos handlers: [VLPDS.md §3](VLPDS.md#3-escrituras-nativas-y-brechas-pendientes).
 2. **El AppView y el bridge leen del relay, no de vlpds.** Si el AppView no
    indexa, lo primero es ver si el relay sigue a vlpds (pasos 2.3 y 5.6).
 3. **Nada persiste en `make dev`**: vlpds corre en memoria y Postgres en
@@ -114,7 +114,7 @@ documentos DID funcionan en todas partes.
 make dev
 ```
 
-La primera vez construye el PLC y el relay desde sus commits fijados (unos
+La primera vez construye el PLC y vlRelay desde sus commits fijados (unos
 minutos) y bsync desde WatZappa `main` (~2 min). Las siguientes, segundos.
 
 **Debe salir:**
@@ -124,7 +124,7 @@ minutos) y bsync desde WatZappa `main` (~2 min). Las siguientes, segundos.
 ✓ vlpds  http://localhost:2583/xrpc/_health
 ✓ AppView  http://localhost:2584/xrpc/_health
 ✓ relay  http://localhost:2470/xrpc/_health
-✓ el relay sigue el firehose de vlpds
+✓ vlRelay sigue el firehose de vlpds
 ```
 
 Si dice `Puertos ocupados`, hay otro entorno (de PARA tradicional o un
@@ -174,9 +174,10 @@ curl -s localhost:2583/xrpc/com.atproto.server.describeServer
 La consola de vlpds en desarrollo está en `http://localhost:2583/admin`, con
 el token `dev-admin-token` (solo en `--dev-mode`).
 
-### 2.4 La brecha de `com.para.*`
+### 2.4 Escrituras nativas de `com.para.*`
 
-Para ver con tus ojos lo que falta en vlpds (y comprobar cuándo se resuelva):
+El fork local implementa los comandos de repositorio. Este ejemplo comprueba
+que la validación ocurre en el PDS, aun con la cabecera de proxy:
 
 ```bash
 PDS=http://localhost:2583
@@ -186,13 +187,16 @@ jwt=$(curl -sf $PDS/xrpc/com.atproto.server.createAccount -H 'content-type: appl
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["accessJwt"])')
 P='atproto-proxy: did:web:localhost%3A2584#bsky_appview'
 
-# Una escritura de PARA: hoy 400 (el AppView no la tiene; sin la cabecera, 501)
+# Una escritura PARA sin communityUri: 400 InvalidRequest del PDS nativo
 curl -s -w ' %{http_code}\n' -X POST $PDS/xrpc/com.para.community.join \
   -H "authorization: Bearer $jwt" -H "$P" -H 'content-type: application/json' -d '{}'
 
 # Una lectura de PARA: 200 (el AppView sí la tiene)
 curl -s -w ' %{http_code}\n' $PDS/xrpc/com.para.feed.getTimeline -H "authorization: Bearer $jwt" -H "$P"
 ```
+
+Las brechas de compatibilidad que quedan están en
+[Escrituras nativas](NATIVE-PARA-WRITES.md).
 
 ### 2.5 Apagar
 
@@ -264,7 +268,7 @@ services:
 ```bash
 O=$(dirname $T)/override.yaml
 c() { env -i PATH="$PATH" HOME="$HOME" DOCKER_CONFIG="$HOME/.docker" \
-  COMPOSE_PROJECT_NAME=para-prodtest PARA_DOMAIN=para.test \
+  COMPOSE_PROJECT_NAME=para-prodtest PARA_DOMAIN=para.test PARA_RELAY=rsky \
   S3_BUCKET=para-test S3_ENDPOINT=http://s3-local:8333 S3_REGION=us-east-1 \
   PARA_PROFILE=tiny PARA_SECRETS_DIR=$T PROFILES=core,local-s3 \
   POSTGRES_PORT=55432 VLPDS_ADMIN_PORT=52620 PDS_CRAWLERS_EXTRA= \
@@ -297,7 +301,7 @@ docker run --rm --network para-prodtest_default \
   -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli:2.27.0 \
   --endpoint-url http://s3-local:8333 s3 ls s3://para-test/prod/ --recursive | head
 
-# Un respaldo de Postgres: una línea por base (para, relay, matrix, mas, bridge)
+# Un respaldo de Postgres: una línea por base (para, matrix, mas, bridge)
 docker exec para-prodtest-backup-1 backup.sh once
 
 # El documento DID del AppView y la descripción de vlpds
@@ -305,9 +309,10 @@ docker exec para-prodtest-bsky-1 wget -qO- http://127.0.0.1:2584/.well-known/did
 docker exec para-prodtest-pds-1 curl -s http://127.0.0.1:2583/xrpc/com.atproto.server.describeServer
 ```
 
-En esta prueba vlpds **no** avisa al relay: `pds.para.test` termina en `.test`
-y vlpds no pide que rastreen una dirección local. Es lo esperado; en
-producción sí lo hace.
+Este ensayo usa rsky (`PARA_RELAY=rsky`): se suscribe al PDS por la red de
+Docker y no depende de que `pds.para.test` sea rastreable desde internet.
+vlRelay, el relay por defecto, rechaza `.test` (un TLD reservado) y lee vlpds
+por el edge público, que aquí no existe ([vlrelay.md](vlrelay.md)).
 
 **4.6 Apagar y borrar todo:**
 
@@ -489,7 +494,7 @@ envuelta, arranca donde quedó ([Respaldos](RESPALDOS.md)).
 | `make relay-add-pds` | Vuelve a pedir al relay que siga a vlpds |
 | `make matrix-init` | Genera la configuración de Synapse, MAS, Element y el appservice para `PARA_DOMAIN` |
 | `make matrix-admin-token` | Usuario admin de Synapse para el bridge y su token en `secrets/` |
-| `make db-init` | Crea las bases compartidas (matrix, mas, bridge, relay) en un Postgres que ya existía |
+| `make db-init` | Crea las bases compartidas (matrix, mas, bridge) en un Postgres que ya existía |
 | `make backup` / `make restore` / `make restore-media` | Respaldo inmediato / restaurar Postgres / restaurar el media de Synapse |
 | `make app-env` | Las variables para compilar la app PARA contra este dominio |
 | `make login-preflight WEB_ORIGIN=…` | Revisa el login de mubEZ sin emitir tokens |
@@ -512,11 +517,11 @@ Lo que trabaja por ti sin que lo pidas:
 
 | Síntoma | Causa | Qué hacer |
 |---|---|---|
-| La app no puede crear comunidades, unirse ni votar | Las escrituras `com.para.*` no existen en vlpds | Ninguno por ahora: [VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara) |
+| Las rutas de repositorio PARA fallan | Imagen upstream, flag nativo apagado o AppView/verificador sin configurar | Usa el fork con VLPDS_PARA=true; [VLPDS.md §3](VLPDS.md#3-escrituras-nativas-y-brechas-pendientes) |
 | El AppView no indexa nada | El relay no sigue a vlpds | `curl -s localhost:2470/xrpc/com.atproto.sync.listHosts` (local) o `make verify`; `make relay-add-pds` |
 | `error in firehose event lexicon validation: Expected integer … at $.seq` | Algo lee el firehose de vlpds directo | Apúntalo al relay (`ws://relay:2470`) |
 | `--crawlers entry ignored: … not a fully qualified hostname` | Un crawler sin punto en el nombre | Usa `relay.para.internal` (el alias del relay) |
-| El relay responde `HostNotFound … not a public IP address` | El relay solo acepta hosts públicos | Normal en local: `make dev` lo registra por la base. En producción, revisa el DNS de `pds.` |
+| El relay rechaza `requestCrawl` | El hostname no coincide con `RELAY_PDS_HOST` | Revisar el dominio configurado; solo se permite el PDS de esta plataforma |
 | `make up BUILD=1` falla en `oauth-provider-ui` con `Cannot find native binding` | El problema de rolldown en WatZappa | Espera el arreglo (rama `fix/pnpm-devengines-node-range`) o usa imágenes ya construidas |
 | vlpds se reinicia con exit 2–9 | Se detiene a propósito ante fallos (lease perdido, bucket inaccesible) | `make logs S=pds`; Docker lo vuelve a levantar. Tras un SIGKILL no escribe durante ~un lease (60 s en tiny) |
 | `budget is … MiB … Lower the cache flags` | Menos de 2 GB para vlpds | Sube `VLPDS_MEM` |

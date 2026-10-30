@@ -104,6 +104,65 @@ persona. En la app va detrás de `EXPO_PUBLIC_MATRIX_DMS=1` ([App](APP.md)).
 salas cifradas, que es lo que exige el chat nativo de PARA
 (`ENCRYPTED_ROOM_REQUIRED`). No cifra salas que ya existen.
 
+## Sin chat
+
+PARA puede salir sin Matrix y conservar la gobernanza. El matrix-bridge no es
+solo chat: también sirve constitución, propuestas y decisiones, sorteo (drand),
+reportes, sanciones y panel de moderación, insignias y extracción. Con el
+perfil `governance` en lugar de `matrix` corre solo:
+
+```bash
+PROFILES=core,governance,identity,edge   # más web si la sirves aquí
+make up
+```
+
+- No se levantan Synapse, MAS, para-idp, Element ni el respaldo de su media.
+  No hace falta `make matrix-init` ni los secretos `matrix_*` /
+  `mas_bridge_admin_secret`.
+- El Makefile aplica `overrides/bridge-chat-off.yaml`: el bridge arranca con
+  `MATRIX_CHAT_ENABLED=false`, sin cliente de admin, sin sondeo de salas, sin
+  trabajos de Matrix en el reintento y sin barrido de leases.
+- Las rutas de chat (`/api/matrix-*`, `/api/community-join`, `/api/rooms`,
+  `/api/unread`, `/api/mark-read`, `/api/space-for-community`,
+  `/api/dm-requests*`, `/api/devices*`, el push gateway y las transacciones del
+  appservice) responden `503 {"error":"CHAT_DISABLED"}`. `/api/push-token`
+  sigue guardando el token de Expo: con él se avisa a quien sale sorteado.
+- La app web que construye la plataforma recibe `EXPO_PUBLIC_CHAT_ENABLED=false`
+  sola (sale de `PROFILES`). Las builds nativas lo necesitan en su entorno de
+  EAS: ocultan chat, mensajes directos y contadores de no leídos, y dejan las
+  pantallas de gobernanza.
+- La imagen del bridge (`WATZAPPA_VERSION`) tiene que incluir este modo. Con
+  `BUILD=1` se construye desde `WATZAPPA_DIR`, que tiene que apuntar a un
+  checkout que lo tenga; `make preflight` lo revisa (ver `.env.example`).
+
+### Encender el chat después
+
+1. Prepara Matrix como en [Primera vez](#primera-vez): `make matrix-init`, la
+   migración de MAS y `make matrix-admin-token`.
+2. Pon `matrix` en `PROFILES` (`governance` puede quedarse o salir) y
+   `make up UP_ARGS=--force-recreate`.
+3. **Cada comunidad creada con el chat apagado necesita su espacio y sus
+   salas.** El bridge las guardó con una fila de gobernanza en
+   `community_space_map` (`space_id` = `para-unprovisioned:<uri>`, sin salas)
+   y una entrada `create_space` fallida en `sync_log`. Con el chat encendido,
+   el trabajo de reintento de creación de salas (`RetryWorker`, cada 60 s, sin
+   límite de intentos para `create_space`) las provisiona desde el registro
+   actual en el PDS. Comprueba que no quede ninguna:
+
+   ```sql
+   -- en la base bridge
+   SELECT community_uri FROM community_space_map
+   WHERE space_id LIKE 'para-unprovisioned:%';
+   ```
+
+   Si alguna queda sin entrada en `sync_log`, provisiónala con
+   `services/matrix-bridge/src/backfill.ts` de WatZappa, que también toma las
+   filas sin salas. Mientras no tenga salas, sus rutas de chat responden
+   `404 Space not found`.
+4. Reconstruye la app con `EXPO_PUBLIC_CHAT_ENABLED=true` (la web, con el
+   siguiente `make up`; las nativas, con una build nueva). Los miembros
+   entran a las salas con el join verificado al abrir el chat.
+
 ## Problemas conocidos
 
 ### MAS generado para localhost

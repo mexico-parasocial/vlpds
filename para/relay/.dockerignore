@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!source.env
+!prepare.sh
+!patches/
+!patches/**

@@ -35,11 +35,11 @@ abs_dir() { (cd "$HERE" && cd "$1" 2>/dev/null && pwd) || echo "$1"; }
 #   offline: yes = no vive en el bucket y perderlo no tiene arreglo; respáldalo
 #            fuera de la máquina (docs/RESPALDOS.md)
 #   perfil:  check solo exige los secretos de los perfiles de PROFILES
+#            (varios separados por +: basta con uno)
 SPEC='
 postgres_password|hex|no|Contraseña de Postgres (usuario POSTGRES_USER)|core
 postgres_url|derived|no|URL de Postgres para AppView, dataplane, bsync y Ozone|core
-postgres_url_bridge|derived|no|URL de Postgres (base bridge) para el matrix-bridge|matrix
-postgres_url_relay|derived|no|URL de Postgres (base relay) para el relay|core
+postgres_url_bridge|derived|no|URL de Postgres (base bridge) para el matrix-bridge|matrix+governance
 s3_access_key_id|provided|no|Llave del bucket (vlpds, mubEZ/Litestream, respaldos)|core
 s3_secret_access_key|provided|no|Secreto del bucket|core
 vlpds_jwt_secret|hex|no|vlpds: firma de sesiones|core
@@ -63,6 +63,7 @@ m8_curp_pepper|hex|yes|mubEZ: pepper de los hashes de CURP. Perderlo rompe la de
 m8_civic_vote_proof_secret|hex|no|mubEZ: autorizaciones de voto público|identity
 m8_issuer_private_jwk|jwk|yes|mubEZ: llave privada del emisor de credenciales (Ed25519)|identity
 m8_issuer_public_jwk|jwk|no|mubEZ: llave pública del emisor|identity
+mas_bridge_admin_secret|hex|no|Cliente confidencial MAS para revocar sesiones nativas|matrix
 matrix_admin_token|provided|no|Token de administrador de Synapse para el bridge|matrix
 matrix_appservice_token|provided|no|as_token del appservice (registro del bridge)|matrix
 matrix_hs_token|provided|no|hs_token del appservice (registro del bridge)|matrix
@@ -70,7 +71,13 @@ matrix_hs_token|provided|no|hs_token del appservice (registro del bridge)|matrix
 
 names() { printf '%s\n' "$SPEC" | sed '/^$/d' | cut -d'|' -f1; }
 profiles() { local p; p="$(platform_env PROFILES)"; printf ',%s,' "${p:-core,matrix,identity,edge}"; }
-in_use() { case "$(profiles)" in *",$(field "$1" 5),"*) return 0 ;; esac; return 1; }
+in_use() {
+  local p
+  for p in $(field "$1" 5 | tr '+' ' '); do
+    case "$(profiles)" in *",$p,"*) return 0 ;; esac
+  done
+  return 1
+}
 field() { printf '%s\n' "$SPEC" | grep "^$1|" | cut -d'|' -f"$2"; }
 
 write_secret() { # write_secret NOMBRE VALOR
@@ -103,7 +110,6 @@ derive_urls() {
   chmod u+w "$DIR"/postgres_url* 2>/dev/null || true
   write_secret postgres_url "postgres://$user:$pw@postgres:5432/$db"
   write_secret postgres_url_bridge "postgres://$user:$pw@postgres:5432/bridge"
-  write_secret postgres_url_relay "postgres://$user:$pw@postgres:5432/relay"
 }
 
 gen_jwk() {
@@ -118,7 +124,7 @@ gen_jwk() {
   echo "  + m8_issuer_private_jwk, m8_issuer_public_jwk"
 }
 
-VLPDS_IMAGE="${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}"
+VLPDS_KEY_IMAGE="${VLPDS_KEY_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}"
 
 # wrap_plc_key [HEX]: envuelve con la KEK una llave de rotación PLC (la que
 # se pasa, o una nueva) usando la imagen de vlpds. La KEK entra como archivo
@@ -128,7 +134,7 @@ wrap_plc_key() {
   [ -s "$DIR/vlpds_kek" ] || { echo "  ⚠️  falta vlpds_kek para envolver la llave PLC" >&2; return 1; }
   local out
   out="$(printf '%s' "${1:-}" | docker run --rm -i -v "$DIR/vlpds_kek:/run/kek:ro" -e VLPDS_KEK_FILE=/run/kek \
-    "$VLPDS_IMAGE" --wrap-plc-rotation-key 2>/dev/null)" || return 1
+    "$VLPDS_KEY_IMAGE" --wrap-plc-rotation-key 2>/dev/null)" || return 1
   case "$out" in vw1.*) ;; *) echo "  ⚠️  vlpds no devolvió una llave envuelta" >&2; return 1 ;; esac
   write_secret vlpds_plc_rotation_key "$out"
 }

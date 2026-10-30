@@ -6,8 +6,8 @@ proveedor. Los comandos, con lo que debe salir en cada uno, también están en
 el [libreto, paso 5](LIBRETO.md#5-producción-de-verdad).
 
 > Antes de mover usuarios reales a vlpds, lee
-> [VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara): las escrituras propias de
-> PARA todavía no funcionan con vlpds.
+> [VLPDS.md §3](VLPDS.md#3-escrituras-nativas-y-brechas-pendientes): las escrituras propias de
+> PARA todavía no alcanzan paridad completa: faltan invitaciones, iM8 y alpha.
 
 ## Qué necesitas
 
@@ -63,18 +63,22 @@ make verify
 
 Guarda ahora las llaves offline (`scripts/secrets.sh list`, columna OFFLINE).
 
-`BUILD=1` construye en la máquina las imágenes de WatZappa (desde el checkout
-de `../../WatZappa`) y la del relay (desde el commit fijado de indigo). La
+`BUILD=1` construye en la máquina el fork Rust, las imágenes de WatZappa
+(desde `../../WatZappa`) y, con `PARA_RELAY=rsky`, la de rsky (desde `relay/source.env`). La
+imagen de vlRelay se construye en cualquier `make up` desde el commit fijado. La
 imagen del AppView todavía no se construye por el problema de rolldown de
 WatZappa; hasta que se arregle, la plataforma no levanta completa en
 producción ([libreto, problemas conocidos](LIBRETO.md#9-problemas-conocidos)).
 
 ## El relay
 
-vlpds le pide al relay que lo rastree al arrancar (`VLPDS_CRAWLERS`), y el
-relay comprueba `https://pds.<dominio>` por la red pública antes de seguirlo.
-Por eso el DNS de `pds.` tiene que resolver desde la propia máquina. Si `make
-verify` dice que el relay no sigue a vlpds:
+vlRelay ([vlrelay.md](vlrelay.md)) sigue únicamente `pds.<dominio>` y lo lee
+como cualquier relay: `wss://pds.<dominio>` por el edge público. El servidor
+tiene que alcanzar su propia IP pública desde un contenedor (hairpin); `make
+verify` lo comprueba. Un servidor que ya corre rsky fija `PARA_RELAY=rsky`
+hasta migrar (preflight lo exige); ver [RSKY-RELAY.md](RSKY-RELAY.md).
+
+Si `make verify` dice que el relay no sigue a vlpds:
 
 ```bash
 make relay-add-pds

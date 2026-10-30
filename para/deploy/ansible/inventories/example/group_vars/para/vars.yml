@@ -19,6 +19,10 @@ para_env:
   S3_REGION: auto
   S3_BUCKET: para-example
   S3_PREFIX: prod
+  # El relay es vlRelay (docs/vlrelay.md). Un servidor que ya corre rsky lo
+  # fija hasta migrar (otro espacio de cursores):
+  # PARA_RELAY: rsky
+  # RELAY_STREAM_ID: rsky-relay-v1
   # ADMIN_DIDS: did:plc:...
   # PARA_METRICS_URL: http://100.64.0.5:9090/api/v1/write   (y agrega monitoring a PROFILES)
   # PARA_LOGS_URL: http://100.64.0.5:3100/loki/api/v1/push

@@ -9,7 +9,8 @@ make backup          # Postgres: hay migraciones de una sola vía en el AppView,
 ```
 
 **vlpds.** Cambia `VLPDS_IMAGE` en `.env` a la versión nueva (siempre un tag
-fijo, nunca `latest`) y `make up`. vlpds se detiene en ~0.25 s y arranca en
+fijo del fork nativo, nunca la imagen upstream ni `latest`) y `make up`.
+Al cambiar el código local, usa `make up BUILD=1`. vlpds se detiene en ~0.25 s y arranca en
 ~1.3 s; Caddy reintenta 10 s, así que se nota como unos segundos de espera.
 Lee antes las notas de la versión: vlpds tiene **niveles de funciones**
 (feature levels) que se activan después de actualizar todos los nodos, y
@@ -30,9 +31,14 @@ Con imágenes publicadas por CI sería `make upgrade WATZAPPA_VERSION=sha-<commi
 que escribe el tag en `.env` (rechaza `main`, `latest` y vacío), descarga,
 recrea solo lo que cambió y corre `make verify`.
 
-**El relay.** `RELAY_COMMIT` (un commit de indigo) y `RELAY_VERSION` (el tag
-de la imagen local) en `.env`, luego `make up BUILD=1`. Su estado (hosts y
-cursores en Postgres, 72 h de eventos en disco) se conserva.
+**El relay.** vlRelay se fija por commit en `overrides/relay-vlrelay.yaml`
+(`para-vlrelay:1.0.0`); `make up` construye la imagen. Conservar el prefijo
+`S3_PREFIX/vlrelay` y `RELAY_STREAM_ID` en actualizaciones compatibles. Una
+instalación con `PARA_RELAY=rsky` fija rsky con su parche en
+`relay/source.env` (`RELAY_VERSION`, `make up BUILD=1`) y conserva
+`rsky_relay_data`. Pasar de rsky a vlRelay: [vlrelay.md](vlrelay.md#cambiar-de-relay). Migrar desde Indigo exige otro espacio de cursores: seguir
+[RSKY-RELAY.md](RSKY-RELAY.md), conservar la base/volumen antiguos y probar
+los consumidores aislados antes del corte.
 
 **El fork.** `git pull` en el fork trae los cambios de `para/` y, por la
 sincronización diaria, los de upstream.
@@ -54,8 +60,10 @@ make verify
 ## De la variante tradicional a vlpds
 
 Pasar un despliegue con el PDS en TypeScript a vlpds. **Hazlo solo cuando la
-brecha de `com.para.*` esté resuelta** ([VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara)):
-con vlpds, hoy la app no puede crear comunidades, unirse ni votar.
+brecha de `com.para.*` esté resuelta** ([VLPDS.md §3](VLPDS.md#3-escrituras-nativas-y-brechas-pendientes)):
+el fork ya implementa comunidades, membresía y votos, pero aún faltan las
+invitaciones, los factores iM8, alpha y un import revisado. Ver
+[Escrituras nativas](NATIVE-PARA-WRITES.md).
 
 ### Qué se conserva y qué no
 
@@ -107,7 +115,7 @@ perfiles), lo que cambia al pasar a `vlpds/para`:
   `para/platform`.
 - `overrides/core.yaml` ya no existe: el núcleo es `core.yaml`, propio.
 - Los secretos del PDS (`pds_*`) se reemplazan por los de vlpds (`vlpds_*`),
-  más `bsync_api_key`, `relay_admin_password` y `postgres_url_relay`.
+  más `bsync_api_key` y `relay_admin_password`.
 - Ya no hay respaldo del PDS ni volumen `pds_data`.
 - `make dev` ya no corre el entorno de WatZappa: levanta vlpds en Docker. El
   de WatZappa sigue en `make run-dev-env` ([tradicional/LIBRETO.md](tradicional/LIBRETO.md)).

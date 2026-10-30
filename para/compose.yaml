@@ -8,7 +8,9 @@
 # Perfiles (se eligen con `make up PROFILES=...`):
 #   core       vlpds, relay, AppView (bsky + dataplane), bsync, Ozone,
 #              Postgres, Redis, respaldos al bucket
-#   matrix     Synapse, MAS, para-idp, Element, matrix-bridge
+#   matrix     Synapse, MAS, para-idp, Element, matrix-bridge (con chat)
+#   governance matrix-bridge sin chat: gobernanza sin Synapse, MAS,
+#              para-idp ni Element (docs/MATRIX.md, "Sin chat")
 #   identity   mubEZ (broker M8: identidad, INE, ZKP)
 #   edge       Caddy: HTTPS y rutas públicas de todo lo anterior
 #   monitoring Alloy: métricas y logs hacia tu Prometheus/Loki
@@ -27,6 +29,8 @@ include:
   - path:
       - ${WATZAPPA_DIR:-../../WatZappa}/docker-compose.matrix.yaml
       - overrides/matrix.yaml
+      # El Makefile elige bridge-chat-off.yaml cuando matrix no está en PROFILES.
+      - ${PARA_BRIDGE_CHAT_OVERRIDE:-overrides/bridge-chat-on.yaml}
   - path:
       - ${MUBEZ_DIR:-../../mubEZ}/docker-compose.yml
       - overrides/identity.yaml

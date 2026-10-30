@@ -1,0 +1,107 @@
+diff --git a/rsky-relay/src/publisher/connection.rs b/rsky-relay/src/publisher/connection.rs
+index 60b1da3..7ef2625 100644
+--- a/rsky-relay/src/publisher/connection.rs
++++ b/rsky-relay/src/publisher/connection.rs
+@@ -72,6 +72,8 @@ impl Connection {
+         // subscriber catching up from an old cursor queues its whole backlog
+         // in memory; WriteBufferFull backpressure only exists below a cap.
+         let config = tungstenite::protocol::WebSocketConfig::default()
++            .max_message_size(Some(64 * 1024))
++            .max_frame_size(Some(64 * 1024))
+             .max_write_buffer_size(crate::config::PUBLISHER_MAX_WRITE_BUFFER);
+         let client = tungstenite::accept_with_config(stream, Some(config))?;
+         match client.get_ref() {
+@@ -111,6 +113,36 @@ impl Connection {
+     pub fn poll(
+         &mut self, mut seq: Cursor, firehose: &PartitionHandle,
+     ) -> Result<bool, ConnectionError> {
++        // subscribeRepos has no client data messages, but reading control
++        // frames is required: tungstenite queues pong/close replies on read.
++        // Bound work so a noisy subscriber cannot starve other connections.
++        for _ in 0..32 {
++            match self.client.read() {
++                Ok(Message::Ping(_) | Message::Pong(_)) => {}
++                Ok(Message::Close(_)) => {
++                    drop(self.client.flush());
++                    return Ok(false);
++                }
++                Ok(_) => {
++                    self.close(CloseFrame {
++                        code: CloseCode::Policy,
++                        reason: Utf8Bytes::from_static("UnexpectedClientMessage"),
++                    })?;
++                    return Ok(false);
++                }
++                Err(tungstenite::Error::Io(ref error))
++                    if error.kind() == io::ErrorKind::WouldBlock => break,
++                Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
++                    return Ok(false);
++                }
++                Err(error) => return Err(error.into()),
++            }
++        }
++        match self.client.flush() {
++            Ok(()) => {}
++            Err(ref error) if is_backpressure(error) => return Ok(true),
++            Err(error) => return Err(error.into()),
++        }
+         if self.cursor.get() != 0 && self.cursor.get() > seq.get() + 1 {
+             self.send(self.cursor, Bytes::from_static(FUTURE_MSG))?;
+             self.close(FUTURE_CLOSE)?;
+@@ -325,6 +357,43 @@ mod tests {
+         client.close(None).ok();
+     }
+ 
++    #[test]
++    fn idle_subscriber_receives_matching_heartbeat_pong_without_cursor_change() {
++        let (mut server, mut client) = ws_pair();
++        let (_tmp, ks) = open_test_keyspace();
++        let firehose = ks.open_partition("firehose", PartitionCreateOptions::default()).unwrap();
++        client.send(Message::Ping(Bytes::from_static(b"para-heartbeat"))).unwrap();
++        client.get_mut().set_nonblocking(true).unwrap();
++        let mut pong = None;
++        for _ in 0..100 {
++            assert!(server.poll(Cursor::from(0), &firehose).unwrap());
++            if let Ok(Message::Pong(payload)) = client.read() {
++                pong = Some(payload);
++                break;
++            }
++            thread::sleep(Duration::from_millis(2));
++        }
++        assert_eq!(pong, Some(Bytes::from_static(b"para-heartbeat")));
++        assert_eq!(server.cursor, Cursor::from(0));
++    }
++
++    #[test]
++    fn subscriber_close_is_processed_while_firehose_is_idle() {
++        let (mut server, mut client) = ws_pair();
++        let (_tmp, ks) = open_test_keyspace();
++        let firehose = ks.open_partition("firehose", PartitionCreateOptions::default()).unwrap();
++        client.close(None).unwrap();
++        let mut closed = false;
++        for _ in 0..100 {
++            if !server.poll(Cursor::from(0), &firehose).unwrap() {
++                closed = true;
++                break;
++            }
++            thread::sleep(Duration::from_millis(2));
++        }
++        assert!(closed);
++    }
++
+     #[test]
+     fn poll_with_future_cursor_closes_connection() {
+         let (mut server, mut client) = ws_pair();
+diff --git a/rsky-relay/src/publisher/worker.rs b/rsky-relay/src/publisher/worker.rs
+index 71d3873..136cef2 100644
+--- a/rsky-relay/src/publisher/worker.rs
++++ b/rsky-relay/src/publisher/worker.rs
+@@ -14,7 +14,7 @@ use crate::publisher::connection::{Connection, ConnectionError};
+ use crate::publisher::types::{Command, CommandReceiver};
+ use crate::types::{Cursor, DB};
+ 
+-const INTEREST: Interest = Interest::WRITABLE;
++const INTEREST: Interest = Interest::READABLE.add(Interest::WRITABLE);
+ 
+ #[derive(Debug, Error)]
+ pub enum WorkerError {

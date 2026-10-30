@@ -62,7 +62,7 @@ o con `tailscale serve` en la red privada, como recomienda vlpds.
 Con el perfil `monitoring`, Alloy manda a tu stack compatible con
 Prometheus/Loki (`PARA_METRICS_URL`, `PARA_LOGS_URL`) las métricas del host,
 de Postgres, del edge, del bridge, de los respaldos, de vlpds (`:9583`) y del
-relay (`:2471`), más los logs de todos los contenedores. Descubre las
+relay (`:2470` con vlRelay, `:2471` con rsky), más los logs de todos los contenedores. Descubre las
 métricas por la etiqueta `para.metrics.port` de cada servicio.
 
 Carga [ops/alerts.yml](../ops/alerts.yml) en tu Prometheus/Mimir; cada alerta

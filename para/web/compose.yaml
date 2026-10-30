@@ -18,6 +18,8 @@ services:
       args:
         EXPO_PUBLIC_ENV: production
         PARA_DOMAIN: ${PARA_DOMAIN:?Define PARA_DOMAIN en .env}
+        # false sin el perfil matrix (lo calcula el Makefile): sin chat.
+        EXPO_PUBLIC_CHAT_ENABLED: ${PARA_CHAT_ENABLED:-true}
     restart: unless-stopped
     environment:
       ATP_APPVIEW_HOST: https://appview.${PARA_DOMAIN}

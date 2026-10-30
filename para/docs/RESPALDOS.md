@@ -6,9 +6,11 @@
 | --- | --- | --- | --- |
 | vlpds: cuentas, repos, blobs, llaves de firma (envueltas), estado de moderación | El bucket, directo (`S3_PREFIX/vlpds`) | Cada commit es durable en el bucket antes de responder | Nada |
 | Base de mubEZ | Disco del contenedor, **solo caché** | Litestream, cada `LITESTREAM_SYNC_INTERVAL` (1 s) | ~1 s de cambios |
-| Postgres: `para` (AppView, bsync, Ozone), `relay`, `matrix`, `mas`, `bridge` | Volumen `postgres_data` | `pg_dump` cada `BACKUP_INTERVAL` | Hasta un intervalo |
+| Postgres: `para` (AppView, bsync, Ozone), `matrix`, `mas`, `bridge` | Volumen `postgres_data` | `pg_dump` cada `BACKUP_INTERVAL` | Hasta un intervalo |
 | Media de Synapse | Volumen `synapse_data` | Copia incremental cada `BACKUP_INTERVAL` | Hasta un intervalo |
-| Caché de vlpds, archivos de eventos del relay, Redis | Volúmenes y memoria | No hace falta: se reconstruyen | Nada que importe |
+| Estado de vlRelay (log, cuentas, hosts, cursores) | Bucket `S3_PREFIX/vlrelay` y commitlog en `vlrelay_data` | Lo durable está en el bucket (flush cada 30 s); sin el volumen se recupera de ahí con los mismos `seq`. Ver [vlrelay.md](vlrelay.md) | Hasta 30 s, que vlpds reenvía |
+| Estado rsky, solo con `PARA_RELAY=rsky` (SQLite, Fjall, contador, cola) | Volumen `rsky_relay_data` | Snapshot completo con relay detenido; ver [RSKY-RELAY.md](RSKY-RELAY.md) | Depende de la copia coherente con cursores de consumidores |
+| Caché de vlpds, Redis | Volúmenes y memoria | No hace falta: se reconstruyen | Nada que importe |
 | Las seis llaves offline | `secrets/` | **Nunca** al bucket | Todo, si no las respaldaste |
 
 El AppView se puede reconstruir entero: su base sale de indexar el firehose.
@@ -80,8 +82,9 @@ make restore ARGS="postgres para latest --force"  # o una fecha: 20261010T052901
 make up
 ```
 
-Sin `--force` se niega si la base tiene tablas. Para `relay`, detén el relay;
-para `bridge`, el bridge.
+Sin `--force` se niega si la base tiene tablas. Para `bridge`, detén el bridge. vlRelay se restaura solo desde el bucket.
+Con rsky, el relay se restaura como un volumen completo, con sus consumidores
+detenidos y checkpoints coherentes; ver [RSKY-RELAY.md](RSKY-RELAY.md).
 
 **vlpds**: no hay nada que restaurar. Con el mismo bucket, la misma KEK y la
 misma llave PLC envuelta, un vlpds nuevo arranca donde quedó el anterior (la
@@ -102,7 +105,9 @@ restaura solo desde el bucket. Nunca corras dos brokers con el mismo
    no, `make secrets` genera otros y habrá que cambiarlos donde se usan).
 3. `make preflight`, luego `make up PROFILES=core` sin el edge todavía.
    vlpds retoma su estado del bucket solo.
-4. Restaura Postgres (cada base). mubEZ se restaura solo.
+4. Restaura Postgres (cada base) antes de arrancar consumidores; vlRelay
+   retoma su log del bucket (con rsky, restaura también el snapshot coherente
+   de `rsky_relay_data`). mubEZ se restaura solo.
 5. Si usas Matrix, restaura su media: `make stop S=synapse` y
    `make restore-media`.
 6. `make up` con todos los perfiles, apunta el DNS y `make verify`.

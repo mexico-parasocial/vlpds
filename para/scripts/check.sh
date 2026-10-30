@@ -44,6 +44,10 @@ for profile in tiny standard; do
     PROFILES=core,matrix,identity,edge,monitoring,local-s3,web WATZAPPA_DIR="$WATZAPPA_DIR" MUBEZ_DIR="$MUBEZ_DIR" \
     make -s -C "$HERE" config
 done
+run "make config (sin chat: perfil governance)" env -i PATH="$PATH" HOME="$HOME" PARA_DIR="$PARA_DIR" \
+  PARA_DOMAIN=example.org S3_BUCKET=check PARA_SECRETS_DIR="$TMP/secrets" \
+  PROFILES=core,governance,identity,edge,web WATZAPPA_DIR="$WATZAPPA_DIR" MUBEZ_DIR="$MUBEZ_DIR" \
+  make -s -C "$HERE" config
 replicas="$(env -i PATH="$PATH" HOME="$HOME" PARA_DOMAIN=example.org S3_BUCKET=check PARA_PROFILE=standard \
   PARA_SECRETS_DIR="$TMP/secrets" WATZAPPA_DIR="$WATZAPPA_DIR" MUBEZ_DIR="$MUBEZ_DIR" \
   make -s -C "$HERE" compose ARGS="config --format json" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["bsky"]["deploy"]["replicas"])' 2>/dev/null)"

@@ -30,7 +30,7 @@ set -eu -o pipefail
 : "${S3_BUCKET:?falta S3_BUCKET}"
 : "${S3_PREFIX:?falta S3_PREFIX}"
 BACKUP_TARGETS="${BACKUP_TARGETS:-postgres}"
-BACKUP_DATABASES="${BACKUP_DATABASES:-para relay matrix mas bridge}"
+BACKUP_DATABASES="${BACKUP_DATABASES:-para matrix mas bridge}"
 BACKUP_INTERVAL="${BACKUP_INTERVAL:-6h}"
 BACKUP_RETENTION="${BACKUP_RETENTION:-14d}"
 METRICS_DIR=/srv/metrics

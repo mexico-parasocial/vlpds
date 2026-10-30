@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 077
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PARA — Matrix Authentication Service setup
@@ -53,9 +54,15 @@ echo "   MAS:      ${MAS_PUBLIC_BASE}"
 echo "   para-idp: ${PARA_IDP_PUBLIC_URL}"
 
 if [ -d "$MAS_DIR" ]; then
-    echo "⚠️  ${MAS_DIR} already exists. Delete it to regenerate."
+    echo "Existing MAS configuration preserved. Never delete it to upgrade: it holds encryption and signing keys."
+    echo "See VLPDS para/docs/CHAT-STAGING.md for the reviewed MAS admin-client upgrade."
     exit 0
 fi
+# A dedicated confidential service client closes native OAuth refresh sessions.
+# The same private value is mounted into the bridge; never put it in app builds.
+MAS_BRIDGE_CLIENT_ID="01K3ZQD8N7P0J5R2T9V4W6X8YD"
+MAS_BRIDGE_ADMIN_SECRET="${MAS_BRIDGE_ADMIN_SECRET:?Provide the private bridge MAS service-client secret}"
+[[ "$MAS_BRIDGE_ADMIN_SECRET" =~ ^[a-f0-9]{64}$ ]] || { echo 'MAS_BRIDGE_ADMIN_SECRET must be 64 lowercase hex characters' >&2; exit 2; }
 mkdir -p "$MAS_DIR"
 
 rand() { openssl rand -hex "${1:-32}"; }
@@ -105,6 +112,7 @@ http:
     - name: internal
       resources:
         - name: health
+        - name: adminapi
       binds:
         - host: 0.0.0.0
           port: 8081
@@ -131,6 +139,13 @@ clients:
   - client_id: ${SYNAPSE_CLIENT_ID}
     client_auth_method: client_secret_basic
     client_secret: ${SYNAPSE_CLIENT_SECRET}
+  - client_id: ${MAS_BRIDGE_CLIENT_ID}
+    client_auth_method: client_secret_basic
+    client_secret: ${MAS_BRIDGE_ADMIN_SECRET}
+
+policy:
+  data:
+    admin_clients: ["${MAS_BRIDGE_CLIENT_ID}"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The PARA identity provider.

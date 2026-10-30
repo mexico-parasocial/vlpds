@@ -5,7 +5,9 @@
 #   pds        vlpds. Todo su estado vive en el bucket (S3_PREFIX/vlpds); el
 #              disco es solo caché. Se llama `pds` para que el resto de la
 #              plataforma (edge, mubEZ, bridge) no tenga que saber cuál PDS es.
-#   relay      relay de indigo entre vlpds y los consumidores en TypeScript.
+#   relay      relay de rsky (Rust) entre vlpds y los consumidores en TypeScript.
+#              Por defecto el Makefile lo reemplaza por vlRelay
+#              (overrides/relay-vlrelay.yaml); PARA_RELAY=rsky deja este.
 #              vlpds numera su firehose con unix_micros × 256 + escritor (sin
 #              secuenciador global), y esos seq pasan de 2^53: @atproto/sync
 #              los rechaza. El relay los vuelve a numerar (docs/VLPDS.md).
@@ -97,7 +99,10 @@ services:
 
   pds:
     profiles: [core]
-    image: ${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}
+    image: ${VLPDS_IMAGE:-para-vlpds:para-native-local}
+    build:
+      context: ${PLATFORM_DIR:?Ejecuta con make desde para/}/..
+      dockerfile: Dockerfile
     restart: unless-stopped
     <<: *secrets-reader
     labels:
@@ -123,6 +128,7 @@ services:
       - path: ${PLATFORM_DIR}/env/vlpds.env
         required: false
     environment:
+      VLPDS_PARA: ${VLPDS_PARA:-true}
       VLPDS_PUBLIC_URL: https://pds.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}
       VLPDS_SERVICE_DID: did:web:pds.${PARA_DOMAIN}
       # Los handles de usuario: alice.<dominio> (PARA_HANDLE_DOMAIN sin el
@@ -205,43 +211,44 @@ services:
   relay:
     profiles: [core]
     build:
-      context: https://github.com/bluesky-social/indigo.git#${RELAY_COMMIT:-162dca49278b59fef7745f72ae7b641dc27f4d83}
-      dockerfile: cmd/relay/Dockerfile
-      args:
-        # Su Dockerfile llama a git describe.
-        BUILDKIT_CONTEXT_KEEP_GIT_DIR: '1'
-    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/indigo-relay:${RELAY_VERSION:-162dca4}
+      context: ${PLATFORM_DIR:?Ejecuta con make desde para/}/relay
+      dockerfile: Dockerfile
+    image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/rsky-relay:${RELAY_VERSION:-e96634e-para1}
     restart: unless-stopped
     <<: [*secrets-reader]
     labels:
       para.metrics.port: '2471'
     environment:
-      DATABASE_URL_FILE: /run/secrets/postgres_url_relay
-      RELAY_API_BIND: ':2470'
-      RELAY_METRICS_LISTEN: ':2471'
-      RELAY_PLC_HOST: ${PLC_URL:-https://plc.directory}
-      RELAY_PERSIST_DIR: /data/relay
+      RELAY_LISTEN: '0.0.0.0:2470'
+      RELAY_METRICS_LISTEN: '0.0.0.0:2471'
+      RELAY_PLC_URL: ${PLC_URL:-https://plc.directory}
+      RELAY_PDS_HOST: pds.${PARA_DOMAIN}
+      # La identidad sigue siendo pds.<dominio>; el transporte usa Docker.
+      RELAY_UPSTREAM_URL: http://pds:2583
+      RELAY_LENIENT_VALIDATION: 'false'
       RELAY_ADMIN_PASSWORD_FILE: /run/secrets/relay_admin_password
-      # Sin requestCrawl público: solo vlpds (por la red interna) y el admin.
-      RELAY_TRUSTED_DOMAINS: pds.${PARA_DOMAIN}
-    secrets: [postgres_url_relay, relay_admin_password]
+      RUST_LOG: ${RELAY_LOG:-rsky_relay=info}
+    secrets: [relay_admin_password]
     networks:
       default:
-        # vlpds no acepta un crawler sin punto en el nombre (`relay`).
         aliases: [relay.para.internal]
     volumes:
-      - relay_data:/data/relay
+      # Un espacio de cursores nuevo: nunca reutilizar el volumen de Indigo.
+      - rsky_relay_data:/data/relay
       - *env-from-files-volume
+    working_dir: /data/relay
     entrypoint: ['dumb-init', '--', 'sh', '/para/env-from-files']
-    command: ['/relay', 'serve']
+    command: ['/usr/local/bin/rsky-relay', '--no-plc-export']
     depends_on:
-      postgres:
+      pds:
         condition: service_healthy
     healthcheck:
-      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:2470/xrpc/_health']
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:2470/xrpc/_health']
       interval: 10s
       timeout: 3s
       retries: 3
+      start_period: 10s
+    stop_grace_period: 30s
     deploy:
       resources:
         limits:
@@ -442,7 +449,7 @@ services:
       BACKUP_INTERVAL: ${BACKUP_INTERVAL:-6h}
       BACKUP_RETENTION: ${BACKUP_RETENTION:-14d}
       BACKUP_TARGETS: postgres
-      BACKUP_DATABASES: ${POSTGRES_DB:-para} relay ${MATRIX_DB_NAME:-matrix} mas bridge
+      BACKUP_DATABASES: ${POSTGRES_DB:-para} ${MATRIX_DB_NAME:-matrix} mas bridge
       PGHOST: postgres
       PGUSER: ${POSTGRES_USER:-pg}
       PGPASSWORD_FILE: /run/secrets/postgres_password
@@ -495,6 +502,8 @@ services:
 volumes:
   postgres_data:
   vlpds_cache:
+  # Conservado para rollback de Indigo; no se monta en rsky.
   relay_data:
+  rsky_relay_data:
   caddy_data:
   caddy_config:

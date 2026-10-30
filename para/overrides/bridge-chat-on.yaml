@@ -1,0 +1,4 @@
+# Con el perfil matrix el bridge queda como lo define overrides/matrix.yaml.
+# Existe para que compose.yaml incluya siempre un archivo (ver
+# overrides/bridge-chat-off.yaml).
+services: {}

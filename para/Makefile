@@ -41,6 +41,11 @@ MATRIX_ADMIN_USER ?= para-bridge-admin
 # El edge publica las rutas de cada perfil solo si el perfil está activo.
 has_profile = $(findstring $(comma)$(1)$(comma),$(comma)$(PROFILES)$(comma))
 PARA_EDGE_MATRIX_SITE := $(if $(call has_profile,matrix),$(PLATFORM_DIR)/edge/sites/matrix.Caddyfile,$(PLATFORM_DIR)/edge/sites/empty.Caddyfile)
+# Chat (Matrix) solo con el perfil matrix. Sin él, el perfil governance
+# levanta el bridge con MATRIX_CHAT_ENABLED=false y la web se construye sin
+# chat (docs/MATRIX.md, "Sin chat").
+PARA_CHAT_ENABLED := $(if $(call has_profile,matrix),true,false)
+PARA_BRIDGE_CHAT_OVERRIDE := overrides/bridge-chat-$(if $(call has_profile,matrix),on,off).yaml
 PARA_EDGE_IDENTITY_SITE := $(if $(call has_profile,identity),$(PLATFORM_DIR)/edge/sites/identity.Caddyfile,$(PLATFORM_DIR)/edge/sites/empty.Caddyfile)
 PARA_WEB_CONTEXT := $(abspath $(PARA_DIR))
 PARA_ROOT_HANDLER := $(if $(call has_profile,web),reverse_proxy web:8100,respond "Not Found" 404)
@@ -54,13 +59,26 @@ OZONE_SERVER_DID ?= did:web:ozone.$(PARA_DOMAIN)
 MATRIX_DEPLOY_DIR := $(abspath $(WATZAPPA_DIR))/deploy/matrix
 export MATRIX_DEPLOY_DIR
 
+# El relay: vlrelay (por defecto, overrides/relay-vlrelay.yaml) o rsky
+# (relay/, core.yaml). Cambiarlo crea otro espacio de cursores: una instalación
+# que ya corre rsky lo fija en .env (preflight lo exige, docs/vlrelay.md).
+PARA_RELAY_SET := $(if $(filter undefined,$(origin PARA_RELAY)),,1)
+PARA_RELAY ?= vlrelay
+ifeq ($(PARA_RELAY),vlrelay)
+PARA_RELAY_FILES := -f compose.yaml -f overrides/relay-vlrelay.yaml
+# La imagen local (para-vlrelay:*) se construye en make up, como backup.
+PARA_RELAY_BUILD := $(if $(filter para-vlrelay:%,$(or $(VLRELAY_IMAGE),para-vlrelay:1.0.0)),relay)
+else ifneq ($(PARA_RELAY),rsky)
+$(error PARA_RELAY=$(PARA_RELAY): usa vlrelay o rsky)
+endif
+
 # El perfil da los tamaños; lo que ponga .env (ya exportado) le gana.
 # Un worker de AppView (PARA_ROLE=appview-worker) usa compose.worker.yaml.
 PARA_ROLE ?= primary
 ifeq ($(PARA_ROLE),appview-worker)
 COMPOSE := docker compose -f compose.worker.yaml --env-file profiles/$(PARA_PROFILE).env --profile appview-worker
 else
-COMPOSE := docker compose --env-file profiles/$(PARA_PROFILE).env $(PROFILE_FLAGS)
+COMPOSE := docker compose $(PARA_RELAY_FILES) --env-file profiles/$(PARA_PROFILE).env $(PROFILE_FLAGS)
 endif
 
 .DEFAULT_GOAL := help
@@ -80,6 +98,14 @@ dev: ## Entorno local: vlpds, PLC, relay, AppView y bsync en Docker
 dev-smoke: ## Prueba punta a punta: cuenta → publicación → AppView → proxy de vlpds
 	@./dev/smoke.sh
 
+.PHONY: relay-test
+relay-test: ## Prueba rsky fijado: cursores, PARA, TypeScript, SIGKILL y recuperación PLC (aislada)
+	@./relay/test.sh
+
+.PHONY: relay-snapshot
+relay-snapshot: ## Snapshot local consistente de rsky; detiene y vuelve a iniciar solo el relay
+	@./relay/snapshot.sh
+
 .PHONY: dev-down
 dev-down: ## Apaga el entorno local y borra sus datos
 	@./dev/down.sh
@@ -91,6 +117,22 @@ e2e-dm: ## Prueba punta a punta de los mensajes directos por Matrix (aislada, so
 .PHONY: app-env
 app-env: ## Variables para compilar la app PARA contra esta plataforma (EAS / build web)
 	@./scripts/app-env.sh
+
+.PHONY: chat-staging-ops chat-staging-build chat-staging-up chat-staging-verify chat-staging-smoke chat-staging-snapshot chat-staging-down
+chat-staging-build: ## Construye imágenes del ensayo persistente de chat (secuencial)
+	@./staging/stage.sh build
+chat-staging-up: ## Inicia solo el staging de chat, con puertos y datos propios
+	@./staging/stage.sh up
+chat-staging-verify: ## Comprueba servicios del staging de chat
+	@./staging/stage.sh verify
+chat-staging-smoke: ## Prueba protocolo real con cuentas y wallet sintéticos
+	@./staging/stage.sh smoke --mas
+chat-staging-ops: ## Ensaya permisos, caída de Synapse y reintento auditado
+	@./staging/stage.sh ops
+chat-staging-snapshot: ## Respaldo coordinado de los datos del staging de chat
+	@./staging/stage.sh snapshot
+chat-staging-down: ## Detiene el staging de chat conservando sus datos
+	@./staging/stage.sh down
 
 ##@ Producción (el servidor)
 
@@ -111,7 +153,7 @@ up: ## Descarga las imágenes fijadas y levanta PROFILES (BUILD=1 construye aqu�
 ifeq ($(BUILD),1)
 	$(COMPOSE) up -d --build --wait --wait-timeout 900 $(UP_ARGS)
 else
-	$(if $(filter primary,$(PARA_ROLE)),$(COMPOSE) build backup)
+	$(if $(filter primary,$(PARA_ROLE)),$(COMPOSE) build backup $(PARA_RELAY_BUILD))
 	$(COMPOSE) pull --ignore-pull-failures --quiet
 	$(COMPOSE) up -d --no-build --wait --wait-timeout 900 $(UP_ARGS)
 endif
@@ -186,7 +228,8 @@ db-init: ## Crea las bases compartidas (matrix, mas, bridge) en un Postgres que 
 # Las URLs públicas que ven los navegadores y la app: MAS en auth., para-idp
 # en idp., Element en chat. La config de Element queda junto a la de Synapse
 # (no versionada) para que el checkout del servidor siga limpio.
-MATRIX_INIT_ENV = POSTGRES_PASSWORD="$$(cat secrets/postgres_password)" \
+MATRIX_INIT_ENV = MAS_BRIDGE_ADMIN_SECRET="$$(cat secrets/mas_bridge_admin_secret)" \
+	POSTGRES_PASSWORD="$$(cat secrets/postgres_password)" \
 	MATRIX_SERVER_NAME="$(MATRIX_SERVER_NAME)" MATRIX_DOMAIN="$(MATRIX_DOMAIN)" \
 	MAS_PUBLIC_BASE="https://auth.$(PARA_DOMAIN)/" PARA_IDP_PUBLIC_URL="https://idp.$(PARA_DOMAIN)" \
 	ELEMENT_CONFIG_OUT="$(abspath $(WATZAPPA_DIR))/deploy/matrix/synapse/element-config.json" \
@@ -194,6 +237,7 @@ MATRIX_INIT_ENV = POSTGRES_PASSWORD="$$(cat secrets/postgres_password)" \
 
 .PHONY: matrix-init
 matrix-init: ## Genera la configuración de Synapse, MAS y Element para PARA_DOMAIN (una vez)
+	@test -s secrets/mas_bridge_admin_secret || { echo 'Primero: make secrets'; exit 2; }
 	@test -s secrets/postgres_password || { echo 'Primero: make secrets'; exit 2; }
 	@case "$(PARA_DOMAIN)" in ''|example.org) echo 'Define PARA_DOMAIN en .env'; exit 2 ;; esac
 	@$(MATRIX_INIT_ENV) ./matrix/setup.sh
@@ -213,7 +257,14 @@ vlpds-admin: ## Cualquier comando de operador de vlpds (ARGS="account list", "re
 
 .PHONY: relay-add-pds
 relay-add-pds: ## Pide al relay que siga a vlpds (lo hace vlpds solo al arrancar)
+ifeq ($(PARA_RELAY),vlrelay)
+	@# vlRelay sigue a pds.<dominio> por --host; esto solo reabre su socket.
+	@$(COMPOSE) exec -T relay sh -c 'curl -fsS -u "admin:$$(cat /run/secrets/relay_admin_password)" \
+		-H "content-type: application/json" -d "{\"action\":\"reconnect\"}" \
+		"http://127.0.0.1:2470/admin/api/hosts/pds.$(PARA_DOMAIN)/action"'
+else
 	@$(COMPOSE) exec -T pds vlpds admin request-crawl http://relay.para.internal:2470
+endif
 
 .PHONY: matrix-admin-token
 matrix-admin-token: ## Usuario admin de Synapse para el bridge (vía MAS) y su token en secrets/
