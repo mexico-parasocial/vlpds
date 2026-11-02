@@ -408,6 +408,10 @@ fn lease() -> vlpds::cluster::NodeLease {
         max_level: 1,
         seen_level: 1,
         pending_age_ms: None,
+        // level 3 on (`cluster::LEASE_TIMING_LEVEL`)
+        ttl_ms: Some(10_000),
+        skew_ms: Some(2_000),
+        renew_ms: Some(2_000),
     }
 }
 

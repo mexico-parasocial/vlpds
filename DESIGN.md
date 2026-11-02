@@ -581,7 +581,9 @@ commit hot path.
   write to the real-repo fixture (`~/repo.car`, 812 blob refs;
   `mst_lazy::bench_cold_open_blobs`), every GET +20 ms: median ~150 ms
   instead of ~270 ms.
-- **GC** (`blobs::sweep_blobs`, owned partitions only). A blob unreferenced
+- **GC** (`blobs::sweep_blobs`, owned partitions only, every
+  `--blob-gc-interval-secs`: by default a quarter of the grace, at most
+  1 h; each pass lists the whole `blob/` prefix). A blob unreferenced
   for longer than `--blob-gc-grace-secs` is moved to `blob-gc/{did}/{cid}`,
   not deleted. A write checks that its blob exists before it is sequenced, so
   a write that checked just before the move can apply its reference just
@@ -1971,7 +1973,18 @@ No node ever compares its wall clock with another node's.
   lease's ETag (or `renewals`) change. A lease seen for the first time gets a
   full TTL from first sight. A peer is presumed dead once its lease has gone
   unchanged for **TTL + skew** of the observer's time, judged as of before
-  the LIST (a slow LIST can't age a lease). It is also dead once the observer
+  the LIST (a slow LIST can't age a lease). From feature level 3
+  (`lease-timing`) each lease publishes its holder's TTL, skew and renew
+  interval (`ttl_ms`, `skew_ms`, `renew_ms`; `cluster::LEASE_TIMING_LEVEL`),
+  and the observer uses the
+  longer of its own and the holder's TTL + skew (and renew interval, for
+  the suspect probe below): during a rolling change of `--lease-ttl-ms`, a
+  short-TTL node never takes over a live long-TTL one. They are level-gated
+  because peers act on them: a v1.2 peer judging a long-TTL node by its own
+  shorter TTL would take over a live node. A lease without them (below
+  level 3, or an older build) is judged by the observer's own, so until
+  level 3 is finalized every node of a cluster must run the same TTL and
+  skew. It is also dead once the observer
   has fenced its log: a renewal it sent before lapsing that lands late can't
   resurrect it.
 - **Self.** A node's own validity is `send time of its last successful
@@ -2120,7 +2133,10 @@ linearizable.
 - **Bounded drift *rate*, not offset.** The owner's validity
   (TTL − skew of its time) must end before an observer's TTL + skew of its
   own time elapses: `(TTL − skew)(1 + ρ) ≤ (TTL + skew)(1 − ρ)`, so
-  ρ ≤ skew/TTL = 20 %. Real oscillators drift ~10⁻⁵. Within that bound a
+  ρ ≤ skew/TTL: 20 % at the default skew (TTL/5), 10 % at TTL 120 s with a
+  12 s skew. The node refuses a skew under TTL/20 (5 %). An observer waits
+  at least the holder's published TTL + skew, so the holder's own ratio is
+  the bound. Real oscillators drift ~10⁻⁵. Within that bound a
   presumed-dead node has already stopped serving, so reads are not stale
   either. Beyond it only availability and read freshness suffer, not acked
   writes. Firehose completeness across a join (§5 "Joining") rests on the
@@ -2159,12 +2175,34 @@ linearizable.
     resume elsewhere from cursors near *S*) would miss.
   - Revs use `next_rev(prev)` and stay monotonic regardless of the clock.
 
-**Renewal RTT ceiling.** Renewals are sequential CAS PUTs, and validity counts
-from the send time. A renewal round trip above `(TTL − skew)/2` = 0.4 × TTL
-therefore opens a validity gap and fail-stops the node. That is 4 s at the
-production default TTL of 10 s (`--lease-ttl-ms`, which warns below 10 s
-outside dev mode), and 1.2 s at the 3 s TTL the HA bench uses. A cluster-wide
-S3 brownout past the ceiling stops every node. Keep the TTL at 10 s or more.
+**Renewal RTT ceiling and stall margin.** Renewals are sequential CAS PUTs,
+and validity counts from the send time. Back-to-back renewal round trips
+above `(TTL − skew)/2` therefore open a validity gap and fail-stop the node:
+0.4 × TTL at the default skew, 4 s at the production default TTL of 10 s
+(`--lease-ttl-ms`, which warns below 10 s outside dev mode), and 1.2 s at
+the 3 s TTL the HA bench uses. One stall that answers nothing (R2 has gone
+silent for 40–90 s at a time) is survived while it lasts less than the
+margin, `TTL − skew − renew`: the validity left just before a renewal goes.
+That is 6 s at the defaults, 36 s at TTL 60 s with TTL/5 for both, and 96 s
+at TTL 120 s with `--lease-renew-ms 12000 --lease-skew-ms 12000` (the same
+write rate as 60 s), less the few seconds between the stall's end and the
+next attempt (one lease-write attempt timeout, at most 4 s, plus its resend
+gap). The node refuses renew + skew over TTL/2 or a skew outside
+TTL/20..TTL/5, so the margin is at least half the TTL and the ceiling at
+least 0.4 × TTL. A cluster-wide S3 brownout past either stops every node.
+Keep the TTL at 10 s or more.
+
+A longer TTL is a per-deployment choice, paid for in failover: a node that
+hangs or is partitioned (its port still accepts or doesn't answer) is taken
+over only TTL + skew after its last renewal (132 s at 120/12/12, against
+72 s at 60 s and 12 s at the default). Until then its shards don't serve
+and the merged firehose waits on its log (it emits at the lowest node
+watermark). Its watermark is capped at its `wm_cap`, TTL after its last
+renewal's send, which joiners and a restart of the same node id wait their
+clocks past: a lone node's crash restart writes again only about a TTL after
+its last renewal (~53 s measured at 60 s, so ~113 s at 120 s). A crashed
+process in a cluster (refused probe) is taken over after 1.5–2.5 renew
+intervals at any TTL.
 
 **One write a second per lease key.** R2 throttles a key past about one write a
 second. So a node's writes to its own lease are kept min(1 s, renew interval)
@@ -5081,7 +5119,8 @@ running node can't read.
 **Built (phase 1, steps 1-5 of the plan below):** level 1 = the formats
 of day one (VLSEG06 etc., `vlsync-store/src/version.rs` `LEVELS`; builds
 ran `1..=1` until level 2, `federated-sign-in`, the first real level after
-it: "Third-party sign-in"); `cluster/version` with the startup gate, the post-lease re-check,
+it: "Third-party sign-in"; level 3, `lease-timing`, publishes each node
+lease's TTL, skew and renew interval: "Liveness"); `cluster/version` with the startup gate, the post-lease re-check,
 exit 7 `incompatible_level`, per-TTL observation and the raise protocol
 (`Cluster::finalize_level`, `vlpds.admin.setFeatureLevel`, `vlpds admin
 cluster finalize`); lease and hello fields; the tolerance fixes;
@@ -5092,7 +5131,7 @@ below are marked **(built: ...)**.
 
 **Built (phase 2, step 6):** a **test-only feature level** (cargo feature
 `test-level`, never in a release image; `version::TEST_LEVEL` = the newest
-real level + 1, today 2) that changes two on-bucket formats the way a real
+real level + 1, today 4) that changes two on-bucket formats the way a real
 level would: segments get the magic `VLSEGT1` and one more header field
 (a body checksum, verified on parse), and `retain/` reports gain
 `min_seg_format`. With it: the level-gating test
@@ -5122,7 +5161,7 @@ effect at the next segment). Not built yet: everything under "Later".
 | Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns, `deleting` (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
 | Shard meta | `meta/applied2` (`nodelog::encode_marker`), `meta/recent` | key-name suffix (`applied2`): the only precedent | **(built)** `decode_marker` of anything but exactly its bytes is an error (the shard doesn't open, `format="applied_marker"`), never "no marker" |
 | SlateDB SSTs + manifest | `state/{id}/` | slatedb's own (pinned fork rev, `Cargo.toml`); SST compression from flags | slatedb error at open |
-| Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields | **(built)** level 1 has `rev`, `min_level`, `max_level`, `seen_level`; a later level's new fields default |
+| Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields | **(built)** level 1 has `rev`, `min_level`, `max_level`, `seen_level`; level 3 adds `ttl_ms`, `skew_ms`, `renew_ms` (written only at a seen level of 3 or more); a later level's new fields default |
 | Assignment | `assign/{id:010}`, `cluster::Assignment` | none; CAS read-modify-write by *every* node | **(built)** `#[serde(default)]` + `flatten extra`: an old node's CAS (acquire, release, handoff) keeps fields it doesn't know. `Span` (history entries) is closed: a new span field needs a new object |
 | Layout | `assign/layout`, `slots::Layout` | `version` = routing generation, not format | **(built)** `flatten extra` on `Layout` and its `op` (`Reshard`); every layout write derives from the one read. `ShardRange` is closed |
 | Writer claim | `writers/{w:03}` | none | n/a |
