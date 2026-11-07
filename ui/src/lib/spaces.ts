@@ -7,7 +7,7 @@ import { ACCOUNT_CALLBACK_PATH, beginSignIn, finishSignIn, forgetAll, OAuthSessi
 import { call, XrpcError } from './xrpc'
 
 export const SESSION = 'spaces'
-/** Reads the user's own space repos, and the spaces they govern (getSpace and listMembers are owner reads). */
+/** Reads the user's own space repos, and the spaces they govern (getSpace and memberspace.listMembers are owner reads). */
 export const READ_SCOPE = 'atproto space:*?authority=*&action=read_self'
 /** Members and deletion, only for spaces this account governs (`authority` defaults to `self`). */
 export const OWNER_SCOPE = 'space:*?action=read_self&manage=update&manage=delete'
@@ -159,40 +159,66 @@ export async function myRepo(s: OAuthSession, space: string): Promise<MyRepo | n
   return { records, more, rev, lastWrite: tidTime(rev) }
 }
 
-export type Policy = { $type: string; managingApp?: string }
+export type Policy = {
+  $type: string
+  publicRead?: boolean
+  publicWrite?: boolean
+  allowedApps?: string[]
+  managingApp?: string
+  publishPolicy?: boolean
+  publishMembers?: boolean
+}
 export type Member = { did: string; read: boolean; write: boolean }
-export type Governance = { readPolicy: Policy; writePolicy: Policy; appAccess: { $type: string; allowed?: string[] }; members: Member[]; more: boolean }
+/** `members` is the member list, which only a memberspace has (`memberList`). */
+export type Governance = { policy: Policy; memberList: boolean; members: Member[]; more: boolean }
+
+export const MEMBERSPACE = 'com.atproto.memberspace.policy'
+export const MANAGEDSPACE = 'com.atproto.managedspace.policy'
+export const PERSONALSPACE = 'com.atproto.personalspace.policy'
 
 const MEMBER_PAGES = 10
 
-/** A space the account governs: its policies and members. */
+/** A space the account governs: its policy, and its members under a memberspace policy. */
 export async function governance(s: OAuthSession, space: string): Promise<Governance> {
-  const g = await s.call('com.atproto.simplespace.getSpace', { params: { space } })
+  const g = await s.call('com.atproto.space.getSpace', { params: { space } })
+  const policy: Policy = g.policy ?? { $type: '' }
   const members: Member[] = []
   let more = false
-  for (let cursor: string | undefined, i = 0; ; i++) {
+  const memberList = policy.$type === MEMBERSPACE
+  for (let cursor: string | undefined, i = 0; memberList; i++) {
     if (i === MEMBER_PAGES) {
       more = true
       break
     }
-    const r = await s.call('com.atproto.simplespace.listMembers', { params: { space, limit: 1000, cursor } })
+    const r = await s.call('com.atproto.memberspace.listMembers', { params: { space, limit: 1000, cursor } })
     members.push(...(r.members ?? []))
     if (!r.cursor || !(r.members ?? []).length) break
     cursor = r.cursor
   }
-  return { readPolicy: g.readPolicy, writePolicy: g.writePolicy, appAccess: g.appAccess, members, more }
+  return { policy, memberList, members, more }
 }
 
-export function policyText(p?: Policy): string {
-  switch (p?.$type?.split('#')[1]) {
-    case 'publicPolicy':
-      return 'anyone'
-    case 'memberListPolicy':
-      return 'members'
-    case 'managingAppPolicy':
+/** Who can read under `p`. */
+export function readText(p?: Policy): string {
+  switch (p?.$type) {
+    case MEMBERSPACE:
+      return p.publicRead ? 'anyone' : 'members'
+    case MANAGEDSPACE:
       return 'an app decides'
+    case PERSONALSPACE:
+      return 'only you'
     default:
-      return p?.$type ?? '—'
+      return p?.$type || '—'
+  }
+}
+
+/** Who can write under `p`. */
+export function writeText(p?: Policy): string {
+  switch (p?.$type) {
+    case MEMBERSPACE:
+      return p.publicWrite ? 'anyone' : 'members'
+    default:
+      return readText(p)
   }
 }
 

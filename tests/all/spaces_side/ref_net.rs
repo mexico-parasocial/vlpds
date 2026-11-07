@@ -1,5 +1,5 @@
 //! The reference's `tests/_space.ts` for the ported space suites
-//! (`ref_space_*`, `ref_simplespace`, `ref_client_attestation`), over XRPC:
+//! (`ref_space_*`, `ref_space_policy`, `ref_client_attestation`), over XRPC:
 //!
 //! - [`Net`]: the reference's `TestNetworkNoAppView` with `extraPdses`, as
 //!   `--spaces` PDSes registering DIDs with one in-process PLC directory, so
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use vlpds::space::commit::{self, SignedCommit};
+use vlpds::space::commit::{self, Commit};
 use vlpds::space::lthash::LtHash;
 use vlpds::space::token::{self, Mint, TokenType};
 
@@ -39,30 +39,27 @@ pub const SPACE_TYPE_COLLECTIONS: [&str; 2] = ["com.example.groupNote", "com.exa
 /// public repo writes and blob uploads.
 pub const FULL_SCOPE: &str = "transition:generic space:*?authority=*&collection=*&action=read&action=create&action=update&action=delete&manage=create&manage=update&manage=delete";
 
-pub const MEMBER_LIST: &str = "com.atproto.simplespace.defs#memberListPolicy";
-pub const PUBLIC: &str = "com.atproto.simplespace.defs#publicPolicy";
-pub const MANAGING_APP: &str = "com.atproto.simplespace.defs#managingAppPolicy";
-pub const OPEN: &str = "com.atproto.simplespace.defs#open";
-pub const ALLOW_LIST: &str = "com.atproto.simplespace.defs#allowList";
+pub const PERSONALSPACE: &str = "com.atproto.personalspace.policy";
+pub const MEMBERSPACE: &str = "com.atproto.memberspace.policy";
+pub const MANAGEDSPACE: &str = "com.atproto.managedspace.policy";
 
-pub fn member_list() -> J {
-    json!({"$type": MEMBER_LIST})
+/// `personalspace.policy.$build({})`.
+pub fn personalspace() -> J {
+    json!({"$type": PERSONALSPACE})
 }
 
-pub fn public() -> J {
-    json!({"$type": PUBLIC})
+/// `memberspace.policy.$build(config)`: `config`'s fields over the type.
+pub fn memberspace(config: J) -> J {
+    let mut p = json!({"$type": MEMBERSPACE});
+    if let J::Object(c) = config {
+        p.as_object_mut().unwrap().extend(c);
+    }
+    p
 }
 
-pub fn managing_app(app: &str) -> J {
-    json!({"$type": MANAGING_APP, "managingApp": app})
-}
-
-pub fn open() -> J {
-    json!({"$type": OPEN})
-}
-
-pub fn allow_list(allowed: &[&str]) -> J {
-    json!({"$type": ALLOW_LIST, "allowed": allowed})
+/// `managedspace.policy.$build({managingApp})`.
+pub fn managedspace(app: &str) -> J {
+    json!({"$type": MANAGEDSPACE, "managingApp": app})
 }
 
 /// `record()`: a minimal record body for a test collection.
@@ -182,13 +179,11 @@ impl Net {
         if !o.ungoverned {
             let r = owner
                 .post(
-                    "com.atproto.simplespace.createSpace",
+                    "com.atproto.space.createSpace",
                     json!({
                         "spaceType": space_type,
                         "skey": skey,
-                        "readPolicy": o.read_policy.unwrap_or_else(member_list),
-                        "writePolicy": o.write_policy.unwrap_or_else(member_list),
-                        "appAccess": o.app_access.unwrap_or_else(open),
+                        "policy": o.policy.unwrap_or_else(|| memberspace(json!({}))),
                     }),
                 )
                 .await;
@@ -218,8 +213,21 @@ impl Net {
         (exchange(&reqwest::Client::new(), &holder, &host, space, token, attestation).await, holder)
     }
 
+    /// `sc.publicCredential(space, {clientAttestation})`: getSpaceCredential
+    /// at the authority with no delegation token.
+    pub async fn public_credential(&self, space: &str, attestation: Option<&str>) -> (Resp, Holder) {
+        let holder = Holder::new();
+        let host = self.host_of(authority_of(space));
+        let mut body = json!({"space": space, "credentialKid": holder.did});
+        if let Some(a) = attestation {
+            body["clientAttestation"] = json!(a);
+        }
+        let rb = reqwest::Client::new().post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
+        (resp(rb.json(&body).send().await.unwrap()).await, holder)
+    }
+
     /// The authority's writer set as its storage holds it (`sW`), as the
-    /// reference's `writerDids` reads it: no credential, so an allowList
+    /// reference's `writerDids` reads it: no credential, so an allowedApps
     /// space's app perimeter doesn't stand in the way. `owner` is the
     /// authority's account.
     pub async fn writer_dids(&self, owner: &SpaceClient, space: &str) -> Vec<String> {
@@ -256,9 +264,8 @@ pub struct SpaceOpts<'a> {
     pub skey: Option<&'a str>,
     pub space_type: Option<&'a str>,
     pub members: &'a [&'a SpaceClient],
-    pub read_policy: Option<J>,
-    pub write_policy: Option<J>,
-    pub app_access: Option<J>,
+    /// Default: a memberspace with every flag off.
+    pub policy: Option<J>,
     /// Skip createSpace, leaving the space ungoverned.
     pub ungoverned: bool,
 }
@@ -266,14 +273,24 @@ pub struct SpaceOpts<'a> {
 pub async fn put_member(owner: &SpaceClient, space: &str, member: &SpaceClient, read: bool, write: bool) -> Resp {
     owner
         .post(
-            "com.atproto.simplespace.putMember",
+            "com.atproto.memberspace.putMember",
             json!({"space": space, "did": member.did, "read": read, "write": write}),
         )
         .await
 }
 
 pub async fn remove_member(owner: &SpaceClient, space: &str, member: &SpaceClient) -> Resp {
-    owner.post("com.atproto.simplespace.removeMember", json!({"space": space, "did": member.did})).await
+    owner.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": member.did})).await
+}
+
+/// `sc.clear`: clearRecords of the actor's own repo.
+pub async fn clear(actor: &SpaceClient, space: &str) -> Resp {
+    actor.post("com.atproto.space.clearRecords", json!({"space": space, "repo": actor.did})).await
+}
+
+/// `sc.removeWriter`.
+pub async fn remove_writer(owner: &SpaceClient, space: &str, writer: &SpaceClient) -> Resp {
+    owner.post("com.atproto.space.removeWriter", json!({"space": space, "did": writer.did})).await
 }
 
 pub async fn delegation_token(actor: &SpaceClient, space: &str) -> String {
@@ -289,14 +306,11 @@ pub async fn exchange(
     token: &str,
     attestation: Option<&str>,
 ) -> Resp {
-    let mut body = json!({"space": space});
+    let mut body = json!({"space": space, "credentialKid": holder.did, "delegationToken": token});
     if let Some(a) = attestation {
         body["clientAttestation"] = json!(a);
     }
-    let mut rb = http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
-    for (k, v) in holder.headers(&format!("Bearer {token}"), None) {
-        rb = rb.header(k, v);
-    }
+    let rb = http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
     resp(rb.json(&body).send().await.unwrap()).await
 }
 
@@ -381,7 +395,7 @@ pub async fn repo_state(actor: &SpaceClient, space: &str) -> Option<(String, Vec
         return None;
     }
     let c = &r.ok()["commit"];
-    Some((c["rev"].as_str().unwrap().to_string(), bytes_field(&c["hash"])))
+    Some((c["rev"].as_str().unwrap().to_string(), bytes_field(&c["data"])))
 }
 
 /// Every record of the actor's repo in `space`, paged as its owner.
@@ -428,22 +442,9 @@ pub fn replay(ops: &[J]) -> LtHash {
 }
 
 pub fn commit_matches(set: &LtHash, c: &J) -> bool {
-    let sc: SignedCommit = signed_commit(c);
+    let sc: Commit = signed_commit(c);
     assert_eq!(sc.ver, 1, "commit ver");
     commit::matches(set, &sc)
-}
-
-/// The account's `#atproto` key as a did:key (describeRepo).
-pub async fn did_key(s: &TestServer, did: &str) -> String {
-    let j = s.describe_repo(did).await.ok();
-    let vm = j["didDoc"]["verificationMethod"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|v| v["id"].as_str().is_some_and(|i| i.ends_with("#atproto")))
-        .unwrap()
-        .clone();
-    format!("did:key:{}", vm["publicKeyMultibase"].as_str().unwrap())
 }
 
 /// A service JWT signed by the actor's account key, as its PDS's outbox
@@ -548,7 +549,7 @@ impl Cred {
     pub async fn post(&self, base: &str, nsid: &str, body: J) -> Resp {
         let aud = body["repo"].as_str().unwrap_or_else(|| authority_of(body["space"].as_str().unwrap())).to_string();
         let mut rb = self.http.post(format!("{base}/xrpc/{nsid}"));
-        for (k, v) in self.holder.headers(&format!("Atproto-Space {}", self.credential), Some(&aud)) {
+        for (k, v) in self.holder.credential_headers(&self.credential, &aud) {
             rb = rb.header(k, v);
         }
         resp(rb.json(&body).send().await.unwrap()).await
@@ -556,7 +557,7 @@ impl Cred {
 
     /// The signed headers for `aud` (`createSpaceSigHeaders`).
     pub fn headers(&self, aud: &str) -> Vec<(String, String)> {
-        self.holder.headers(&format!("Atproto-Space {}", self.credential), Some(aud))
+        self.holder.credential_headers(&self.credential, aud)
     }
 }
 

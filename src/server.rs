@@ -252,10 +252,6 @@ impl Config {
             max_backfills: self.firehose_max_backfills as u64,
             max_exports: self.max_exports as u64,
             import_memory: self.import_memory_bytes,
-            space_exports: match self.spaces {
-                true => crate::space::export_budget_bytes(self.space_repo_max_records),
-                false => 0,
-            },
         }
     }
 
@@ -641,7 +637,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         s.outbox.start(Arc::downgrade(&app));
         s.fanout.start(Arc::downgrade(&app));
         crate::space::retention::start(&app);
+        crate::space::deleted::start(&app);
         s.start_revocations(app.store.clone()).await;
+        crate::kem_backfill::start(&app);
+    } else {
+        crate::kem_backfill::reset(&app);
     }
     Ok(app)
 }

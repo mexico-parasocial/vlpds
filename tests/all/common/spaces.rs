@@ -5,16 +5,16 @@
 //! - `SpaceClient::new(&server, name, scope)`: account, PAR, consent, token.
 //! - `get`/`post`: DPoP-authenticated XRPC as that account.
 //! - `credential(space)`: getDelegationToken, then getSpaceCredential at the
-//!   authority's host, signed by the holder key.
+//!   authority's host, bound to the holder key.
 //! - `signed_get(base, nsid, query, credential, audience)`: a read with
-//!   `Authorization: Atproto-Space`, signed over the authorization and
+//!   `Authorization: Atproto-Space-Credential`, signed over the authorization and
 //!   audience headers.
 
 use super::{Resp, TestServer};
 use crate::oauth::{self, Browser, DpopKey, Flow, Srv};
 use p256::ecdsa::signature::Signer;
 use serde_json::{json, Value as J};
-use vlpds::space::httpsig;
+use vlpds::space::{commit, httpsig, mac, star};
 
 pub struct SpaceClient {
     pub srv: Srv,
@@ -48,20 +48,23 @@ impl Holder {
         base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
     }
 
-    /// The headers of a request authorized by `authorization`, signed as the
-    /// reference's client signs them (`createSpaceSigHeaders`): with an
-    /// audience for a credential read, without one (and with `keyid`) for a
-    /// delegation exchange.
-    pub fn headers(&self, authorization: &str, audience: Option<&str>) -> Vec<(String, String)> {
-        let input = httpsig::signature_input(audience.is_some(), &self.did);
+    /// The headers of a request authorized by `authorization` (a space
+    /// credential), signed for `audience` as the reference's client signs
+    /// them (`createSpaceSigHeaders`).
+    pub fn headers(&self, authorization: &str, audience: &str) -> Vec<(String, String)> {
+        let input = httpsig::signature_input();
         let sig = self.sign(&httpsig::signature_base(authorization, &input, audience));
-        let mut h = vec![("authorization".to_string(), authorization.to_string())];
-        if let Some(a) = audience {
-            h.push((httpsig::AUDIENCE_HEADER.into(), a.into()));
-        }
-        h.push(("signature-input".into(), format!("{}={input}", httpsig::LABEL)));
-        h.push(("signature".into(), format!("{}=:{sig}:", httpsig::LABEL)));
-        h
+        vec![
+            ("authorization".to_string(), authorization.to_string()),
+            (httpsig::AUDIENCE_HEADER.into(), audience.into()),
+            ("signature-input".into(), format!("{}={input}", httpsig::LABEL)),
+            ("signature".into(), format!("{}=:{sig}:", httpsig::LABEL)),
+        ]
+    }
+
+    /// The headers of a read with `credential`.
+    pub fn credential_headers(&self, credential: &str, audience: &str) -> Vec<(String, String)> {
+        self.headers(&format!("Atproto-Space-Credential {credential}"), audience)
     }
 }
 
@@ -132,7 +135,7 @@ impl SpaceClient {
         oauth_resp(oauth::xrpc_dpop(&self.srv, &self.key, &self.access, "GET", nsid, None).await)
     }
 
-    /// A GET whose answer isn't JSON (getRepo's CAR): status, content type
+    /// A GET whose answer isn't JSON (getRepo's STAR archive): status, content type
     /// and body.
     pub async fn get_raw(&self, nsid: &str, query: &[(&str, &str)]) -> (u16, String, Vec<u8>) {
         let url = xrpc_url(&self.srv.base, nsid, query);
@@ -159,7 +162,7 @@ impl SpaceClient {
         unreachable!()
     }
 
-    /// A POST of raw bytes (importRepo's CAR) with a query.
+    /// A POST of raw bytes (importRepo's STAR archive) with a query.
     pub async fn post_bytes(&self, nsid: &str, query: &[(&str, &str)], body: Vec<u8>, ctype: &str) -> Resp {
         let url = xrpc_url(&self.srv.base, nsid, query);
         for attempt in 0..2 {
@@ -215,17 +218,15 @@ impl SpaceClient {
         oauth_resp(oauth::xrpc_dpop(&self.srv, &self.key, &self.access, "POST", nsid, Some(body)).await)
     }
 
-    /// simplespace.createSpace with the default policies; the space's URI.
+    /// space.createSpace with a default memberspace; the space's URI.
     pub async fn create_space(&self, space_type: &str, skey: &str) -> String {
         let r = self
             .post(
-                "com.atproto.simplespace.createSpace",
+                "com.atproto.space.createSpace",
                 json!({
                     "spaceType": space_type,
                     "skey": skey,
-                    "readPolicy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"},
-                    "writePolicy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"},
-                    "appAccess": {"$type": "com.atproto.simplespace.defs#open"},
+                    "policy": {"$type": "com.atproto.memberspace.policy"},
                 }),
             )
             .await;
@@ -268,7 +269,7 @@ impl SpaceClient {
         self.exchange_with(holder, host, space, token, None).await
     }
 
-    /// getSpaceCredential with a client attestation (an `appAccess` allow
+    /// getSpaceCredential with a client attestation (an `allowedApps`
     /// list's proof of which app asks).
     pub async fn exchange_with(
         &self,
@@ -278,11 +279,8 @@ impl SpaceClient {
         token: &str,
         attestation: Option<&str>,
     ) -> Resp {
-        let mut rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
-        for (k, v) in holder.headers(&format!("Bearer {token}"), None) {
-            rb = rb.header(k, v);
-        }
-        let mut body = json!({"space": space});
+        let rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
+        let mut body = json!({"space": space, "credentialKid": holder.did, "delegationToken": token});
         if let Some(a) = attestation {
             body["clientAttestation"] = json!(a);
         }
@@ -340,13 +338,16 @@ pub async fn signed_post_as(
     audience: &str,
 ) -> Resp {
     let mut rb = http.post(xrpc_url(base, nsid, &[]));
-    for (k, v) in holder.headers(&format!("Atproto-Space {credential}"), Some(audience)) {
+    for (k, v) in holder.headers(&format!("Atproto-Space-Credential {credential}"), audience) {
         rb = rb.header(k, v);
     }
     resp(rb.json(&body).send().await.unwrap()).await
 }
 
-/// A credential read signed by `holder`.
+/// A credential read signed by `holder`. A method that returns a commit or
+/// a record asks for a MAC against the repo's `#atproto_kem` key (when its
+/// host publishes one), and a MAC that comes back is verified here, as the
+/// reference's `SpaceCredential` helper does.
 pub async fn signed_get_as(
     http: &reqwest::Client,
     holder: &Holder,
@@ -356,9 +357,135 @@ pub async fn signed_get_as(
     credential: &str,
     audience: &str,
 ) -> Resp {
+    let repo = query.iter().find(|(n, _)| *n == "repo").map(|(_, v)| *v);
+    let kem = match (mac_type(nsid), repo) {
+        (Some(_), Some(repo)) => kem_key_at(http, base, repo).await,
+        _ => None,
+    };
+    signed_get_kem(http, holder, base, nsid, query, credential, audience, kem.as_deref()).await
+}
+
+/// [`signed_get_as`] with the repo's KEM key already resolved (a poll that
+/// shouldn't resolve it each time).
+#[allow(clippy::too_many_arguments)]
+pub async fn signed_get_kem(
+    http: &reqwest::Client,
+    holder: &Holder,
+    base: &str,
+    nsid: &str,
+    query: &[(&str, &str)],
+    credential: &str,
+    audience: &str,
+    kem: Option<&str>,
+) -> Resp {
     let mut rb = http.get(xrpc_url(base, nsid, query));
-    for (k, v) in holder.headers(&format!("Atproto-Space {credential}"), Some(audience)) {
+    for (k, v) in holder.headers(&format!("Atproto-Space-Credential {credential}"), audience) {
         rb = rb.header(k, v);
     }
-    resp(rb.send().await.unwrap()).await
+    let find = |k: &str| query.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+    let mut want = None;
+    if let (Some(ty), Some(kem)) = (mac_type(nsid), kem) {
+        let (share, secret) = mac::encapsulate(kem).unwrap();
+        rb = rb.header(mac::WANT_MAC_HEADER, mac::format_want_mac(ty, &share));
+        want = Some((ty, secret));
+    }
+    let r = resp(rb.send().await.unwrap()).await;
+    if let (Some((ty, secret)), 200) = (want, r.status) {
+        verify_mac(&r, nsid, ty, &secret, find("space").unwrap_or(""), find("repo").unwrap_or(""));
+    }
+    r
+}
+
+pub fn mac_type(nsid: &str) -> Option<mac::MacType> {
+    match nsid {
+        "com.atproto.space.getRecord" => Some(mac::MacType::Record),
+        "com.atproto.space.getLatestCommit" | "com.atproto.space.listRepoOps" | "com.atproto.space.getRepo" => {
+            Some(mac::MacType::Repo)
+        }
+        _ => None,
+    }
+}
+
+/// `repo`'s `#atproto_kem` key as `base` publishes it (describeRepo).
+pub async fn kem_key_at(http: &reqwest::Client, base: &str, repo: &str) -> Option<String> {
+    let r = http.get(xrpc_url(base, "com.atproto.repo.describeRepo", &[("repo", repo)])).send().await.ok()?;
+    let j: J = r.json().await.ok()?;
+    mac::kem_key_of(&j["didDoc"])
+}
+
+/// The commit a MAC-bearing response carries: getRepo's STAR metadata, or
+/// the JSON body's `commit`.
+pub fn response_commit(r: &Resp, nsid: &str) -> Option<commit::Commit> {
+    if nsid == "com.atproto.space.getRepo" {
+        let (meta, _) = star::read_all(&r.body, star::LIMITS).expect("a STAR archive");
+        return Some(star::parse_repo_meta(&meta).expect("repo metadata"));
+    }
+    match &r.json["commit"] {
+        J::Null => None,
+        c => Some(commit::Commit::from_json(c).expect("a commit")),
+    }
+}
+
+/// Asserts a response's MAC verifies under `secret` (and that one came
+/// with a commit or record, and none without).
+pub fn verify_mac(r: &Resp, nsid: &str, ty: mac::MacType, secret: &[u8; 32], space: &str, repo: &str) {
+    let header = r.headers.get(mac::MAC_HEADER).map(|v| v.to_str().unwrap().to_string());
+    let vary = r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains(mac::WANT_MAC_HEADER));
+    assert!(vary, "{nsid}: Vary names the MAC request header");
+    match ty {
+        mac::MacType::Record => {
+            let m = mac::parse_mac(header.as_deref(), ty).expect("a record MAC");
+            let (uri, cid) = (r.json["uri"].as_str().unwrap(), r.json["cid"].as_str().unwrap());
+            let cid = vlatproto::cid::Cid::parse(cid).unwrap().to_bytes();
+            assert!(commit::verify_record(secret, uri, &cid, &m), "{nsid}: the record MAC verifies");
+        }
+        mac::MacType::Repo => match response_commit(r, nsid) {
+            Some(c) => {
+                let m = mac::parse_mac(header.as_deref(), ty).expect("a commit MAC");
+                assert!(commit::verify(&c, space, repo, secret, &m), "{nsid}: the commit MAC verifies");
+            }
+            None => assert!(header.is_none(), "{nsid}: a page without a commit has no MAC"),
+        },
+    }
+}
+
+/// What a verified getRepo archive holds.
+pub struct Star {
+    pub commit: commit::Commit,
+    pub paths: Vec<String>,
+    /// (path, CID, record bytes), in the archive's order.
+    pub records: Vec<(String, vlatproto::cid::Cid, Vec<u8>)>,
+}
+
+/// Checks a getRepo STAR archive as the reference's `verifyRepoStarFull`
+/// does, the MAC aside ([`signed_get_as`] checks that): repo metadata for
+/// the space and repo asked for, keys in strict bytewise order, each record
+/// canonical DRISL, and the records fold to the commit's `data`.
+pub fn verify_star(body: &[u8], space: &str, repo: &str) -> Star {
+    use vlatproto::cbor::Value;
+    let (meta, pairs) = star::read_all(body, star::LIMITS).expect("a STAR archive");
+    let commit = star::parse_repo_meta(&meta).expect("repo metadata");
+    assert_eq!((commit.space.as_str(), commit.repo.as_str()), (space, repo), "the archive's commit");
+    let mut set = vlpds::space::lthash::LtHash::default();
+    let mut records = Vec::with_capacity(pairs.len());
+    for (i, (key, value)) in pairs.into_iter().enumerate() {
+        if i > 0 {
+            assert!(records.last().is_some_and(|(p, _, _): &(String, _, _)| p.as_bytes() < &key[..]), "strict path order");
+        }
+        let path = String::from_utf8(key).expect("a UTF-8 path");
+        let (c, r) = path.split_once('/').expect("collection/rkey");
+        let mut again = Vec::new();
+        Value::decode(&value).expect("a record").encode(&mut again);
+        assert_eq!(again, value, "{path}: canonical DRISL");
+        let cid = vlatproto::cid::Cid::dag_cbor(&value);
+        set.add(&commit::element(c, r, &cid.to_string()));
+        records.push((path, cid, value));
+    }
+    assert!(commit::matches(&set, &commit), "the records fold to the commit's data");
+    Star { commit, paths: records.iter().map(|r| r.0.clone()).collect(), records }
+}
+
+/// A JSON commit (getLatestCommit, listRepoOps).
+pub fn commit_of(c: &J) -> commit::Commit {
+    commit::Commit::from_json(c).unwrap_or_else(|| panic!("not a commit: {c}"))
 }

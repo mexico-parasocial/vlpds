@@ -37,13 +37,15 @@ pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
 pub mod scheduled_deletion;
-mod server;
+pub(crate) mod server;
 mod signin;
-mod simplespace;
 pub mod space;
 mod space_admin;
+mod space_clear;
 mod space_import;
+mod space_meta;
 mod space_ops;
+mod space_policy;
 pub mod staged_import;
 mod sync;
 mod webui;
@@ -61,7 +63,6 @@ pub use server::{
 pub use server::{LogMailer, Mail, Mailer};
 pub use signin::{trust_expired, ALERTS_PER_DAY, DEFAULT_TRUST_DAYS, TRUST as TRUST_PREFIX};
 pub use staged_import::import_rows;
-pub(crate) use sync::EXPORT_CHUNK;
 pub use sync::{
     export_memory_bytes, find_record, set_export_prefetch_max_bytes, size_export_prefetch_pool, stream_export,
     ExportChunkTx, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS,
@@ -305,9 +306,11 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(space_ops::routes())
                 .merge(match app.config.spaces {
                     true => space::routes()
-                        .merge(simplespace::routes())
+                        .merge(space_policy::routes())
                         .merge(space_admin::routes())
+                        .merge(space_clear::routes())
                         .merge(space_import::routes())
+                        .merge(space_meta::routes())
                         .merge(admin_tools::space_routes()),
                     false => Router::new(),
                 }),
@@ -552,11 +555,12 @@ impl App {
         &self,
         plc: &crate::plc::Plc,
         signing_did_key: &str,
+        kem_did_key: Option<&str>,
         handle: &str,
         recovery_key: Option<&str>,
     ) -> Result<(String, serde_json::Value), XrpcError> {
         for _ in 0..10_000 {
-            let (did, op) = plc.genesis(signing_did_key, handle, &self.public_url, recovery_key)?;
+            let (did, op) = plc.genesis(signing_did_key, kem_did_key, handle, &self.public_url, recovery_key)?;
             if self.cluster.is_none() || self.partitions.for_key(&did).is_some() {
                 return Ok((did, op));
             }
