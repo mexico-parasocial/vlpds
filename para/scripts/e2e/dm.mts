@@ -132,7 +132,7 @@ try {
     db,
     log,
     challenges: new ChallengeStore(),
-    config: { port: 0, matrixServerName: serverName, m8BaseUrl: '' },
+    config: { port: 0, matrixServerName: serverName, m8BaseUrl: '', matrixAllowAppServiceLogin: true },
     matrix: {
       // The real bridge creates the requester's account through the
       // appservice; here the admin API does it.

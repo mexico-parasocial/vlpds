@@ -118,6 +118,7 @@ lazy!(CLUSTER_NUDGES: IntCounterVec = register_int_counter_vec!("vlpds_cluster_n
 lazy!(CLUSTER_LONE_SKIPS: IntCounterVec = register_int_counter_vec!("vlpds_cluster_lone_skips_total", "Control-plane LISTs a lone node skipped (nodes: membership reused, listed at least once per TTL; assign: assignments unchanged but by our own writes, listed every 25 steps)", &["list"]));
 lazy!(CLUSTER_STORE_TIMEOUTS: IntCounterVec = register_int_counter_vec!("vlpds_cluster_store_timeouts_total", "Control-plane object-store calls a step gave up on at their deadline (min(TTL, 5 s)); the step retries next tick", &["op"]));
 lazy!(COMPACTION_POLL_MODE: IntCounterVec = register_int_counter_vec!("vlpds_compaction_poll_switches_total", "Shard compactors switched to fast polls (deep L0) or back to slow (--compaction-polling adaptive)", &["mode"]));
+lazy!(COMPACTOR_RESTARTS: IntCounter = register_int_counter!("vlpds_compactor_restarts_total", "Shard compactors (coordinator + worker) restarted after a failed start or run, with backoff"));
 lazy!(LAYOUT_VERSION: IntGauge = register_int_gauge!("vlpds_shard_layout_version", "Version of the shard layout this node routes by (grows with each split/merge)"));
 lazy!(RESHARD_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_reshard_events_total", "Shard split/merge steps this node performed: planned, frozen (parents closed), split / merged (layout flipped), aborted", &["event"]));
 lazy!(RESHARD_SECONDS: Histogram = register_histogram!("vlpds_reshard_drive_seconds", "Driver time from every parent frozen to the children open (clone, assignments, flip, open)", exponential_buckets(0.01, 2.0, 14).unwrap()));
@@ -161,13 +162,13 @@ impl LeaseRenewHistogram {
 
 pub static LEASE_RENEW_SECONDS: LazyLock<LeaseRenewHistogram> = LazyLock::new(|| {
     LeaseRenewHistogram {
-    secs: register_histogram!("vlpds_lease_renew_seconds", "Node lease renewal round trip (the CAS PUT of nodes/{node_id}), answered or failed. Validity ends TTL - skew after a renewal's send time, so round trips over 0.4 x TTL (4 s at the default TTL) open a gap and the node fail-stops", exponential_buckets(0.001, 2.0, 14).unwrap()).unwrap(),
-    ttl_ratio: register_histogram!("vlpds_lease_renew_ttl_ratio", "Node lease renewal round trip as a fraction of the lease TTL (vlpds_lease_renew_seconds / vlpds_lease_ttl_seconds). Over 0.4 the node's validity gaps and it fail-stops", vec![0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]).unwrap(),
+    secs: register_histogram!("vlpds_lease_renew_seconds", "Node lease renewal round trip (the CAS PUT of nodes/{node_id}), answered or failed. Validity ends TTL - skew after a renewal's send time, so one round trip over TTL - skew - renew, or back-to-back ones over (TTL - skew) / 2 (0.4 x TTL, 4 s, at the defaults), open a gap and the node fail-stops", exponential_buckets(0.001, 2.0, 14).unwrap()).unwrap(),
+    ttl_ratio: register_histogram!("vlpds_lease_renew_ttl_ratio", "Node lease renewal round trip as a fraction of the lease TTL (vlpds_lease_renew_seconds / vlpds_lease_ttl_seconds). Back-to-back ones over (1 - skew / TTL) / 2 (0.4 at the default skew, never less) gap the node's validity and it fail-stops", vec![0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]).unwrap(),
 }
 });
-lazy!(LEASE_TTL: Gauge = register_gauge!("vlpds_lease_ttl_seconds", "Configured node lease TTL (--lease-ttl-ms). Renewal ceiling = 0.4 x TTL; a crashed node's shards are taken over after about TTL + skew"));
-lazy!(LEASE_RENEW_INTERVAL: Gauge = register_gauge!("vlpds_lease_renew_interval_seconds", "Configured node lease renewal interval (TTL / 5)"));
-lazy!(LEASE_SKEW: Gauge = register_gauge!("vlpds_lease_skew_seconds", "Configured clock-skew margin of the node lease (TTL / 5): validity ends TTL - skew after a renewal's send time"));
+lazy!(LEASE_TTL: Gauge = register_gauge!("vlpds_lease_ttl_seconds", "Configured node lease TTL (--lease-ttl-ms). Renewal ceiling = (TTL - skew) / 2; a hung node's shards are taken over after about TTL + skew"));
+lazy!(LEASE_RENEW_INTERVAL: Gauge = register_gauge!("vlpds_lease_renew_interval_seconds", "Configured node lease renewal interval (--lease-renew-ms, default TTL / 5)"));
+lazy!(LEASE_SKEW: Gauge = register_gauge!("vlpds_lease_skew_seconds", "Configured clock-skew margin of the node lease (--lease-skew-ms, default TTL / 5): validity ends TTL - skew after a renewal's send time"));
 lazy!(LEASE_RENEW_ERRORS: IntCounterVec = register_int_counter_vec!("vlpds_lease_renew_errors_total", "Failed node lease renewals by kind: timeout / error (retried next interval), conflict (someone rewrote our lease: fail-stop), lapsed (validity ended before the renewal: fail-stop)", &["kind"]));
 lazy!(LEASE_VALIDITY: GaugeVec = register_gauge_vec!("vlpds_lease_validity_seconds", "Seconds until this node's own lease validity ends (TTL - skew after the send time of its last successful renewal), computed at scrape. Normally between TTL - skew - one renew interval and TTL - skew; negative = lapsed", &["node_id"]));
 lazy!(PEER_TAKEOVERS: IntCounterVec = register_int_counter_vec!("vlpds_peer_takeovers_total", "Log incarnations this node fenced because they ended without fencing themselves (crash, kill, fail-stop, partition): peer = a dead peer's log, before taking its shards; restart = our own previous incarnation's, at startup. A graceful stop fences its own log and is not counted", &["reason"]));
@@ -207,13 +208,16 @@ lazy!(SCOPE_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_scope_r
 lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth, passkey: passwordless with a passkey, on the OAuth page or the account page) and second factor (none, totp, email, passkey, recovery: a recovery code, trusted: a trusted browser skipped it; a passwordless sign-in counts as passkey)", &["method", "factor"]));
 lazy!(SIGN_IN_ALERTS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_alerts_total", "Sign-ins from a new device, by what became of their alert mail: mailed (handed to the mailer), budget (a mail budget refused it: vlpds_mail_suppressed_total{purpose=\"sign_in_alert\"}), account_limit (the account's 3 alerts a day are spent), muted (the owner turned alerts off), no_email, email_code (an emailed code just went to the same inbox), baseline (the account's first recorded sign-in)", &["result"]));
 lazy!(SIGN_IN_SETTINGS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_settings_total", "Sign-in security settings changed by account owners, by setting (oauth_only, block_app_passwords, password_alerts, app_password_alerts) and new value (on, off)", &["setting", "value"]));
+lazy!(OIDC_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_oidc_requests_total", "Calls to sign-in providers by provider id (operator config), op (discovery, jwks, token) and result (ok, error)", &["provider", "op", "result"]));
+lazy!(FEDERATED_SIGN_INS: IntCounterVec = register_int_counter_vec!("vlpds_federated_callbacks_total", "Third-party sign-in callbacks by purpose (sign_in, link) and result: ok, unknown_identity (no account uses it), refused (state, device or id_token checks), provider_error (the provider said no or failed), error", &["purpose", "result"]));
+lazy!(FEDERATED_IDENTITIES: IntCounterVec = register_int_counter_vec!("vlpds_federated_identities_total", "Third-party identities linked to or unlinked from accounts", &["event"]));
 lazy!(PASSKEYS: IntCounterVec = register_int_counter_vec!("vlpds_passkeys_total", "Passkey changes by event: registered (an owner added one on the Security page), removed (an owner removed one), reset (the operator's resetSecondFactors removed them; counts accounts)", &["event"]));
 lazy!(PASSKEY_FAILURES: IntCounterVec = register_int_counter_vec!("vlpds_passkey_failures_total", "Passkey registrations and assertions refused, by the check that failed: malformed, too_large, type, challenge (wrong, expired or bound to another flow), origin, cross_origin, rp_id, user_present, user_verified (passwordless without a PIN or biometric), algorithm, key, signature, credential_id, counter (a hardware key's counter went backwards, or it was flagged for that), unknown_credential (not one of the account's), replay (its challenge was already used)", &["reason"]));
 lazy!(PASSKEY_COUNTER_REGRESSIONS: IntCounterVec = register_int_counter_vec!("vlpds_passkey_counter_regressions_total", "Passkey sign-ins whose signature counter went backwards, by result: refused (a key that can't be synced: flagged and the owner mailed), accepted (a synced passkey, whose copies are expected)", &["result"]));
 lazy!(TRUSTED_BROWSERS: IntCounterVec = register_int_counter_vec!("vlpds_trusted_browsers_total", "Trusted browsers (skip the second factor for --trusted-device-days): granted (\"trust this browser\" after a code), revoked (one, or all, from the account page)", &["event"]));
 lazy!(HANDLE_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_handle_checks_total", "vlpds.identity.checkHandle answers by kind (service: a name under the handle domain; external: the caller's own domain) and status (invalid, reserved, current, taken, available, verified, unverified)", &["kind", "status"]));
 lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
-lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page; passkey: a passkey in place of the password, on the OAuth page or the account page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), passkey_required (a passkey is the account's only strong factor: createSession refused its main password outside this server's own pages), rate_limited, error (server-side failure)", &["method", "result"]));
+lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page; passkey: a passkey in place of the password, on the OAuth page or the account page; federated: a third-party provider in place of the password) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), passkey_required (a passkey is the account's only strong factor: createSession refused its main password outside this server's own pages), rate_limited, error (server-side failure)", &["method", "result"]));
 lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password_resets_total", "Password resets: requested (a reset email asked for), unknown_email (asked for an address with no account; answered the same), completed (a new password set with its token)", &["step"]));
 lazy!(INVITE_CODES: IntCounterVec = register_int_counter_vec!("vlpds_invite_codes_total", "Invite codes: created (admin or earned), used (by a sign-up)", &["event"]));
 lazy!(RECORDS_WRITTEN: IntCounterVec = register_int_counter_vec!("vlpds_records_written_total", "Record ops committed by collection (the well-known app.bsky / chat.bsky collections; any other is `other`) and action (create, update, delete)", &["collection", "action"]));
@@ -335,12 +339,17 @@ pub fn init_counters() {
         LazyLock::force(&IMPORT_RESERVED_BYTES);
         LazyLock::force(&BLOB_UPLOAD_BYTES);
         CPU_CORES.set(std::thread::available_parallelism().map_or(0, |n| n.get()) as f64);
-        for method in ["password", "app_password", "oauth", "passkey"] {
+        for method in ["password", "app_password", "oauth", "passkey", "federated"] {
             for r in LOGIN_RESULTS {
                 LOGINS.with_label_values(&[method, r]);
             }
         }
-        for method in ["password", "app_password", "oauth", "passkey"] {
+        for purpose in ["sign_in", "link"] {
+            for r in ["ok", "unknown_identity", "refused", "provider_error", "error"] {
+                FEDERATED_SIGN_INS.with_label_values(&[purpose, r]);
+            }
+        }
+        for method in ["password", "app_password", "oauth", "passkey", "federated"] {
             for factor in ["none", "totp", "email", "passkey", "recovery", "trusted"] {
                 SIGN_IN_FACTORS.with_label_values(&[method, factor]);
             }
@@ -425,6 +434,10 @@ const LOGIN_RESULTS: [&str; 10] = [
     "error",
 ];
 
+pub fn oidc_request(provider: &str, op: &str, ok: bool) {
+    OIDC_REQUESTS.with_label_values(&[provider, op, if ok { "ok" } else { "error" }]).inc();
+}
+
 pub fn login(method: &str, result: &str) {
     LOGINS.with_label_values(&[method, result]).inc();
 }
@@ -480,7 +493,10 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
             "lease_recreated",
             "history_full",
             "join_lease_moved",
+            "join_landed",
             "shutdown_fence_failed",
+            "renewal_landed",
+            "revalidated",
         ],
     ),
     (&LEASE_RENEW_ERRORS, &["timeout", "error", "conflict", "lapsed"]),
@@ -523,6 +539,7 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&SIGN_IN_ALERTS, &["mailed", "budget", "account_limit", "muted", "no_email", "email_code", "baseline"]),
     (&TRUSTED_BROWSERS, &["granted", "revoked"]),
     (&PASSKEYS, &["registered", "removed", "reset"]),
+    (&FEDERATED_IDENTITIES, &["linked", "unlinked"]),
     (
         &PASSKEY_FAILURES,
         &[

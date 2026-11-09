@@ -16,6 +16,13 @@
 //! and parsing of larger bodies on blocking threads (at most one per core),
 //! and at most [`MUNGE_BUDGET`] decoded bytes being munged at once (a
 //! response past it is returned unmunged). DESIGN.md "Read-after-write".
+//!
+//! With PARA enabled, its feeds (`com.para.feed.{getTimeline,getAuthorFeed,
+//! getPostThread,getPosts}`, WatZappa `api/com/para/feed`) get the
+//! requester's `com.para.post` records the same way, as PARA's flat
+//! PostViews. getPostThread of an own post the AppView hasn't indexed is
+//! built locally, and getPosts fills requested PARA posts the AppView
+//! doesn't return from this PDS's store.
 
 use super::*;
 use crate::recent_writes::{self, Rec, Since};
@@ -30,8 +37,11 @@ const GET_POSTS: &str = "app.bsky.feed.getPosts";
 const GET_POST_THREAD: &str = "app.bsky.feed.getPostThread";
 const GET_FEED_GENERATOR: &str = "app.bsky.feed.getFeedGenerator";
 const GET_LIST: &str = "app.bsky.graph.getList";
+/// The most of the requester's PARA posts a not-found thread is built from
+/// without a rev (WatZappa `readAfterWriteNotFoundNoRev`).
+const PARA_THREAD_SCAN: usize = 1000;
 
-/// The proxied methods the reference munges.
+/// The proxied methods the reference (and WatZappa, for PARA's) munges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     Profile,
@@ -40,6 +50,10 @@ pub(super) enum Kind {
     AuthorFeed,
     Timeline,
     PostThread,
+    ParaAuthorFeed,
+    ParaTimeline,
+    ParaPostThread,
+    ParaPosts,
 }
 
 impl Kind {
@@ -51,8 +65,17 @@ impl Kind {
             "app.bsky.feed.getAuthorFeed" => Kind::AuthorFeed,
             "app.bsky.feed.getTimeline" => Kind::Timeline,
             GET_POST_THREAD => Kind::PostThread,
+            "com.para.feed.getAuthorFeed" => Kind::ParaAuthorFeed,
+            "com.para.feed.getTimeline" => Kind::ParaTimeline,
+            "com.para.feed.getPostThread" => Kind::ParaPostThread,
+            "com.para.feed.getPosts" => Kind::ParaPosts,
             _ => return None,
         })
+    }
+
+    /// One of PARA's feeds (munged only with PARA enabled).
+    pub(super) fn is_para(self) -> bool {
+        matches!(self, Kind::ParaAuthorFeed | Kind::ParaTimeline | Kind::ParaPostThread | Kind::ParaPosts)
     }
 }
 
@@ -257,12 +280,14 @@ struct Local {
     profile: Option<Desc>,
     /// oldest first
     posts: Vec<Desc>,
+    /// `com.para.post`, oldest first (WatZappa `paraPosts`)
+    para_posts: Vec<Desc>,
 }
 
 impl Local {
     /// ms since the oldest merged write (reference `getLocalLag`).
     fn lag(&self) -> Option<i64> {
-        let oldest = self.profile.iter().chain(&self.posts).map(|d| &d.indexed_at).min()?;
+        let oldest = self.profile.iter().chain(&self.posts).chain(&self.para_posts).map(|d| &d.indexed_at).min()?;
         let t = chrono::DateTime::parse_from_rfc3339(oldest).ok()?;
         Some(chrono::Utc::now().timestamp_millis() - t.timestamp_millis())
     }
@@ -287,8 +312,12 @@ fn local_of(did: &str, recs: Vec<Rec>) -> Local {
             Desc { uri: format!("at://{did}/{}", r.path), cid: r.cid.to_string(), indexed_at: rev_time(r.rev), record };
         if &*r.path == recent_writes::PROFILE_PATH {
             l.profile = Some(d);
-        } else if crate::worker::collection_of(&r.path) == recent_writes::POST {
-            l.posts.push(d);
+        } else {
+            match crate::worker::collection_of(&r.path) {
+                recent_writes::POST => l.posts.push(d),
+                recent_writes::PARA_POST => l.para_posts.push(d),
+                _ => {}
+            }
         }
     }
     l
@@ -768,7 +797,243 @@ async fn add_posts_to_thread(viewer: &Viewer<'_>, thread: &mut J, posts: &[&Desc
     Ok(())
 }
 
-async fn munge(kind: Kind, viewer: &Viewer<'_>, mut v: J, local: &Local) -> M<J> {
+// PARA feeds (WatZappa api/com/para/feed)
+// ---------------------------------------
+
+fn created_at(v: &J) -> Option<&str> {
+    str_at(v, "/createdAt")
+}
+
+/// WatZappa `toPostView`: PARA's flat PostView of a local post.
+fn para_post_view(d: &Desc) -> J {
+    let r = &d.record;
+    let author = at_uri_parts(&d.uri).map_or("", |(host, _, _)| host);
+    let mut v = json!({"uri": d.uri, "cid": d.cid, "author": author});
+    for k in ["text", "createdAt", "postType"] {
+        if let Some(x) = r.get(k).filter(|x| !x.is_null()) {
+            v[k] = x.clone();
+        }
+    }
+    if let Some(x) = str_at(r, "/reply/root/uri") {
+        v["replyRoot"] = x.into();
+    }
+    if let Some(x) = str_at(r, "/reply/parent/uri") {
+        v["replyParent"] = x.into();
+    }
+    for k in ["langs", "tags", "flairs"] {
+        if let Some(a) = r.get(k).and_then(J::as_array).filter(|a| !a.is_empty()) {
+            v[k] = J::Array(a.clone());
+        }
+    }
+    v
+}
+
+/// Newest `createdAt` first (WatZappa sorts with `localeCompare`).
+fn sort_newest_first(views: &mut [J]) {
+    views.sort_by(|a, b| created_at(b).unwrap_or("").cmp(created_at(a).unwrap_or("")));
+}
+
+/// WatZappa `insertLocalPostsInFeed`: PARA's feeds are ordered by
+/// `createdAt` (they carry no indexedAt).
+fn insert_para_posts(feed: &mut Vec<J>, posts: &[Desc]) {
+    if posts.is_empty() {
+        return;
+    }
+    let mut in_feed: std::collections::HashSet<String> =
+        feed.iter().filter_map(|i| str_at(i, "/uri")).map(String::from).collect();
+    let last = feed.last().and_then(created_at).unwrap_or("1970-01-01T00:00:00.000Z").to_string();
+    let mut local: Vec<J> = posts
+        .iter()
+        .filter(|p| created_at(&p.record).is_some_and(|c| c > last.as_str()))
+        .filter(|p| !in_feed.contains(&p.uri))
+        .map(para_post_view)
+        .collect();
+    sort_newest_first(&mut local);
+    for post in local {
+        let at = created_at(&post).unwrap_or_default().to_string();
+        let idx = feed.iter().position(|i| created_at(i).is_some_and(|t| t < at.as_str()));
+        in_feed.insert(str_at(&post, "/uri").unwrap_or_default().to_string());
+        match idx {
+            Some(i) => feed.insert(i, post),
+            None => feed.push(post),
+        }
+    }
+}
+
+/// WatZappa `getPostThreadMunge`: the requester's newer PARA posts as the
+/// anchor, its missing parents and the root's missing replies.
+fn munge_para_thread(v: &mut J, posts: &[Desc]) -> M<()> {
+    if posts.is_empty() {
+        return Ok(());
+    }
+    let post = v.get("post").filter(|p| p.is_object()).ok_or(Abort)?.clone();
+    let parents = v.get("parents").and_then(J::as_array).ok_or(Abort)?.clone();
+    let mut replies = v.get("replies").and_then(J::as_array).ok_or(Abort)?.clone();
+    let uri = str_at(&post, "/uri").ok_or(Abort)?.to_string();
+    let by_uri: HashMap<&str, &Desc> = posts.iter().map(|p| (p.uri.as_str(), p)).collect();
+    let mut seen: std::collections::HashSet<String> = std::iter::once(uri.clone())
+        .chain(parents.iter().chain(&replies).filter_map(|p| str_at(p, "/uri")).map(String::from))
+        .collect();
+    let anchor = by_uri.get(uri.as_str()).map_or_else(|| post.clone(), |d| para_post_view(d));
+    let mut added = Vec::new();
+    let mut next = str_at(&post, "/replyParent").map(String::from);
+    while let Some(p) = next.take().filter(|p| !seen.contains(p)) {
+        let Some(d) = by_uri.get(p.as_str()) else { break };
+        added.push(para_post_view(d));
+        seen.insert(p);
+        next = str_at(&d.record, "/reply/parent/uri").map(String::from);
+    }
+    added.reverse();
+    let root = str_at(&post, "/replyRoot").unwrap_or(&uri).to_string();
+    for d in posts {
+        if seen.contains(&d.uri) || str_at(&d.record, "/reply/root/uri") != Some(root.as_str()) {
+            continue;
+        }
+        replies.push(para_post_view(d));
+        seen.insert(d.uri.clone());
+    }
+    sort_newest_first(&mut replies);
+    added.extend(parents);
+    v["post"] = anchor;
+    v["parents"] = J::Array(added);
+    v["replies"] = J::Array(replies);
+    Ok(())
+}
+
+/// A thread built from local PARA posts only (WatZappa
+/// `readAfterWriteNotFound`): `anchor`, its parents among `posts` and the
+/// root's replies among them.
+fn para_thread(anchor: &Desc, posts: &[Desc]) -> J {
+    let by_uri: HashMap<&str, &Desc> = posts.iter().map(|p| (p.uri.as_str(), p)).collect();
+    let post = para_post_view(anchor);
+    let mut parents = Vec::new();
+    let mut seen = std::collections::HashSet::from([anchor.uri.as_str()]);
+    let mut next = str_at(&anchor.record, "/reply/parent/uri");
+    // `seen` ends a cycle of parents (WatZappa's loop would not)
+    while let Some(d) = next.filter(|p| seen.insert(p)).and_then(|p| by_uri.get(p)) {
+        parents.push(para_post_view(d));
+        next = str_at(&d.record, "/reply/parent/uri");
+    }
+    parents.reverse();
+    let root = str_at(&post, "/replyRoot").unwrap_or(&anchor.uri);
+    let mut replies: Vec<J> = posts
+        .iter()
+        .filter(|p| p.uri != anchor.uri && str_at(&p.record, "/reply/root/uri") == Some(root))
+        .map(para_post_view)
+        .collect();
+    sort_newest_first(&mut replies);
+    json!({"post": post, "parents": parents, "replies": replies})
+}
+
+/// The `uris` a getPosts asks for, in order.
+fn requested_uris(pq: &str) -> Vec<String> {
+    query_params(pq).into_iter().filter(|(k, _)| k == "uris").map(|(_, v)| v).collect()
+}
+
+/// A requested PARA post by DID (`at://did:.../com.para.post/<rkey>`).
+fn is_para_post_uri(uri: &str) -> bool {
+    at_uri_parts(uri).is_some_and(|(host, coll, rkey)| {
+        host.starts_with("did:") && coll == Some(recent_writes::PARA_POST) && rkey.is_some()
+    })
+}
+
+/// A PARA post of an available account on this PDS, as getRecord serves it
+/// (WatZappa getPosts' `getRequestedLocalPosts`).
+async fn stored_para_post(app: &App, uri: &str) -> Option<Desc> {
+    let (did, _, rkey) = at_uri_parts(uri).filter(|_| is_para_post_uri(uri))?;
+    let acct = crate::xrpc::sync::assert_available(app, did, None).await.ok()?;
+    let path = format!("{}/{}", recent_writes::PARA_POST, rkey?);
+    let raw = app.record_value(did, Some(acct.repo_gen), &path).await.ok()??;
+    if crate::xrpc::admin::is_record_takendown(app, did, &path).await.unwrap_or(true) {
+        return None;
+    }
+    let (cid, bytes) = state::decode_record_value(&raw).ok()?;
+    Some(Desc {
+        uri: format!("at://{did}/{path}"),
+        cid: cid.to_string(),
+        indexed_at: rev_time(state::record_value_rev(&raw)),
+        record: record_json(&bytes)?,
+    })
+}
+
+/// Up to [`PARA_THREAD_SCAN`] of `did`'s PARA posts, newest first (the
+/// reference listRecords order), without taken-down ones; each `indexed_at`
+/// is `indexed_at`, as WatZappa's `readAfterWriteNotFoundNoRev` sets them.
+async fn stored_para_posts(app: &App, did: &str, gen: u64, indexed_at: &str) -> Option<Vec<Desc>> {
+    let p = app.partition(did).ok()?;
+    let prefix = state::record_key(did, gen, &format!("{}/", recent_writes::PARA_POST));
+    let opts = slatedb::config::ScanOptions::default().with_order(slatedb::IterationOrder::Descending);
+    let takedowns = crate::xrpc::server::ctl(app, did).await.ok()?;
+    let mut iter = p.db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &opts).await.ok()?;
+    let mut out = Vec::new();
+    while out.len() < PARA_THREAD_SCAN {
+        let rows = iter.next_batch(PARA_THREAD_SCAN - out.len()).await.ok()?;
+        if rows.is_empty() {
+            break;
+        }
+        for kv in rows {
+            let Ok(rkey) = std::str::from_utf8(&kv.key[prefix.len()..]) else { continue };
+            if takedowns.has_takedown(&format!("rec/{}/{rkey}", recent_writes::PARA_POST)) {
+                continue;
+            }
+            let Some(record) =
+                state::decode_record_value(&kv.value).ok().and_then(|(cid, b)| Some((cid, record_json(&b)?)))
+            else {
+                continue;
+            };
+            out.push(Desc {
+                uri: format!("at://{did}/{}/{rkey}", recent_writes::PARA_POST),
+                cid: record.0.to_string(),
+                indexed_at: indexed_at.to_string(),
+                record: record.1,
+            });
+        }
+    }
+    Some(out)
+}
+
+/// WatZappa `getPostsMunge`: the requested PARA posts the AppView didn't
+/// return, from the requester's newer records, else this PDS's store (for
+/// any author it hosts; WatZappa reads only the first requested post's),
+/// in the order asked. Nothing to add: the original is returned.
+async fn munge_para_posts(app: &App, v: &mut J, local: &mut Local, pq: &str) -> M<()> {
+    let posts = v.get("posts").and_then(J::as_array).ok_or(Abort)?;
+    let mut by_uri: HashMap<String, J> =
+        posts.iter().filter_map(|p| Some((str_at(p, "/uri")?.to_string(), p.clone()))).collect();
+    let requested = requested_uris(pq);
+    let mut added = false;
+    for d in &local.para_posts {
+        if requested.contains(&d.uri) && !by_uri.contains_key(&d.uri) {
+            by_uri.insert(d.uri.clone(), para_post_view(d));
+            added = true;
+        }
+    }
+    for uri in &requested {
+        if by_uri.contains_key(uri) || !is_para_post_uri(uri) {
+            continue;
+        }
+        if let Some(d) = stored_para_post(app, uri).await {
+            by_uri.insert(uri.clone(), para_post_view(&d));
+            local.para_posts.push(d);
+            added = true;
+        }
+    }
+    if !added {
+        return Err(Abort);
+    }
+    v["posts"] = J::Array(requested.iter().filter_map(|u| by_uri.get(u).cloned()).collect());
+    Ok(())
+}
+
+/// Whether getAuthorFeed's `actor` is the requester (by DID or handle;
+/// WatZappa `resolveLocalActorDid`).
+async fn is_own_actor(app: &App, did: &str, pq: &str) -> bool {
+    let Some((_, actor)) = query_params(pq).into_iter().find(|(k, _)| k == "actor") else { return false };
+    actor == did
+        || (!actor.starts_with("did:") && app.account(did).await.is_ok_and(|a| a.handle.eq_ignore_ascii_case(&actor)))
+}
+
+async fn munge(kind: Kind, viewer: &Viewer<'_>, mut v: J, local: &mut Local, pq: &str) -> M<J> {
     if !v.is_object() {
         return Err(Abort);
     }
@@ -816,6 +1081,19 @@ async fn munge(kind: Kind, viewer: &Viewer<'_>, mut v: J, local: &Local) -> M<J>
                 add_posts_to_thread(viewer, thread, &posts).await?;
             }
         }
+        Kind::ParaAuthorFeed => {
+            v.get("feed").and_then(J::as_array).ok_or(Abort)?;
+            if !local.para_posts.is_empty() && is_own_actor(viewer.app, me, pq).await {
+                let feed = v.get_mut("feed").and_then(J::as_array_mut).ok_or(Abort)?;
+                insert_para_posts(feed, &local.para_posts);
+            }
+        }
+        Kind::ParaTimeline => {
+            let feed = v.get_mut("feed").and_then(J::as_array_mut).ok_or(Abort)?;
+            insert_para_posts(feed, &local.para_posts);
+        }
+        Kind::ParaPostThread => munge_para_thread(&mut v, &local.para_posts)?,
+        Kind::ParaPosts => munge_para_posts(viewer.app, &mut v, local, pq).await?,
     }
     Ok(v)
 }
@@ -851,25 +1129,37 @@ pub(super) async fn proxy(
                 return Ok(r);
             }
         }
+        // WatZappa's getPostThread also takes any 400 or 404 as not found
+        if kind == Kind::ParaPostThread && (err.error.as_deref() == Some("NotFound") || matches!(err.status, 400 | 404))
+        {
+            if let Some(r) = para_thread_not_found(app, acct, did, pq, &err.headers).await {
+                return Ok(r);
+            }
+        }
         return Ok(err.into_response());
     }
-    let Some(rev) = parts.headers.get(REPO_REV).and_then(|v| v.to_str().ok()).and_then(vlatproto::tid::Tid::parse)
-    else {
+    let rev = parts.headers.get(REPO_REV).and_then(|v| v.to_str().ok()).and_then(vlatproto::tid::Tid::parse);
+    // getPosts fills requested PARA posts from the store, with or without a rev
+    let from_store = kind == Kind::ParaPosts && requested_uris(pq).iter().any(|u| is_para_post_uri(u));
+    if rev.is_none() && !from_store {
         return Ok(passthrough(parts, body));
-    };
+    }
     let json = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_none_or(is_json_content_type);
     if !json {
         return Ok(passthrough(parts, body));
     }
-    let recs = match records_since(app, did, acct.part, rev.0).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(did, "read-after-write: local records: {e}");
-            COUNTERS.failed.inc();
-            return Ok(passthrough(parts, body));
-        }
+    let recs = match rev {
+        None => Vec::new(),
+        Some(rev) => match records_since(app, did, acct.part, rev.0).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(did, "read-after-write: local records: {e}");
+                COUNTERS.failed.inc();
+                return Ok(passthrough(parts, body));
+            }
+        },
     };
-    if recs.is_empty() {
+    if recs.is_empty() && !from_store {
         return Ok(passthrough(parts, body));
     }
     let Some(codings) = codings(&parts.headers) else {
@@ -896,9 +1186,9 @@ pub(super) async fn proxy(
         COUNTERS.unchanged.inc();
         return Ok(original(raw));
     };
-    let local = local_of(did, recs);
+    let mut local = local_of(did, recs);
     let viewer = Viewer { app, did, acct };
-    match munge(kind, &viewer, v, &local).await {
+    match munge(kind, &viewer, v, &mut local, pq).await {
         Ok(v) => {
             COUNTERS.munged.inc();
             let lag = local.lag();
@@ -964,6 +1254,47 @@ async fn thread_not_found(app: &App, acct: &CachedAcct, did: &str, pq: &str, hea
         }
     }
     Some(munged_response(&json!({ "thread": thread }), local.lag()))
+}
+
+/// PARA getPostThread of the requester's own post the AppView hasn't
+/// indexed (WatZappa `readAfterWriteNotFound`, else
+/// `readAfterWriteNotFoundNoRev`): the thread is built from the requester's
+/// PARA posts written since the rev, else from the post and up to
+/// [`PARA_THREAD_SCAN`] of their PARA posts in the store.
+async fn para_thread_not_found(
+    app: &App,
+    acct: &CachedAcct,
+    did: &str,
+    pq: &str,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let params = query_params(pq);
+    let (host, coll, rkey) = at_uri_parts(params.iter().find(|(k, _)| k == "uri").map(|(_, v)| v.as_str())?)?;
+    if host != did {
+        // a handle: only the requester's own matters
+        if host.starts_with("did:") || app.account(did).await.ok()?.handle != host.to_ascii_lowercase() {
+            return None;
+        }
+    }
+    let (coll, rkey) = (coll?, rkey?);
+    let uri = format!("at://{did}/{coll}/{rkey}");
+    if let Some(rev) = headers.get(REPO_REV).and_then(|v| v.to_str().ok()).and_then(vlatproto::tid::Tid::parse) {
+        if let Ok(recs) = records_since(app, did, acct.part, rev.0).await {
+            let local = local_of(did, recs);
+            if let Some(anchor) = local.para_posts.iter().find(|p| p.uri == uri) {
+                return Some(munged_response(&para_thread(anchor, &local.para_posts), local.lag()));
+            }
+        }
+    }
+    if coll != recent_writes::PARA_POST {
+        return None;
+    }
+    let anchor = stored_para_post(app, &uri).await?;
+    let gen = app.account(did).await.ok()?.repo_gen;
+    let posts = stored_para_posts(app, did, gen, &anchor.indexed_at).await?;
+    let thread = para_thread(&anchor, &posts);
+    // lag: since the post was written
+    Some(munged_response(&thread, Local { para_posts: vec![anchor], ..Default::default() }.lag()))
 }
 
 #[cfg(test)]
@@ -1083,5 +1414,72 @@ mod tests {
         insert_reply(&mut t, "at://a/p/1", &thread_view_post(&json!({"uri": "at://a/p/4"})));
         assert_eq!(t["replies"][0]["post"]["uri"], "at://a/p/4");
         assert_eq!(t["replies"][1]["replies"][0]["post"]["uri"], "at://a/p/3");
+    }
+
+    fn para(rkey: &str, created_at: &str, reply: Option<(&str, &str)>) -> Desc {
+        let mut record = json!({"$type": "com.para.post", "text": rkey, "createdAt": created_at, "tags": []});
+        if let Some((root, parent)) = reply {
+            record["reply"] = json!({"root": {"uri": format!("at://did:x/com.para.post/{root}")},
+                "parent": {"uri": format!("at://did:x/com.para.post/{parent}")}});
+        }
+        Desc {
+            uri: format!("at://did:x/com.para.post/{rkey}"),
+            cid: "bafy".into(),
+            indexed_at: created_at.into(),
+            record,
+        }
+    }
+
+    fn uris(v: &J) -> Vec<&str> {
+        v.as_array().unwrap().iter().map(|p| p["uri"].as_str().unwrap().rsplit('/').next().unwrap()).collect()
+    }
+
+    #[test]
+    fn para_post_views() {
+        let v = para_post_view(&para("b", "2026-01-02T00:00:00Z", Some(("r", "a"))));
+        assert_eq!(
+            v,
+            json!({"uri": "at://did:x/com.para.post/b", "cid": "bafy", "author": "did:x", "text": "b",
+                "createdAt": "2026-01-02T00:00:00Z", "replyRoot": "at://did:x/com.para.post/r",
+                "replyParent": "at://did:x/com.para.post/a"})
+        );
+    }
+
+    #[test]
+    fn para_feed_inserts_by_created_at() {
+        let feed_post =
+            |rkey: &str, at: &str| json!({"uri": format!("at://did:x/com.para.post/{rkey}"), "createdAt": at});
+        let mut feed = vec![feed_post("f3", "2026-01-03T00:00:00Z"), feed_post("f1", "2026-01-01T00:00:00Z")];
+        let local = [
+            para("old", "2025-12-31T00:00:00Z", None), // older than the page: not inserted
+            para("l2", "2026-01-02T00:00:00Z", None),
+            para("l4", "2026-01-04T00:00:00Z", None),
+            para("f3", "2026-01-03T00:00:00Z", None), // already there
+        ];
+        insert_para_posts(&mut feed, &local);
+        assert_eq!(uris(&J::Array(feed)), ["l4", "f3", "l2", "f1"]);
+    }
+
+    #[test]
+    fn para_threads() {
+        let root = para("r", "2026-01-01T00:00:00Z", None);
+        let a = para("a", "2026-01-02T00:00:00Z", Some(("r", "r")));
+        let b = para("b", "2026-01-03T00:00:00Z", Some(("r", "a")));
+        let posts = [root, a, b];
+        let t = para_thread(&posts[2], &posts);
+        assert_eq!(uris(&t["parents"]), ["r", "a"]);
+        assert_eq!(uris(&t["replies"]), ["a"]);
+
+        // AppView's thread of the root: the local replies, newest first
+        let mut v = json!({"post": para_post_view(&posts[0]), "parents": [], "replies": []});
+        munge_para_thread(&mut v, &posts[1..]).unwrap();
+        assert_eq!(uris(&v["replies"]), ["b", "a"]);
+        assert!(munge_para_thread(&mut json!({"post": {}}), &posts).is_err());
+
+        // a cycle of parents ends
+        let x = para("x", "2026-01-01T00:00:00Z", Some(("x", "y")));
+        let y = para("y", "2026-01-02T00:00:00Z", Some(("x", "x")));
+        let posts = [x, y];
+        assert_eq!(uris(&para_thread(&posts[0], &posts)["parents"]), ["y"]);
     }
 }

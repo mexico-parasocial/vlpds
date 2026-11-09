@@ -84,7 +84,7 @@ export type AccountRow = {
   /** The node that read it (its shard's owner). */
   node: string
   invitesDisabled: boolean
-  secondFactors: { passkeys: number; totp: boolean; emailCode: boolean }
+  secondFactors: { passkeys: number; totp: boolean; emailCode: boolean; im8?: boolean }
   blobBytes: number
   overQuota: boolean
   /** From the repo's kept counts; absent for an account without a repo. */
@@ -192,6 +192,7 @@ export type AccountSecurity = {
   secondFactorRequired: boolean
   passkeys: { name: string; createdAt: number; lastUsedAt?: number | null; backedUp: boolean; suspect: boolean; transports: string[] }[]
   totp: { enabled: boolean; enabledAt?: string | null }
+  im8?: { enabled: boolean }
   emailCode: { enabled: boolean; since?: string | null }
   recoveryCodes: { remaining: number; total: number; issuedAt?: number | null }
   /** Wrong-code counts, and the lock while one is in force. */

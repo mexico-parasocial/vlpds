@@ -408,6 +408,10 @@ fn lease() -> vlpds::cluster::NodeLease {
         max_level: 1,
         seen_level: 1,
         pending_age_ms: None,
+        // level 3 on (`cluster::LEASE_TIMING_LEVEL`)
+        ttl_ms: Some(10_000),
+        skew_ms: Some(2_000),
+        renew_ms: Some(2_000),
     }
 }
 
@@ -445,6 +449,72 @@ fn ratelimits() -> Vec<u8> {
     )
     .unwrap();
     compact(&d)
+}
+
+/// Feature level 2: the sign-in providers object (`config/signin-providers.json`).
+fn signin_providers() -> Vec<u8> {
+    use vlpds::federated::config::*;
+    let p = |id: &str, issuer: &str, auth: ClientAuth| Provider {
+        id: id.into(),
+        name: "Example".into(),
+        icon: Some("data:image/png;base64,iVBORw0KGgo".into()),
+        issuer: issuer.into(),
+        client_id: "client-1".into(),
+        client_auth: auth,
+        scopes: vec!["openid".into(), "email".into()],
+        response_mode: ResponseMode::Query,
+        signup: Signup::Off,
+        signups_per_day: 25,
+        trust_email: true,
+        required_claims: [("hd".to_string(), "example.com".to_string())].into(),
+        id_token_algs: vec!["RS256".into()],
+        updated_at: Some(TIME.into()),
+        updated_by: Some("admin".into()),
+    };
+    let doc = Doc {
+        providers: vec![
+            p(
+                "example",
+                "https://accounts.example.com",
+                ClientAuth {
+                    method: AuthMethod::ClientSecretBasic,
+                    secret: Some(SecretRef::Wrapped("vw1.Labcdef0123456789.c2VjcmV0".into())),
+                    key: None,
+                    key_id: None,
+                    signed_secret: None,
+                },
+            ),
+            p(
+                "signed",
+                "https://signed.example.com",
+                ClientAuth {
+                    method: AuthMethod::ClientSecretPost,
+                    secret: None,
+                    key: Some(SecretRef::Wrapped("vw1.Labcdef0123456789.cDg".into())),
+                    key_id: Some("ABC123".into()),
+                    signed_secret: Some(SignedSecret {
+                        issuer: "TEAM".into(),
+                        audience: None,
+                        lifetime_secs: Some(3600),
+                    }),
+                },
+            ),
+            p(
+                "keyed",
+                "https://keyed.example.com",
+                ClientAuth {
+                    method: AuthMethod::PrivateKeyJwt,
+                    secret: None,
+                    key: Some(SecretRef::Wrapped("vw1.Labcdef0123456789.a2V5".into())),
+                    key_id: Some("k1".into()),
+                    signed_secret: None,
+                },
+            ),
+        ],
+        version: 3,
+        updated_at: Some(TIME.into()),
+    };
+    serde_json::to_vec_pretty(&doc).unwrap()
 }
 
 fn space_revocations() -> vlpds::space::revocations::Doc {
@@ -540,11 +610,17 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("stream/watermark.bin", vlpds::remote::encode_watermark(1003 << 8).to_vec()),
         ("private/rows.json", private_rows()),
         ("private/blob_quota.json", blob_quota_rows()),
+        (
+            "private/blob_quota_max_blob.json",
+            rows_json(vlpds::xrpc::private_rows::blob_quota_max_blob_row_fixtures(DID)),
+        ),
         ("private/app_password_scopes.json", app_password_scope_rows()),
         ("private/sign_in.json", rows_json(vlpds::xrpc::private_rows::sign_in_row_fixtures(DID))),
         ("private/sign_in_failures.json", rows_json(vlpds::xrpc::private_rows::sign_in_failure_row_fixtures(DID))),
         ("private/passkeys.json", rows_json(vlpds::xrpc::private_rows::passkey_row_fixtures(DID))),
     ];
+    v.push(("control/signin_providers.json", signin_providers()));
+    v.push(("private/federated.json", rows_json(vlpds::xrpc::private_rows::federated_row_fixtures(DID))));
     v.extend(frames());
     v
 }
@@ -819,13 +895,22 @@ fn json_reencode<T: serde::Serialize + serde::de::DeserializeOwned>(name: &str, 
     v
 }
 
+/// The level a segment written at `level` names in its header: the one
+/// that introduced its magic (a level without a segment change keeps it).
+fn seg_level(level: u32) -> u32 {
+    version::segment_level(version::segment_magic(level)).unwrap()
+}
+
 /// Decodes one fixture with this build's readers and re-encodes it.
 async fn check(level: u32, name: &str, b: &[u8]) {
     let dir = level_dir(level);
     match name {
         "segment/plain.seg" => {
             let (h, _) = segment::parse_header(b).unwrap().unwrap();
-            assert_eq!((h.level, h.codec, h.ordinal, h.prefix_end, h.count), (level, segment::CODEC_NONE, 5, 4, 3));
+            assert_eq!(
+                (h.level, h.codec, h.ordinal, h.prefix_end, h.count),
+                (seg_level(level), segment::CODEC_NONE, 5, 4, 3)
+            );
             assert_eq!(
                 h.checksum.is_some(),
                 level == version::TEST_LEVEL,
@@ -839,7 +924,7 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         }
         "segment/zstd.seg" => {
             let (h, _) = segment::parse_header(b).unwrap().unwrap();
-            assert_eq!((h.level, h.codec), (level, segment::CODEC_ZSTD));
+            assert_eq!((h.level, h.codec), (seg_level(level), segment::CODEC_ZSTD));
             // zstd's output may change with the library; only decoding is a format
             let plain = std::fs::read(dir.join("segment/plain.seg")).unwrap();
             assert!(segment::decode(Bytes::copy_from_slice(b)).unwrap() == plain, "{name}: decodes to plain.seg");
@@ -848,7 +933,7 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let LogObject::Segment(h, entries) = vlpds::derived::parse(Bytes::copy_from_slice(b), None).unwrap() else {
                 panic!("{name}")
             };
-            assert_eq!(h.level, level, "{name}: segment level");
+            assert_eq!(h.level, seg_level(level), "{name}: segment level");
             let e = &entries[0];
             // c/ put, R/ put, the backlink put, h/
             assert_eq!(e.derived, 4, "{name}: #commit muts derived");
@@ -1032,6 +1117,13 @@ async fn check(level: u32, name: &str, b: &[u8]) {
                 "min_seg_format is the test level's field"
             );
         }
+        "control/signin_providers.json" => {
+            let d: vlpds::federated::config::Doc = serde_json::from_slice(b).unwrap();
+            assert!(serde_json::to_vec_pretty(&d).unwrap() == b, "{name}: re-encode differs");
+            for p in &d.providers {
+                assert_eq!(vlpds::federated::config::invalid(p, false), None, "{name}: {}", p.id);
+            }
+        }
         "control/ratelimits.json" => {
             let d = vlpds::ratelimit::config::parse(b).unwrap();
             assert!(compact(&d) == b);
@@ -1083,10 +1175,12 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert!(kinds.len() >= 20, "L{level}/{name}: only {} row kinds: {kinds:?}", kinds.len());
         }
         "private/blob_quota.json"
+        | "private/blob_quota_max_blob.json"
         | "private/app_password_scopes.json"
         | "private/sign_in.json"
         | "private/sign_in_failures.json"
-        | "private/passkeys.json" => {
+        | "private/passkeys.json"
+        | "private/federated.json" => {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(b).unwrap();
             assert!(pretty(&rows) == b, "{name}: re-encode differs");
             for r in &rows {

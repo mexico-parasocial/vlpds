@@ -6,8 +6,10 @@ import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { acall, call, setSession } from '../../lib/xrpc'
 import { RecoveryKeys } from './RecoveryKeys'
+import { SignInMethods } from './SignInMethods'
 import { SignInSecurity } from './SignIns'
 import { Passkeys, RecoveryCodes, SavedCodes } from './Passkeys'
+import { Im8 } from './Im8'
 
 export function Security() {
   const [ver, setVer] = useState(0)
@@ -15,8 +17,10 @@ export function Security() {
     <>
       <PageHead title="Security" desc="Passkeys and two-factor sign-in, where you've signed in, your recovery key, passwords for apps, and the apps you've connected." />
       <Passkeys onChange={() => setVer((v) => v + 1)} />
+      <Im8 />
       <Totp onChange={() => setVer((v) => v + 1)} />
       <RecoveryCodes ver={ver} />
+      <SignInMethods />
       <SignInSecurity ver={ver} />
       <RecoveryKeys />
       <AppPasswords />

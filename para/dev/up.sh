@@ -7,11 +7,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE="$HERE/../.dev"
 ENV_FILE="$STATE/dev.env"
-VLPDS_IMAGE="${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}"
+KEY_IMAGE="${VLPDS_KEY_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}"
 
 mkdir -p "$STATE"
 if [ ! -s "$ENV_FILE" ]; then
-  key() { docker run --rm "$VLPDS_IMAGE" --generate-did-key 2>&1 | grep -io 'private key (hex): [0-9a-f]*' | awk '{print $NF}'; }
+  key() { docker run --rm "$KEY_IMAGE" --generate-did-key 2>&1 | grep -io 'private key (hex): [0-9a-f]*' | awk '{print $NF}'; }
   umask 077
   {
     echo "DEV_PLC_ROTATION_KEY=$(key)"
@@ -28,7 +28,10 @@ if [ -n "$busy" ]; then
   exit 2
 fi
 
-compose() { docker compose -f "$HERE/compose.yaml" --env-file "$ENV_FILE" "$@"; }
+# vlRelay por defecto (compose.vlrelay.yaml, docs/vlrelay.md); PARA_RELAY=rsky vuelve a rsky.
+RELAY_FILES=(-f "$HERE/compose.yaml")
+[ "${PARA_RELAY:-vlrelay}" = vlrelay ] && RELAY_FILES+=(-f "$HERE/compose.vlrelay.yaml")
+compose() { docker compose "${RELAY_FILES[@]}" --env-file "$ENV_FILE" "$@"; }
 compose up -d --build
 
 wait_http() { # wait_http NOMBRE URL SEGUNDOS
@@ -45,15 +48,15 @@ wait_http vlpds http://localhost:2583/xrpc/_health 120
 wait_http AppView http://localhost:2584/xrpc/_health 120
 wait_http relay http://localhost:2470/xrpc/_health 60
 
-# El relay solo da de alta hosts que alcanza por IP pública, también por su
-# ruta de admin, así que vlpds (localhost) se registra en su base de datos.
-# Al reiniciar, el relay se suscribe a cada host activo desde last_seq.
-added="$(compose exec -T postgres psql -U postgres -d relay -Atc \
-  "INSERT INTO host (created_at, updated_at, hostname, no_ssl, account_limit, trusted, status, last_seq)
-   VALUES (now(), now(), 'localhost:2583', true, 1000, true, 'active', 0)
-   ON CONFLICT (hostname) DO NOTHING RETURNING id")"
-if [ -n "$added" ]; then
-  compose restart relay >/dev/null
-  wait_http relay http://localhost:2470/xrpc/_health 60
+if [ "${PARA_RELAY:-vlrelay}" = vlrelay ]; then
+  # vlRelay sigue a vlpds por --host desde que arranca; solo se comprueba.
+  curl -fsS http://localhost:2470/xrpc/com.atproto.sync.listHosts | grep -q '"hostname":"localhost:2583"' \
+    || { echo "✗ vlRelay no lista localhost:2583" >&2; exit 1; }
+  echo "✓ vlRelay sigue el firehose de vlpds"
+else
+  # rsky registra únicamente RELAY_PDS_HOST y usa el transporte local fijado.
+  # No hace falta escribir en una base ajena ni reiniciar para registrar el PDS.
+  curl -fsS http://localhost:2470/xrpc/com.atproto.sync.requestCrawl \
+    -H 'content-type: application/json' -d '{"hostname":"localhost:2583"}' >/dev/null
+  echo "✓ rsky sigue el firehose de vlpds"
 fi
-echo "✓ el relay sigue el firehose de vlpds"

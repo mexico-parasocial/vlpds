@@ -74,7 +74,8 @@ services:
           memory: ${ELEMENT_MEM:-64m}
   matrix-bridge:
     container_name: !reset null
-    profiles: [matrix]
+    # governance: el bridge sin chat (overrides/bridge-chat-off.yaml).
+    profiles: [matrix, governance]
     image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-matrix-bridge:${WATZAPPA_VERSION:-local}
     labels:
       para.metrics.port: '3001'
@@ -105,6 +106,9 @@ services:
       # El firehose de vlpds renumerado por el relay: el consumidor del
       # bridge, como @atproto/sync, no admite seq por encima de 2^53.
       PDS_FIREHOSE_URL: ws://relay:2470
+      # Cambiar de relay crea otro espacio de cursores. Un bridge existente
+      # rechaza el cambio hasta completar la migración documentada.
+      BRIDGE_PDS_SOURCE_ID: ${RELAY_STREAM_ID:-rsky-relay-v1}
       MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:-matrix.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}}
       MATRIX_ENABLE_ENCRYPTION: ${MATRIX_ENABLE_ENCRYPTION:-true}
       PLC_URL: ${PLC_URL:-https://plc.directory}
@@ -112,6 +116,10 @@ services:
       # hace falta salir al host por host.docker.internal.
       M8_BASE_URL: ${M8_BASE_URL:-http://mubez:8787/v1}
       BRIDGE_AUTHORITY_APPVIEW_URL: ${BRIDGE_AUTHORITY_APPVIEW_URL:-https://appview.${PARA_DOMAIN}}
+      MATRIX_MAS_ADMIN_URL: http://mas:8081
+      MATRIX_MAS_TOKEN_URL: http://mas:8080/oauth2/token
+      MATRIX_MAS_CLIENT_ID: 01K3ZQD8N7P0J5R2T9V4W6X8YD
+      MATRIX_MAS_CLIENT_SECRET_FILE: /run/secrets/mas_bridge_admin_secret
       MATRIX_ADMIN_TOKEN: ''
       MATRIX_ADMIN_TOKEN_FILE: /run/secrets/matrix_admin_token
       MATRIX_APPSERVICE_TOKEN: ''
@@ -121,6 +129,7 @@ services:
     secrets:
       - postgres_url_bridge
       - matrix_admin_token
+      - mas_bridge_admin_secret
       - matrix_appservice_token
       - matrix_hs_token
       - authority_service_token

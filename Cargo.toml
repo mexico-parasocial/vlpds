@@ -1,6 +1,6 @@
 [package]
 name = "vlpds"
-version = "1.1.0"
+version = "1.3.0"
 edition = "2021"
 description = "An atproto Personal Data Server whose only durable storage is an object store, clustered across any number of nodes"
 license = "MIT"
@@ -44,11 +44,11 @@ test-level = ["vlsync-store/test-level"]
 [dependencies]
 # The storage layer and the firehose vlpds shares with vlRelay and delta
 # (vlsync), and atproto (vlatproto)
-vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "de9d99dc0e3c8e9b46bf01ad8b1a0c9937e774a0" }
-vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "c87d069b8d98a00c8aeadbc7e5b9dfa3b4853e28" }
-vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "de9d99dc0e3c8e9b46bf01ad8b1a0c9937e774a0" }
+vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "8661151bb559e0a9ddf736773d7608bf35a6a092" }
+vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "8fd41163c003a39ae73c568d648434ef42f32049" }
+vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "8661151bb559e0a9ddf736773d7608bf35a6a092" }
 # the SlateDB fork every vlsync user builds against (its Cargo.toml lists the patches)
-slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "de9d99dc0e3c8e9b46bf01ad8b1a0c9937e774a0" }
+slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "8661151bb559e0a9ddf736773d7608bf35a6a092" }
 # the SST block cache (partition.rs BlockCache): SlateDB's FoyerCache can't be resized
 foyer = "0.22"
 # log segment body compression (vlsync-store/src/segment.rs; the same zstd SlateDB links)
@@ -93,12 +93,12 @@ tokio-tungstenite = { version = "0.29", features = ["__rustls-tls"] }
 tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
 # GET /debug/pprof/heap: jemalloc's heap sampler, on from the start, as pprof
-vlsync-heapprof = { git = "https://github.com/jazware/vlsync", rev = "de9d99dc0e3c8e9b46bf01ad8b1a0c9937e774a0", features = ["axum"], optional = true }
+vlsync-heapprof = { git = "https://github.com/jazware/vlsync", rev = "8661151bb559e0a9ddf736773d7608bf35a6a092", features = ["axum"], optional = true }
 mimalloc = { version = "0.1", optional = true }
 pyroscope = { version = "2.1", default-features = false, features = ["backend-pprof-rs"], optional = true }
 prost = { version = "0.14", optional = true }
 inferno = { version = "0.12", default-features = false, optional = true }
-slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "de9d99dc0e3c8e9b46bf01ad8b1a0c9937e774a0", optional = true }
+slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "8661151bb559e0a9ddf736773d7608bf35a6a092", optional = true }
 prometheus = { version = "0.14", default-features = false }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
@@ -136,6 +136,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 x509-parser = "0.18"
 time = { version = "0.3", default-features = false, features = ["std"] }
+schnorrkel = { version = "=0.11.5", default-features = false, features = ["std"] }
 
 [[test]]
 name = "all"
@@ -225,6 +226,9 @@ codegen-units = 16
 brotli = "9"
 # tests cross-check libsecp256k1 signatures against RustCrypto
 k256 = { version = "0.14", features = ["ecdsa"] }
+# the SIWE adapter interop test (tests/all/federated.rs): Ethereum
+# addresses and EIP-191 message hashes are Keccak-256
+sha3 = "0.11"
 # differential tests (tests/all/differential_shrike.rs): a second atproto
 # implementation (DAG-CBOR, CID, CAR, MST, proofs, crypto, syntax, lexicon)
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "lexicon"] }

@@ -214,6 +214,23 @@ async fn every_audited_admin_write_names_its_operator() {
                 let (_, e) = audited(&s, actions[0], 1, "admin", post(&s, nsid, body)).await;
                 assert_eq!(e[0]["subject"], other("domain", &domain));
             }
+            "vlpds.admin.putSignInProvider" | "vlpds.admin.removeSignInProvider" => {
+                let id = unique_name("aud");
+                let secret = format!("provider-secret-{id}");
+                secrets.push(secret.clone());
+                let p = json!({"id": id, "name": "Audited", "issuer": format!("https://{id}.example.com"), "clientId": "c",
+                               "clientAuth": {"method": "client_secret_basic", "secret": {"value": secret}}});
+                let put = json!({"provider": p, "force": true});
+                if *nsid == "vlpds.admin.removeSignInProvider" {
+                    post(&s, "vlpds.admin.putSignInProvider", put).await;
+                    let (_, e) = audited(&s, actions[0], 1, "admin", post(&s, nsid, json!({"id": id}))).await;
+                    assert_eq!(e[0]["subject"], other("config", &format!("signin-provider:{id}")));
+                } else {
+                    let (_, e) = audited(&s, actions[0], 1, "admin", post(&s, nsid, put)).await;
+                    assert_eq!(e[0]["subject"], other("config", &format!("signin-provider:{id}")));
+                    assert_eq!(e[0]["detail"]["replaced"], false);
+                }
+            }
             "vlpds.admin.backfillStorageStats" => {
                 audited(&s, "storage.backfill", 0, "admin", post(&s, nsid, json!({"dryRun": true}))).await;
                 let body = json!({"maxRequests": 100, "pagesPerSecond": 50});

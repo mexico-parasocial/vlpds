@@ -62,7 +62,10 @@ services:
 
   vlpds:
     <<: *shared
-    image: ${VLPDS_IMAGE:-ghcr.io/jazware/vlpds:1.1.0}
+    image: ${VLPDS_IMAGE:-para-vlpds:para-native-local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
     depends_on:
       plc:
         condition: service_healthy
@@ -70,10 +73,13 @@ services:
       - --memory
       - --dev-mode
       - --no-rate-limits
-      # Sin anunciarse a nadie: el relay no acepta localhost por su
-      # requestCrawl público; up.sh lo registra directamente.
+      # El relay sigue únicamente el PDS fijado en RELAY_PDS_HOST.
       - --crawlers=
+    env_file:
+      - path: ../env/vlpds-dev.env
+        required: false
     environment:
+      VLPDS_PARA: ${VLPDS_PARA:-true}
       VLPDS_PUBLIC_URL: http://localhost:2583
       VLPDS_HANDLE_DOMAIN: test
       VLPDS_PLC_URL: http://localhost:2582
@@ -81,35 +87,40 @@ services:
       VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: ${DEV_PLC_ROTATION_KEY:?make dev la genera}
       VLPDS_APPVIEW: http://localhost:2584,did:web:localhost%3A2584
       VLPDS_LOG_FORMAT: text
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:2583/xrpc/_health']
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
-  # Relay de indigo entre vlpds y los consumidores en TypeScript. vlpds
-  # numera su firehose con unix_micros × 256 + escritor (sin secuenciador
-  # global), y esos seq pasan de 2^53: @atproto/sync los rechaza. El relay
-  # vuelve a numerar con seq consecutivos, como en la red de ATProto.
+  # Relay Rust de rsky: conserva el cursor de VLPDS en 64 bits y publica
+  # secuencias propias compatibles con los consumidores TypeScript.
   relay:
     <<: *shared
     build:
-      context: https://github.com/bluesky-social/indigo.git#162dca49278b59fef7745f72ae7b641dc27f4d83
-      dockerfile: cmd/relay/Dockerfile
-      args:
-        # Su Dockerfile llama a git describe.
-        BUILDKIT_CONTEXT_KEEP_GIT_DIR: '1'
-    image: para-relay:162dca4
+      context: ../relay
+      dockerfile: Dockerfile
+    image: para-rsky-relay:e96634e-para2
     depends_on:
-      postgres:
+      vlpds:
         condition: service_healthy
-    # Anónimo y no tmpfs: sus archivos de eventos tienen que sobrevivir a un
-    # reinicio del relay mientras su Postgres los recuerde.
     volumes:
       - /data/relay
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/relay
-      RELAY_API_BIND: ':2470'
-      RELAY_PLC_HOST: http://localhost:2582
-      RELAY_PERSIST_DIR: /data/relay
+      RELAY_LISTEN: '0.0.0.0:2470'
+      RELAY_PLC_URL: http://localhost:2582
+      RELAY_PDS_HOST: localhost:2583
+      RELAY_UPSTREAM_URL: http://localhost:2583
+      RELAY_LENIENT_VALIDATION: 'false'
       RELAY_ADMIN_PASSWORD: dev-relay-admin
-      # vlpds de desarrollo habla HTTP en localhost.
-      RELAY_ALLOW_INSECURE_HOSTS: 'true'
+      RUST_LOG: rsky_relay=info
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:2470/xrpc/_health']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    stop_grace_period: 30s
+    mem_limit: 256m
 
   bsync:
     <<: *shared

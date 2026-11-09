@@ -40,6 +40,7 @@ services:
       # esto el rate limit trataría a todos como la misma IP (la de Caddy).
       TRUST_PROXY_HEADERS: 'true'
       PDS_URL: https://pds.${PARA_DOMAIN}
+      MATRIX_IDP_ISSUER: https://idp.${PARA_DOMAIN}
       PLC_URL: ${PLC_URL:-https://plc.directory}
       CORS_ORIGIN: ${M8_CORS_ORIGIN:-https://${PARA_DOMAIN}}
       OAUTH_RETURN_TO_ALLOWLIST: ${M8_OAUTH_RETURN_TO_ALLOWLIST:-im8://oauth/callback,para://m8-auth,https://${PARA_DOMAIN}/m8-auth}

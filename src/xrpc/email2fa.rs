@@ -44,6 +44,7 @@ pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow
 /// What a failed second-factor check asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Factor {
+    Im8,
     Totp,
     /// The account has passkeys and no TOTP: an assertion (checked by the
     /// caller), or a recovery code.
@@ -98,6 +99,11 @@ pub(super) async fn check_second_factor(
     passkeys: bool,
 ) -> Result<(), FactorErr> {
     let code = code.map(str::trim).filter(|c| !c.is_empty());
+    if super::para::account::enabled(app, &acct.did).await.map_err(|err| FactorErr { err, factor: Factor::Im8 })? {
+        return super::para::account::check_login(app, &acct.did, code)
+            .await
+            .map_err(|err| FactorErr { err, factor: Factor::Im8 });
+    }
     let hint = || Factor::Email { hint: acct.email.as_deref().map(obfuscate_email).unwrap_or_default() };
     if app_password {
         return match code {

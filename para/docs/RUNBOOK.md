@@ -106,8 +106,11 @@ avisa si sigue). Mismos pasos que arriba.
    contenedor).
 3. Logs: Docker tiene tope por contenedor (Ansible lo configura: 5 × 50 MB).
 4. La caché de disco de vlpds ocupa hasta `VLPDS_DISK_CACHE_MB` (4 GB en
-   `tiny`) y el relay guarda 72 h de eventos: los dos se pueden borrar sin
-   perder nada (sus volúmenes `vlpds_cache` y `relay_data`).
+   `tiny`) y se puede reconstruir. El commitlog de vlRelay (`vlrelay_data`)
+   guarda hasta 512 MB; perderlo no pierde cursores (se recupera del bucket,
+   [vlrelay.md](vlrelay.md)). Con rsky, **no borrar `rsky_relay_data`**:
+   contiene checkpoints, el contador y obligaciones pendientes; ver
+   [RSKY-RELAY.md](RSKY-RELAY.md).
 5. Postgres o el media de Synapse crecen de verdad: más disco.
 
 ## ParaMemoryLow
@@ -145,7 +148,7 @@ firmas dependen de la hora.
 1. `make logs S=matrix-bridge`: errores contra Synapse (token de admin
    vencido → `secrets/matrix_admin_token`) o contra el relay.
 2. ¿El relay sigue a vlpds? `make verify` (sección Firehose) o
-   `make compose ARGS="exec -T relay wget -qO- http://127.0.0.1:2470/xrpc/com.atproto.sync.listHosts"`.
+   `make compose ARGS="exec -T relay curl -fsS http://127.0.0.1:2470/xrpc/com.atproto.sync.listHosts"`.
    Si no: `make relay-add-pds`.
 3. ¿Synapse está sano? `make logs S=synapse`.
 4. Después de una caída larga, el retraso baja solo mientras se pone al día;
@@ -166,7 +169,10 @@ Las publicaciones se escriben en vlpds pero no aparecen en los feeds.
 3. Un solo dataplane indexa: si hay un worker de AppView, el suyo no debe
    tener `BSKY_REPO_PROVIDER` (`overrides/worker.yaml`).
 
-### La app no puede crear comunidades, unirse ni votar
+### Fallan las escrituras de PARA
 
-No es una caída: esas rutas `com.para.*` no existen en vlpds
-([VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara)).
+Comprueba que la imagen es el fork nativo y que `VLPDS_PARA=true`.
+`ParaAppViewUnavailable` requiere revisar el AppView y la resolución de DID;
+`ParaVerifierUnavailable` requiere revisar las URLs y disponibilidad de M8.
+`ParaFeatureUnavailable` y `ParaImportReviewRequired` son gates explícitos de
+compatibilidad, detallados en [Escrituras nativas](NATIVE-PARA-WRITES.md).

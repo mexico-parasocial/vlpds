@@ -33,9 +33,18 @@ no matter what its build can do. So mixed versions are safe, and rolling back is
 until you finalize. The few exceptions are listed under [Compatibility contract](#compatibility-contract).
 
 > [!NOTE]
-> Today every release runs level 1 only (`baseline`), so there hasn't been a level to finalize yet.
-> The machinery (the `cluster/version` object, the startup check, finalize and lower) is built and
-> tested with a test-only level 2.
+> Level 2 (`federated-sign-in`) is the first level after `baseline`. It's persistent and turns on
+> third-party sign-in ([OAuth and 2FA](../oauth-2fa.md#third-party-sign-in)): below it, providers can
+> be saved but none is offered and nothing of it is written. A new prefix starts at level 2. An
+> existing cluster gets it with `vlpds admin cluster finalize --level 2` once every node runs a build
+> that has it, and after that older builds exit 7.
+>
+> Level 3 (`lease-timing`) is persistent and adds each node lease's TTL, skew and renew interval,
+> which peers wait out before taking a node over ([Configuration](configuration.md#shards-and-lease-ttl)).
+> Below it, keep `--lease-ttl-ms`, `--lease-renew-ms` and `--lease-skew-ms` the same on every node.
+> A new prefix starts at level 3. An existing cluster gets it with
+> `vlpds admin cluster finalize --level 3`, and after that builds before it exit 7. The test-only
+> level is 4.
 
 ## Rolling deploy
 
@@ -153,6 +162,12 @@ that ships without a level is a bug, and this page lists each one with what to d
   ([Spaces: operating](../spaces/operating.md#what-you-get-with-spaces)).
 - Client tokens are a format too. If the old build can't verify a session JWT or OAuth token, a
   rollback turns into a forced logout, so a change to them belongs to a level.
+- A largest-blob override sits outside the levels. `setBlobQuota`'s `maxBlobBytes` is stored in
+  the account's blob quota row, which builds from before it read without the field. A node on
+  such a build ignores the override and holds the account to its `--max-blob-mb`, and the
+  console says the node's build doesn't support it. Old builds never rewrite the row, so the
+  override comes back once the account's owner runs a newer build. Set overrides once every node
+  runs one.
 
 The format inventory (every persisted and wire format, and how it's versioned) is in DESIGN.md under
 "Rolling upgrades and format versioning".
@@ -212,7 +227,7 @@ on to get a new set of recovery codes on the Security page.
 - title: "`just upgrade-ha`"
   body: "Every `upgrade-*` scenario (`bench/ha/upgrade.sh`): rolling upgrade, rollback before finalize, old-node refusal after it, and a node starting during a raise."
 - title: Never deploy a test build
-  body: "The scenarios use the cargo feature `test-level`, which adds a fake level 2 with a different segment format. A build like that logs `TEST BUILD` at startup."
+  body: "The scenarios use the cargo feature `test-level`, which adds a fake level above the real ones with a different segment format. A build like that logs `TEST BUILD` at startup."
 ```
 
 Results of the last two-build run are in `bench/ha/RESULTS.md` ("Two-build upgrade scenarios").

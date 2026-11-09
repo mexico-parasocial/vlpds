@@ -11,8 +11,8 @@ decidimos cuál usar:
 | Libreto de comandos | [tradicional/LIBRETO.md](tradicional/LIBRETO.md) | [LIBRETO.md](LIBRETO.md) |
 
 Todo lo demás es el mismo código en las dos: el AppView, bsync, Ozone, el
-bridge de Matrix, para-idp y mubEZ salen de sus repos. El fork no cambia nada
-de WatZappa.
+bridge de Matrix, para-idp y mubEZ salen de sus repos. Los contratos PARA del
+fork se actualizan en los lexicons compartidos de WatZappa.
 
 ---
 
@@ -21,14 +21,13 @@ de WatZappa.
 - **vlpds funciona como PDS de PARA para lo genérico de ATProto**: cuentas,
   sesiones, OAuth, repos, blobs, handles, el firehose y el proxy al AppView.
   Probado de punta a punta en `make dev-smoke`.
-- **Bloqueo: las escrituras propias de PARA no existen en vlpds.** Unas doce
-  rutas `com.para.*` (crear comunidad, unirse, votar, el factor de correo…) las
-  implementa el PDS de TypeScript. En vlpds responden 501, y reenviadas al
-  AppView responden 400. Con vlpds, hoy la app no puede hacer esas acciones
-  (§3).
+- **El fork implementa PARA en Rust**, con políticas antes del commit, invitaciones
+  firmadas por el creador, factores iM8 independientes y estado alpha durable.
+  Incluye imports revisados; no migrar usuarios hasta validar los clientes, la
+  recuperación y los servicios reales (§3).
 - **vlpds exige un relay.** Numera su firehose con valores mayores que 2^53,
-  que los consumidores en TypeScript (el AppView, el bridge) rechazan. Un relay
-  de indigo los renumera (§4).
+  que los consumidores en TypeScript (el AppView, el bridge) rechazan.
+  vlRelay los renumera (§4).
 - **Operarlo es más simple**: todo su estado está en el bucket, el disco es
   caché, no hay respaldos que correr para el PDS y escala a varios nodos sin
   cambiar nada (§5).
@@ -45,52 +44,33 @@ de WatZappa.
 | Llave de rotación PLC | Hex en claro | Envuelta con la KEK (`make secrets` lo hace) |
 | Escalar el PDS | No escala: un secuenciador, SQLite en disco | Varios nodos sobre el mismo bucket, con leases y shards |
 | Firehose | `seq` consecutivos desde 1; el AppView lo lee directo | `seq = unix_micros × 256 + escritor`, más de 2^53; hace falta el relay |
-| Rutas propias de PARA (`com.para.*`) | En el PDS | **No existen**; solo las lecturas que también tiene el AppView |
-| Reglas de PARA al escribir | El PDS rechaza boletas congeladas, votos y delegaciones sin prueba, reposts | No las aplica; solo el AppView al indexar |
+| Rutas propias de PARA (`com.para.*`) | En el PDS | Comandos nativos, invitaciones autorizadas, iM8 independiente y alpha privado; validación integral pendiente |
+| Reglas de PARA al escribir | El PDS rechaza boletas congeladas, votos y delegaciones sin prueba, reposts | El fork las aplica antes de create/put/applyWrites, incluso con validate=false; AppView sigue validando al indexar |
 | Consola de operador | `com.atproto.admin.*` con contraseña | `/admin` y `vlpds.admin.*` con token, en un puerto solo de loopback |
 | Certificados de handles | `/tls-check` (añadido en WatZappa) | `/tls-check` nativo |
 | Memoria | 512 MB (tiny) | 2 GB como mínimo |
 | Spaces (datos con permisos) | Port parcial en WatZappa (fases 1–3a) | Completo en alfa, con `--spaces` (`VLPDS_SPACES`) |
 
-## 3. La brecha de `com.para.*`
+## 3. Escrituras nativas y brechas pendientes
 
-La app manda todas las rutas `com.para.*` con el cliente del AppView, es
-decir, con la cabecera `atproto-proxy: <AppView>#bsky_appview`. En la variante
-tradicional el PDS de TypeScript resuelve las de escritura él mismo. vlpds no
-las conoce y reenvía todo lo que trae esa cabecera al AppView, que no las
-implementa.
+Con el fork compilado y `VLPDS_PARA=true`, las rutas registradas de escritura se
+resuelven en el PDS aunque la app incluya `atproto-proxy`. Las lecturas continúan
+en el AppView. La imagen upstream `ghcr.io/jazware/vlpds:1.1.0` no incluye este port.
 
-| Ruta | Tradicional | vlpds |
-|---|---|---|
-| `com.para.community.createBoard`, `join`, `leave`, `acceptDraftInvite` | PDS | ✗ |
-| `com.para.community.createBriefingPack`, `updateBriefingPack` | PDS | ✗ |
-| `com.para.community.shareContent`, `sharedContentAction` | PDS | ✗ |
-| `com.para.civic.castVote` | PDS (verifica la prueba de M8) | ✗ |
-| `com.para.account.getAuthFactor`, `setAuthFactor` | PDS | ✗ |
-| `com.para.alpha.requestAccess`, `createInvite` | PDS | ✗ |
-| `com.para.alpha.getAccess`, `getRolloutStatus` | AppView | ✓ |
-| `com.para.feed.getTimeline`, `com.para.actor.getProfileStats`, `com.para.social.getPostMeta` | AppView | ✓ |
+Ya están implementados `createBoard`, `join`, `leave`, `createBriefingPack`,
+`updateBriefingPack`, `shareContent`, `removeSharedContent`, `restoreSharedContent`
+y `com.para.civic.castVote`. Todos usan el worker y log durable de VLPDS y verifican
+los permisos de colección. Las escrituras genéricas ejecutan la misma política.
 
-Comprobado contra el entorno local: `com.para.community.join` y
-`com.para.civic.castVote` responden 501 en vlpds, y 400 cuando se reenvían al
-AppView; `com.para.feed.getTimeline` responde 200. El libreto lo repite en
-[LIBRETO.md, paso 2.4](LIBRETO.md#24-la-brecha-de-compara).
-
-Las salidas posibles, para decidir antes de mover usuarios:
-
-1. **Que la app escriba los registros directamente** con
-   `com.atproto.repo.createRecord`, y que el AppView valide al indexar. El
-   AppView ya verifica las boletas antes de indexarlas, incluidas las de otros
-   repos. Es el camino más ATProto, pero cambia la app y pierde el rechazo
-   inmediato (un voto inválido se escribe y se ignora en vez de rechazarse).
-2. **Un servicio pequeño de PARA** que implemente esas rutas. Solo sirve para
-   las que no escriben en el repo del usuario: un servicio no puede escribir en
-   un repo ajeno.
-3. **Implementarlas en el fork de vlpds** (Rust). Contradice la idea de no
-   construir sobre vlpds y nos ata a mantener un parche.
-
-Mientras no se resuelva, vlpds sirve para probar operación, rendimiento y
-costos, no para usuarios reales.
+`acceptDraftInvite` exige invitación firmada por el creador; la activación con nueve
+fundadores la firma el creador. `account.getAuthFactor` y `setAuthFactor` usan firmas
+del wallet iM8 que funcionan sin sesión del broker. Alpha tiene cuotas e invitaciones
+de un solo uso en el log privado; la administración exige credenciales de operador.
+Los imports sin revisión se cierran con `ParaImportReviewRequired`; la ruta revisada
+fija CAR, firma original y head del destino, y alpha tiene una migración privada.
+Las obligaciones de cliente, revisión y validación están en
+[Escrituras nativas](NATIVE-PARA-WRITES.md). **No es aún paridad completa para
+producción.**
 
 ## 4. Por qué el relay es obligatorio
 
@@ -105,21 +85,18 @@ el `seq` como entero seguro de JavaScript y descarta los eventos de vlpds
 (`Expected integer value type (got 458708000931978140n) at $.seq`). El bridge
 de Matrix tiene el mismo problema.
 
-El relay de [indigo](https://github.com/bluesky-social/indigo) (en Go) lee el
-firehose de vlpds y lo vuelve a publicar con `seq` consecutivos propios, como
-hace la red de ATProto. El AppView y el bridge leen `ws://relay:2470`. Cuesta
-un proceso pequeño (256 MB en tiny), una base en Postgres y unos GB de disco
-para 72 h de eventos.
+[vlRelay](https://github.com/jazware/vlrelay) (Rust, de jazware, con los
+mismos crates que vlpds) consume esos enteros y publica `seq` densos
+(1, 2, 3…) que `@atproto/sync` acepta. AppView y bridge leen
+`ws://relay:2470`. Sigue solo a `pds.<dominio>` (`--host`, sin `--crawl`),
+leído por el edge público. Su estado durable está en el bucket
+(`S3_PREFIX/vlrelay`) con un commitlog local; el replay es de 72 h.
+Ver [vlRelay](vlrelay.md).
 
-Dos detalles de la puesta en marcha:
-
-- En producción, vlpds avisa solo al relay al arrancar (`VLPDS_CRAWLERS`), y
-  el relay comprueba `https://pds.<dominio>` por la red pública antes de
-  seguirlo. `make verify` revisa que lo esté siguiendo; `make relay-add-pds`
-  lo vuelve a pedir.
-- El relay solo da de alta hosts con IP pública, incluso por su ruta de admin.
-  En el entorno local, donde vlpds es `localhost:2583`, `make dev` lo registra
-  directo en la base del relay.
+El rsky parchado de `relay/` sigue disponible con `PARA_RELAY=rsky` para las
+instalaciones que ya lo corren ([Relay Rust de rsky](RSKY-RELAY.md)). Un
+consumidor TypeScript adaptado a los cursores de 64 bits de VLPDS podría
+eliminar el relay en el futuro.
 
 ## 5. Lo que se gana operando vlpds
 
@@ -140,7 +117,7 @@ Dos detalles de la puesta en marcha:
 
 ## 6. Lo que se pierde o cambia
 
-- Las rutas y reglas propias de PARA en el PDS (§3).
+- Mantener el port Rust de PARA y cerrar las brechas pendientes (§3).
 - `com.para.account.*`: el segundo factor por correo de PARA vive en el PDS de
   TypeScript. vlpds tiene su propio 2FA ([docs/oauth-2fa.md](../../docs/oauth-2fa.md)).
 - Más memoria: 2 GB como mínimo, y `tiny` pasa a pedir una VM de 12 GB.
@@ -157,10 +134,11 @@ Dos detalles de la puesta en marcha:
 - `main` se sincroniza con upstream cada día (`.github/workflows/sync-upstream.yml`,
   con `SYNC_TOKEN` si existe, si no `GITHUB_TOKEN`). `merge-upstream` no copia
   tags: la versión 1.1.0 es el commit `77b8897`.
-- Los workflows `CI` e `Image` de upstream están deshabilitados en el fork;
-  la imagen que usamos es la de upstream, `ghcr.io/jazware/vlpds:1.1.0`.
-- `para/` es lo único nuestro. No compilamos vlpds: usamos su imagen. Si algún
-  día hiciera falta un parche, el fork ya comparte historial con upstream.
+- Las imágenes de upstream no incorporan PARA. Compose compila este fork desde
+  su Dockerfile y usa `para-vlpds:para-native-local` en desarrollo; producción
+  requiere una imagen propia con tag inmutable.
+- `para/` contiene la plataforma; `src/para.rs` y `src/xrpc/para/` contienen las
+  políticas y comandos nativos. Los esquemas se sincronizan desde WatZappa.
 - Con `GITHUB_TOKEN`, un cambio de upstream en `.github/workflows/` no se puede
   sincronizar. Agrega el secreto `SYNC_TOKEN` (un token con permiso `workflow`).
 

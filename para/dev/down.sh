@@ -3,4 +3,6 @@
 # anónimo del relay; lo demás ya vivía en memoria).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-docker compose -f "$HERE/compose.yaml" --env-file "$HERE/../.dev/dev.env" down -v
+RELAY_FILES=(-f "$HERE/compose.yaml")
+[ "${PARA_RELAY:-vlrelay}" = vlrelay ] && RELAY_FILES+=(-f "$HERE/compose.vlrelay.yaml")
+docker compose "${RELAY_FILES[@]}" --env-file "$HERE/../.dev/dev.env" down -v

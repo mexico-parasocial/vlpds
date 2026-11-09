@@ -94,6 +94,7 @@ pub fn flags(status: Option<&str>, email_confirmed: bool, extra: &serde_json::Ma
         f |= UNCONFIRMED;
     }
     let second = extra.get("totpEnabled").and_then(|v| v.as_bool()) == Some(true)
+        || extra.get("im8Enabled").and_then(|v| v.as_bool()) == Some(true)
         || extra.get("emailAuthFactorAt").is_some_and(|v| v.is_string())
         || extra.get("passkeys").and_then(|v| v.as_u64()).is_some_and(|n| n > 0);
     if status.is_none() && !second {

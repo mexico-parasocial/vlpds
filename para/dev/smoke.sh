@@ -39,3 +39,20 @@ curl -sf "$PDS/xrpc/app.bsky.feed.getAuthorFeed?actor=$did" \
   -H "authorization: Bearer $jwt" | grep -q "$text" \
   || { echo "✗ el proxy de vlpds al AppView no devolvió la publicación" >&2; exit 1; }
 echo "✓ vlpds la sirve a través de su proxy al AppView"
+
+if [ "${VLPDS_PARA:-true}" != false ]; then
+  community="$(curl -sf "$PDS/xrpc/com.para.community.createBoard" \
+    -H 'content-type: application/json' -H "authorization: Bearer $jwt" \
+    -H 'atproto-proxy: did:web:localhost%3A2584#bsky_appview' \
+    -d "{\"name\":\"Smoke native $suffix\",\"quadrant\":\"MX-NL\"}")"
+  board_uri="$(echo "$community" | json "['uri']")"
+  board_key="${board_uri##*/}"
+  curl -sf "$PDS/xrpc/com.atproto.repo.getRecord?repo=$did&collection=com.para.community.membership&rkey=$board_key" \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["value"]["membershipState"] == "active"'
+  echo '✓ comunidad nativa y membresía del creador en el repo durable'
+  status="$(curl -s -o /dev/null -w '%{http_code}' "$PDS/xrpc/com.atproto.repo.createRecord" \
+    -H 'content-type: application/json' -H "authorization: Bearer $jwt" \
+    -d "{\"repo\":\"$did\",\"collection\":\"com.para.community.vote\",\"validate\":false,\"record\":{}}")"
+  [ "$status" = 400 ] || { echo "✗ la política PARA no rechazó la boleta congelada ($status)" >&2; exit 1; }
+  echo '✓ la política previa al commit no se elude con validate=false'
+fi

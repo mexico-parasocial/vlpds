@@ -62,6 +62,7 @@ groups:
 | Repo signing key (secp256k1, one per account) | commits, service-auth JWTs, space commits and space JWTs ([Spaces](spaces/reading.md#the-three-tokens)) | account row `a/{did}` | KEK, bound to the DID | admin `updateAccountSigningKey` |
 | Reserved signing key | migrations in (`reserveSigningKey`) | `p/_reserved:{did:key}` | KEK, bound to the did:key | used once |
 | TOTP secret | second factor | `p/{did}` private row | KEK, bound to the DID | the user re-enrolls |
+| Sign-in provider secrets and keys | the code exchange with a third-party sign-in provider ([Third-party sign-in](oauth-2fa.md#third-party-sign-in)) | `config/signin-providers.json` | KEK, bound to the provider id (`sign-in-provider-secret`) · never returned by the admin API, and never a file path (the admin API would read any file on the node and send it to a token endpoint) | `putSignInProvider` with a new value, `rewrap-secrets` |
 | Passkey public keys | checking passkey sign-ins | `p/{did}\0passkeys` private row | nothing (public keys aren't secrets) | the user adds or removes passkeys |
 | PLC rotation key (one per deployment) | signing PLC ops for every DID | a `vw1.` file on each node (`--plc-rotation-key-file`) | KEK · never in the bucket | `rotate-plc-keys` |
 | Operator recovery key | undoing a bad PLC op within 72 h | offline · nodes get only its did:key | not on any host | `ensure-recovery-key` with a new one |
@@ -255,7 +256,7 @@ between nodes)", and joining a node is in [Scaling and clustering](operations/sc
 - { value: "'self'", label: the only script source, note: "every UI page · OAuth pages allow only hashed inline code", tone: accent }
 - { value: "DENY", label: framing, note: "frame-ancestors 'none' + X-Frame-Options" }
 - { value: public, label: addresses only for outbound fetches, note: "private, loopback and link-local are refused", tone: blue }
-- { value: "46", unit: rate limits, label: built in, note: "per IP, account, node, cluster or space credential · tunable live", tone: amber }
+- { value: "47", unit: rate limits, label: built in, note: "per IP, account, node, cluster or space credential · tunable live", tone: amber }
 ```
 
 - Headers. The web UI (`/`, `/account`, `/admin`, `/docs`) is served with a same-origin CSP

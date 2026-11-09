@@ -149,10 +149,21 @@ pub(super) async fn import(app: &Arc<App>, did: &str, body: Body, headers: &Head
         return Err(import_stream::too_large(max));
     }
     let res = app.imports.admit(declared).await?;
+    import_admitted(app, did, body, res, None).await
+}
+
+pub(super) async fn import_admitted(
+    app: &Arc<App>,
+    did: &str,
+    body: Body,
+    res: Arc<Reservation>,
+    expected_head: Option<Cid>,
+) -> XResult<()> {
+    let max = app.config.max_import_bytes;
     let driver = Driver::start(did)?;
     let body = import_stream::TimedBody::new(body, app.config.import_body_idle, app.config.import_body_deadline);
     let mut items = import_stream::start(body, max, res.clone());
-    let mut st = Stage { did: did.to_string(), nonce: driver.nonce, ..Default::default() };
+    let mut st = Stage { did: did.to_string(), nonce: driver.nonce, expected_head, ..Default::default() };
     let r = st.run(app, &mut items, &res).await;
     if let Err(e) = &r {
         if !crashed(e) {
@@ -167,6 +178,7 @@ pub(super) async fn import(app: &Arc<App>, did: &str, body: Body, headers: &Head
 struct Stage {
     did: String,
     nonce: u64,
+    expected_head: Option<Cid>,
     ticket: Option<ImportTicket>,
     /// Entries queued and not acked yet, oldest first, by batch number.
     inflight: VecDeque<(u64, Reply)>,
@@ -200,6 +212,7 @@ impl Stage {
                     *self = Stage {
                         did: std::mem::take(&mut self.did),
                         nonce: self.nonce,
+                        expected_head: self.expected_head,
                         ticket: self.ticket,
                         ..Default::default()
                     };
@@ -214,7 +227,8 @@ impl Stage {
 
     async fn begin(&mut self, app: &Arc<App>) -> XResult<ImportTicket> {
         let (tx, rx) = oneshot::channel();
-        step(app, &self.did, ImportStep::Begin { nonce: self.nonce, ticket: tx }).await?;
+        step(app, &self.did, ImportStep::Begin { nonce: self.nonce, expected_head: self.expected_head, ticket: tx })
+            .await?;
         let t = rx.await.map_err(|_| XrpcError::internal("import ticket dropped"))?;
         self.ticket = Some(t);
         if let Some(g) = t.stale {

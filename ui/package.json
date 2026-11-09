@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:mock": "VLPDS_MOCK=1 vite",
+    "test": "node --test test/",
+    "shots": "node scripts/shots.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "check-docs": "node docs-build/check.mjs && node scripts/check-docs-private.mjs && node scripts/check-docs-ratelimits.mjs"
@@ -27,6 +30,7 @@
     "highlight.js": "^11.12.0",
     "js-yaml": "^5.4.2",
     "markdown-it": "^15.0.2",
+    "playwright": "^1.63.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.2"
   }

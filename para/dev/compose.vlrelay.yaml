@@ -1,0 +1,23 @@
+# make dev PARA_RELAY=vlrelay: el entorno local con vlRelay en lugar de rsky
+# (docs/vlrelay.md). Se aplica sobre dev/compose.yaml.
+#
+# Como el resto del entorno, vive en memoria (--memory): reiniciar el relay
+# empieza otro espacio de cursores. Un --host http:// implica --dev-mode, que
+# deja leer localhost; los documentos DID nombran localhost:2583, el mismo
+# host, así que la autoridad del host coincide sin alias.
+services:
+  relay:
+    # El commit de la release 1.0.0 (overrides/relay-vlrelay.yaml).
+    build: !override
+      context: https://github.com/jazware/vlrelay.git#5fcc2517f797729f062b542b04ade13206a7318b
+    image: ${VLRELAY_IMAGE:-para-vlrelay:1.0.0}
+    volumes: !reset []
+    environment: !override
+      VLRELAY_LISTEN: '0.0.0.0:2470'
+      VLRELAY_PLC_URL: http://localhost:2582
+      VLRELAY_ADMIN_TOKEN: dev-relay-admin
+      RUST_LOG: info,slatedb=warn
+    command: ['--memory', '--host', 'http://localhost:2583']
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:2470/xrpc/_health']
+    mem_limit: 512m

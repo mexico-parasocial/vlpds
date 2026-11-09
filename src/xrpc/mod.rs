@@ -19,6 +19,7 @@ mod ctl_load;
 mod email2fa;
 pub mod extract;
 mod feature_level;
+pub mod federated;
 pub mod firehose_subs;
 mod handle_domains;
 mod identity;
@@ -29,6 +30,7 @@ pub mod key_rotation;
 pub mod mfa;
 pub mod moderation;
 pub mod oauth;
+mod para;
 pub mod passkeys;
 #[doc(hidden)]
 pub mod private_rows;
@@ -114,6 +116,8 @@ pub struct App {
     pub public_url: String,
     /// `--handle-domain` and the domains added at runtime.
     pub handle_domains: Arc<crate::handle_domains::HandleDomains>,
+    /// Third-party sign-in: the providers and the OIDC caches.
+    pub federated: Arc<crate::federated::Federated>,
     /// Writes beyond this many in flight get a fast 503. A write's permit
     /// travels with its queued message, so it is held until its worker takes
     /// it, even if the handler is gone.
@@ -292,12 +296,14 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(mfa::routes())
                 .merge(identity::routes())
                 .merge(repo::routes())
+                .merge(para::routes())
                 .merge(sync::routes())
                 .merge(blobs::routes())
                 .merge(admin::routes())
                 .merge(admin_tools::routes())
                 .merge(crawlers::routes())
                 .merge(handle_domains::routes())
+                .merge(federated::xrpc_routes())
                 .merge(space_ops::routes())
                 .merge(match app.config.spaces {
                     true => space::routes()
@@ -310,6 +316,7 @@ pub fn router(app: Arc<App>) -> Router {
         ))
         .merge(proxy::routes())
         .merge(oauth::routes())
+        .merge(federated::routes())
         .merge(internal::routes())
         .merge(space_ops::internal_routes())
         .merge(match app.config.spaces {
@@ -337,6 +344,7 @@ pub fn router(app: Arc<App>) -> Router {
     appview_override::start(&app);
     crawlers::start(&app);
     handle_domains::start(&app);
+    federated::start(&app);
     let r = oauth::with_dpop_layer(r, &app);
     let r = if app.config.rate_limits_enabled {
         let limiter = app.ratelimit.clone();

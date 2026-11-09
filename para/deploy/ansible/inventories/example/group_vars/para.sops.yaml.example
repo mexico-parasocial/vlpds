@@ -8,7 +8,7 @@
 # de una máquina existente: make secrets-import, luego copia cada archivo.
 #
 # Los nombres son los de scripts/secrets.sh list. postgres_url,
-# postgres_url_bridge y postgres_url_relay no van: se derivan de
+# postgres_url_bridge no va: se derivan de
 # postgres_password. vlpds_plc_rotation_key va envuelta con vlpds_kek: genera
 # los dos en tu máquina con `make secrets` y copia los archivos aquí.
 para_secrets:

@@ -10,3 +10,6 @@ testdata/
 tests/
 accounts.json
 *.car
+para/.dev/
+para/secrets/
+para/.env

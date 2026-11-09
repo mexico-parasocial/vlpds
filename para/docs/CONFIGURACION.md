@@ -26,7 +26,7 @@ Son techos de memoria, no consumo.
 | Postgres | 1 GB · shared_buffers 256 MB · 100 conexiones | 6 GB · 2 GB · 300 |
 | Redis (caché, sin disco) | 128 MB | 1 GB |
 | **vlpds** | 2 GB · 1 shard · lease 60 s · caché de disco 4 GB | 6 GB · 64 shards · lease 10 s · 64 GB |
-| **relay** | 256 MB | 1 GB |
+| **relay** | vlRelay 768 MB (`VLRELAY_MEM`); rsky 256 MB | vlRelay 768 MB; rsky 1 GB |
 | AppView (bsky) | 768 MB × 1 | 2 GB × 2 |
 | dataplane (indexa; siempre uno) | 512 MB | 2 GB |
 | bsync / Ozone | 192 MB / 384 MB | 512 MB / 1 GB |
@@ -59,7 +59,7 @@ valores `VLPDS_*` del perfil.
 | Archivo | Lo usa | Tipo | Offline |
 | --- | --- | --- | --- |
 | `postgres_password` | Postgres | aleatorio | |
-| `postgres_url`, `postgres_url_bridge`, `postgres_url_relay` | AppView, dataplane, bsync, Ozone / bridge / relay | derivado | |
+| `postgres_url`, `postgres_url_bridge` | AppView, dataplane, bsync, Ozone / bridge | derivado | |
 | `s3_access_key_id`, `s3_secret_access_key` | vlpds, mubEZ, respaldos | del proveedor | |
 | `vlpds_jwt_secret`, `vlpds_admin_token`, `vlpds_internal_token`, `vlpds_rate_limit_bypass_key` | vlpds | aleatorio (32+ bytes, distintos) | |
 | `vlpds_kek` | vlpds: envuelve las llaves de firma de cada repo | aleatorio | **sí** |
@@ -115,10 +115,14 @@ y el secreto a la lista del servicio `pds`. El remitente y la marca van en
 | `PARA_DOMAIN` | — | Dominio público; obligatorio y para siempre |
 | `ACME_EMAIL` | — | Avisos de Let's Encrypt |
 | `PARA_PROFILE` | `tiny` | `tiny` o `standard` |
-| `PROFILES` | `core,matrix,identity,edge` | Perfiles de Compose que levanta `make up` |
-| `VLPDS_IMAGE` | `ghcr.io/jazware/vlpds:1.1.0` | La imagen de vlpds (siempre una versión fija) |
+| `PROFILES` | `core,matrix,identity,edge` | Perfiles de Compose que levanta `make up`. `governance` en lugar de `matrix`: sin chat ([Matrix](MATRIX.md#sin-chat)) |
+| `VLPDS_IMAGE` | `para-vlpds:para-native-local` | La imagen de vlpds (siempre una versión fija) |
 | `PARA_REGISTRY`, `WATZAPPA_VERSION`, `MUBEZ_VERSION` | `ghcr.io/mexico-parasocial`, `local`, `local` | Nombre y tag de las imágenes de WatZappa y mubEZ; con `local`, `make up BUILD=1` las construye |
-| `RELAY_COMMIT`, `RELAY_VERSION` | `162dca4…` | El commit de indigo del que se construye el relay |
+| `PARA_RELAY` | `vlrelay` | El relay: `vlrelay` ([vlrelay.md](vlrelay.md)) o `rsky`. Una instalación que ya corre rsky lo fija; preflight lo exige |
+| `VLRELAY_IMAGE` | `para-vlrelay:1.0.0` | Imagen de vlRelay; la local se construye en `make up` desde el commit fijado |
+| `VLRELAY_MEM`, `VLRELAY_RETAIN_HOURS` | `768m`, `72` | Techo de memoria de vlRelay (179 MiB medidos en dev) y horas de replay en el bucket |
+| `RELAY_VERSION` | `e96634e-para1` | Con `PARA_RELAY=rsky`: tag del relay Rust; fuente y parche en `relay/source.env` |
+| `RELAY_STREAM_ID` | `vlrelay-v1` (`rsky-relay-v1` con rsky) | Espacio de cursores del bridge; no cambiar mientras el relay conserve su log |
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_PREFIX`, `S3_FORCE_PATH_STYLE` | —, `auto`, —, `prod`, `true` | El bucket. Un prefijo = una plataforma |
 | `PLC_URL` | `https://plc.directory` | Directorio PLC |
 | `PDS_INVITE_REQUIRED` | `true` | vlpds exige invitación |
@@ -156,3 +160,13 @@ La cuenta depende de cuántas veces se escribe, no de cuánto:
 - **Blobs**: uno por imagen o video subido.
 
 Para un piloto, R2 suele quedar dentro de su capa gratuita.
+
+## Comandos nativos de PARA
+
+`VLPDS_PARA=true` habilita los handlers de este fork y las políticas previas a
+create/put/applyWrites. La imagen upstream no los incluye; usa una imagen propia
+y `BUILD=1` para compilar el checkout local. Los verificadores opcionales
+`VLPDS_PARA_VOTE_VERIFIER_URL` y `VLPDS_PARA_DELEGATION_VERIFIER_URL` se configuran
+en `env/vlpds.env`: HTTPS o HTTP loopback. Si falta la verificación, se rechaza
+la escritura. Las brechas que aún impiden una migración completa están en
+[Escrituras nativas](NATIVE-PARA-WRITES.md).

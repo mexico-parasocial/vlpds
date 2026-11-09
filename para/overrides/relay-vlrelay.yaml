@@ -1,0 +1,108 @@
+# vlRelay de jazware en lugar del rsky parchado de core.yaml. Es el relay por
+# defecto: el Makefile agrega este archivo con -f salvo con PARA_RELAY=rsky.
+# Ver docs/vlrelay.md.
+#
+# El servicio se sigue llamando `relay` y escucha en el mismo puerto 2470:
+# dataplane y matrix-bridge siguen leyendo ws://relay:2470 sin cambios.
+# vlRelay sirve seq densos (1, 2, 3…), así que @atproto/sync los acepta.
+#
+# Diferencias con rsky que importan aquí:
+#   - No tiene transporte separado de la identidad (RELAY_UPSTREAM_URL). Fuera
+#     de --dev-mode solo marca IPs públicas, así que lee wss://pds.<dominio>
+#     por el edge público, como lo haría cualquier relay. El servidor tiene
+#     que alcanzar su propia IP pública (hairpin). docs/vlrelay.md tiene la
+#     alternativa si no puede.
+#   - Su estado vive en el bucket (S3_PREFIX/vlrelay) más un commitlog local
+#     (vlrelay_data). No usa rsky_relay_data.
+#   - Otro espacio de cursores: cambiar RELAY_STREAM_ID antes de apuntar un
+#     bridge que ya tiene cursor (docs/vlrelay.md, "Cambiar de relay").
+services:
+  relay:
+    # La imagen de ghcr.io/jazware/vlrelay no admite pull anónimo: con BUILD=1
+    # se construye aquí desde el commit de la release 1.0.0, como rsky desde
+    # relay/source.env. Si un registro la publica, VLRELAY_IMAGE apunta a ella.
+    build: !override
+      context: https://github.com/jazware/vlrelay.git#5fcc2517f797729f062b542b04ade13206a7318b
+    image: ${VLRELAY_IMAGE:-para-vlrelay:1.0.0}
+    labels:
+      para.metrics.port: '2470'
+    # La imagen trae su entrypoint (tini → vlrelay --ui-dir) y lee los
+    # secretos de archivos por sí misma (VLRELAY_*_FILE).
+    entrypoint: !reset null
+    working_dir: /var/lib/vlrelay
+    environment: !override
+      VLRELAY_LISTEN: '0.0.0.0:2470'
+      VLRELAY_PLC_URL: ${PLC_URL:-https://plc.directory}
+      # vlRelay exige un endpoint aunque el bucket sea de AWS; preflight lo revisa.
+      VLRELAY_S3_ENDPOINT: ${VLRELAY_S3_ENDPOINT:-${S3_ENDPOINT:-}}
+      VLRELAY_S3_REGION: ${S3_REGION:-auto}
+      VLRELAY_S3_BUCKET: ${S3_BUCKET:?Define S3_BUCKET en .env}
+      # Un prefijo es un relay; nunca lo compartas con otro despliegue.
+      VLRELAY_PREFIX: ${S3_PREFIX:-prod}/vlrelay
+      VLRELAY_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key_id
+      VLRELAY_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_access_key
+      # /admin (consola y API) en el mismo puerto; el relay no sale por el edge.
+      VLRELAY_ADMIN_TOKEN_FILE: /run/secrets/relay_admin_password
+      VLRELAY_NODE_ID: single
+      VLRELAY_QLOG_DIR: /var/lib/vlrelay/qlog
+      VLRELAY_LOG_FORMAT: json
+      RUST_LOG: ${RELAY_LOG:-info,slatedb=warn}
+    secrets: !override
+      - relay_admin_password
+      - s3_access_key_id
+      - s3_secret_access_key
+    volumes: !override
+      - vlrelay_data:/var/lib/vlrelay
+    # Un solo PDS, fijo: sin --crawl ni --plc-export, así que no descubre ni
+    # admite otros hosts. El tamaño es para un PDS, no para la red entera
+    # (docs/operations/configuration.md de vlRelay, "A small box"). Solo
+    # flags que ya existen en 1.0.0: --record-cache-entries y
+    # --qlog-flush-segment-mb llegaron después (sha-* desde 2026-10-18).
+    command:
+      - --host
+      - pds.${PARA_DOMAIN:?Define PARA_DOMAIN en .env}
+      - --qlog-retain-hours
+      - '${VLRELAY_RETAIN_HOURS:-72}'
+      - --ring-mb
+      - '32'
+      - --qlog-memory-mb
+      - '16'
+      - --qlog-disk-retain-mb
+      - '512'
+      - --backfill-cache-mb
+      - '32'
+      - --backfill-readahead-mb
+      - '16'
+      - --slatedb-cache-mb
+      - '64'
+      - --inflight-mb
+      - '64'
+      - --host-inflight-mb
+      - '32'
+      - --upstream-rcvbuf-kb
+      - '64'
+      - --ingest-threads
+      - '2'
+      - --ingest-mem-mb
+      - '${VLRELAY_INGEST_MEM_MB:-384}'
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:2470/xrpc/_health']
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: ${VLRELAY_MEM:-768m}
+
+  # Otro espacio de cursores que el de rsky (rsky-relay-v1).
+  matrix-bridge:
+    environment:
+      BRIDGE_PDS_SOURCE_ID: ${RELAY_STREAM_ID:-vlrelay-v1}
+
+  pds:
+    environment:
+      # vlRelay sigue a vlpds por --host y no acepta requestCrawl: vlpds solo
+      # avisa a los relays externos.
+      VLPDS_CRAWLERS: ${PDS_CRAWLERS_EXTRA:-,https://bsky.network}
+
+volumes:
+  vlrelay_data:

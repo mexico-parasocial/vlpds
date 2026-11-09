@@ -1,0 +1,27 @@
+name: PARA rsky relay
+
+on:
+  pull_request:
+    paths: ['para/relay/**', 'para/core.yaml', 'para/dev/**', '.github/workflows/para-rsky-relay.yml']
+  push:
+    branches: [main, para/platform]
+    paths: ['para/relay/**', 'para/core.yaml', 'para/dev/**', '.github/workflows/para-rsky-relay.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: para-rsky-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check scripts and pinned source
+        run: |
+          bash -n para/relay/prepare.sh para/relay/test.sh para/relay/snapshot.sh para/dev/up.sh
+          bash para/relay/prepare.sh /tmp/para-rsky-source
+      - name: Build the runtime image and run relay unit tests
+        run: docker build -t para-rsky-relay:test para/relay

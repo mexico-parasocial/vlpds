@@ -60,7 +60,7 @@ if has_profile edge && [ -n "$DOMAIN" ] && [ "$DOMAIN" != example.org ]; then
   check "AppView" "https://appview.$DOMAIN/xrpc/_health"
   check "DID del AppView" "https://appview.$DOMAIN/.well-known/did.json"
   check "Ozone" "https://ozone.$DOMAIN/xrpc/_health"
-  has_profile matrix && check "Bridge" "https://bridge.$DOMAIN/healthz"
+  { has_profile matrix || has_profile governance; } && check "Bridge" "https://bridge.$DOMAIN/healthz"
   if has_profile matrix; then
     matrix_host="$(cfg MATRIX_SERVER_NAME)"; matrix_host="${matrix_host:-matrix.$DOMAIN}"
     check "Matrix: descubrimiento" "https://$matrix_host/.well-known/matrix/client"
@@ -90,7 +90,16 @@ if has_profile core; then
   else fail "vlpds no responde /tls-check ($code): los handles de usuario no tendrán certificado"; fi
 
   section "Firehose"
-  hosts="$(compose exec -T relay wget -qO- http://127.0.0.1:2470/xrpc/com.atproto.sync.listHosts 2>/dev/null || true)"
+  if [ "${PARA_RELAY:-vlrelay}" = vlrelay ]; then
+    # vlRelay lee wss://pds.<dominio> por el edge público (docs/vlrelay.md).
+    if compose exec -T relay curl -fsS -o /dev/null "https://pds.$DOMAIN/xrpc/_health" 2>/dev/null; then
+      ok "El relay alcanza https://pds.$DOMAIN (hairpin)"
+    else
+      fail "El relay no alcanza https://pds.$DOMAIN desde su contenedor" \
+        "Sin hairpin no lee vlpds: docs/vlrelay.md, \"Identidad y transporte\""
+    fi
+  fi
+  hosts="$(compose exec -T relay curl -fsS http://127.0.0.1:2470/xrpc/com.atproto.sync.listHosts 2>/dev/null || true)"
   if printf '%s' "$hosts" | grep -q "\"hostname\":\"pds.$DOMAIN\""; then
     ok "El relay sigue a vlpds (pds.$DOMAIN)"
   else

@@ -1,0 +1,1163 @@
+diff --git a/rsky-relay/src/config.rs b/rsky-relay/src/config.rs
+index 50c9e16..c90a926 100644
+--- a/rsky-relay/src/config.rs
++++ b/rsky-relay/src/config.rs
+@@ -5,6 +5,10 @@ use std::time::Duration;
+ // admin
+ pub static ADMIN_PASSWORD: LazyLock<Option<String>> =
+     LazyLock::new(|| env::var("RELAY_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty()));
++// PARA runs a private relay for one explicitly configured PDS. Its public
++// hostname remains the identity authority; the connection may use Docker DNS.
++pub static PDS_HOST: LazyLock<Option<String>> =
++    LazyLock::new(|| env::var("RELAY_PDS_HOST").ok().filter(|s| !s.is_empty()));
+ pub const BAN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+ 
+ // validator: when true (default), the validator publishes events that strict checks would defer or drop.
+@@ -20,13 +24,13 @@ pub static METRICS_LISTEN: LazyLock<Option<String>> =
+ // main
+ // Bounds unconsumed intake to capacity * frame_size while the validator lags;
+ // crawler backpressure engages when the ring nears full.
+-pub const CAPACITY_MSGS: usize = 1 << 13;
+-pub const INTAKE_BYTE_BUDGET: usize = 2 * 1024 * 1024 * 1024;
+-pub const PUBLISHER_MAX_WRITE_BUFFER: usize = 32 * 1024 * 1024;
++pub const CAPACITY_MSGS: usize = 1 << 8;
++pub const INTAKE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
++pub const PUBLISHER_MAX_WRITE_BUFFER: usize = 4 * 1024 * 1024;
+ pub const CAPACITY_REQS: usize = 1 << 12;
+ pub const CAPACITY_STATUS: usize = 1 << 10;
+-pub const WORKERS_CRAWLERS: usize = 4;
+-pub const WORKERS_PUBLISHERS: usize = 4;
++pub const WORKERS_CRAWLERS: usize = 1;
++pub const WORKERS_PUBLISHERS: usize = 1;
+ 
+ // server
+ pub const PORT: u16 = if cfg!(feature = "labeler") { 9001 } else { 9000 };
+@@ -47,17 +51,17 @@ pub static DO_PLC_EXPORT: LazyLock<bool> = LazyLock::new(|| {
+     !cfg!(feature = "labeler") && env::args().filter(|arg| arg == "--no-plc-export").count() == 0
+ });
+ pub const PLC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+-pub const CAPACITY_CACHE: usize = 1 << 18;
++pub const CAPACITY_CACHE: usize = 1 << 12;
+ 
+ // validator
+ pub const HOSTS_WRITE_INTERVAL: Duration = Duration::from_secs(10);
+ 
+ // validator queue
+-pub const QUEUE_DISK_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB max queue size
++pub const QUEUE_DISK_SIZE: u64 = 128 * 1024 * 1024;
+ pub const QUEUE_TTL_SECONDS: Option<u64> = Some(6 * 60 * 60); // 6 hours
+ 
+ // firehose
+-pub const DISK_SIZE: u64 = 320 * 1024 * 1024 * 1024; // 320 GiB
++pub const DISK_SIZE: u64 = 1024 * 1024 * 1024;
+ pub const TTL_SECONDS: Option<u64> = if cfg!(feature = "labeler") {
+     None
+ } else {
+@@ -65,10 +69,10 @@ pub const TTL_SECONDS: Option<u64> = if cfg!(feature = "labeler") {
+ };
+ 
+ // fjall db
+-pub const CACHE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
+-pub const WRITE_BUFFER_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
++pub const CACHE_SIZE: u64 = 32 * 1024 * 1024;
++pub const WRITE_BUFFER_SIZE: u64 = 16 * 1024 * 1024;
+ pub const FSYNC_MS: Option<u16> = Some(1000); // 1 second
+-pub const MEMTABLE_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB
++pub const MEMTABLE_SIZE: u32 = 8 * 1024 * 1024;
+ pub const BLOCK_SIZE: u32 = 64 * 1024; // 64 KiB
+ 
+ #[cfg(test)]
+diff --git a/rsky-relay/src/crawler/client.rs b/rsky-relay/src/crawler/client.rs
+index d98b17e..5a8d0a5 100644
+--- a/rsky-relay/src/crawler/client.rs
++++ b/rsky-relay/src/crawler/client.rs
+@@ -1,10 +1,10 @@
+ use std::io;
+ use std::net::{TcpStream, ToSocketAddrs};
+ use std::sync::Arc;
++use std::time::Duration;
+ 
+ use http::Uri;
+ use http::request::Parts;
+-use socket2::{Domain, Protocol, Socket, Type};
+ use tungstenite::Connector;
+ use tungstenite::client::{IntoClientRequest, uri_mode};
+ use tungstenite::client_tls_with_config;
+@@ -28,7 +28,11 @@ use crate::crawler::types::{DecomposeError, HandshakeResult};
+ /// you want to use other TLS libraries, use `client` instead. There is no need to enable any of
+ /// the `*-tls` features if you don't call `connect` since it's the only function that uses them.
+ pub fn connect<Req: IntoClientRequest>(request: Req) -> HandshakeResult {
+-    connect_with_config(request, None, 3)
++    connect_with_config(
++        request,
++        Some(WebSocketConfig::default().max_message_size(Some(16 * 1024 * 1024))),
++        0,
++    )
+ }
+ 
+ // Ref: https://github.com/snapview/tungstenite-rs/blob/master/src/client.rs
+@@ -104,25 +108,14 @@ pub fn connect_with_config<Req: IntoClientRequest>(
+ }
+ 
+ fn connect_to_some(addrs: impl ToSocketAddrs, uri: &Uri) -> Result<TcpStream, Box<Error>> {
+-    fn is_blocking_error(error: &io::Error) -> bool {
+-        matches!(
+-            error.kind(),
+-            io::ErrorKind::Interrupted | io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
+-        ) || matches!(error.raw_os_error(), Some(libc::EINPROGRESS))
+-    }
+-
+-    /// `Ok(None)`: every address was tried and none accepted the connection.
++    // Complete TCP connect before configuring/starting the nonblocking WS
++    // handshake. An EINPROGRESS socket may otherwise fail with ENOTCONN.
+     fn try_addrs(addrs: impl ToSocketAddrs) -> io::Result<Option<TcpStream>> {
+         for addr in addrs.to_socket_addrs()? {
+-            // debug!("Trying to contact {uri} at {addr}...");
+-            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+-            socket.set_nonblocking(true)?;
+-            match socket.connect(&addr.into()) {
+-                Ok(()) => {}
+-                Err(e) if is_blocking_error(&e) => {}
+-                Err(_) => continue,
++            if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
++                stream.set_nonblocking(true)?;
++                return Ok(Some(stream));
+             }
+-            return Ok(Some(socket.into()));
+         }
+         Ok(None)
+     }
+diff --git a/rsky-relay/src/crawler/connection.rs b/rsky-relay/src/crawler/connection.rs
+index 4b0f94c..8b86ce3 100644
+--- a/rsky-relay/src/crawler/connection.rs
++++ b/rsky-relay/src/crawler/connection.rs
+@@ -58,8 +58,12 @@ impl Connection {
+         } else {
+             "com.atproto.sync.subscribeRepos"
+         };
+-        #[expect(clippy::unwrap_used)]
+-        let mut url = Url::parse(&format!("wss://{hostname}/xrpc/{path}")).unwrap();
++        let mut url = upstream_url(
++            hostname,
++            path,
++            crate::config::PDS_HOST.as_deref(),
++            std::env::var("RELAY_UPSTREAM_URL").ok().as_deref(),
++        )?;
+         if let Some(cursor) = cursor {
+             url.query_pairs_mut().append_pair("cursor", &cursor.to_string());
+         }
+@@ -114,6 +118,77 @@ impl Connection {
+     }
+ }
+ 
++fn upstream_url(
++    hostname: &str, path: &str, configured_host: Option<&str>, configured_url: Option<&str>,
++) -> Result<Url, Box<tungstenite::Error>> {
++    let invalid = || {
++        Box::new(tungstenite::Error::Io(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "invalid or untrusted relay upstream",
++        )))
++    };
++    if configured_host.is_some_and(|host| hostname != host) {
++        return Err(invalid());
++    }
++    let mut url =
++        Url::parse(&configured_url.map_or_else(|| format!("https://{hostname}"), str::to_owned))
++            .map_err(|_| invalid())?;
++    if url.host_str().is_none()
++        || !url.username().is_empty()
++        || url.password().is_some()
++        || url.query().is_some()
++        || url.fragment().is_some()
++        || url.path() != "/"
++    {
++        return Err(invalid());
++    }
++    let scheme = match url.scheme() {
++        "http" => "ws",
++        "https" => "wss",
++        _ => return Err(invalid()),
++    };
++    url.set_scheme(scheme).map_err(|()| invalid())?;
++    url.set_path(&format!("/xrpc/{path}"));
++    Ok(url)
++}
++
++#[cfg(test)]
++mod para_tests {
++    use super::*;
++
++    #[test]
++    fn private_transport_keeps_public_identity_and_rejects_other_hosts() {
++        let url = upstream_url(
++            "pds.example.org",
++            "com.atproto.sync.subscribeRepos",
++            Some("pds.example.org"),
++            Some("http://pds:2583"),
++        )
++        .unwrap();
++        assert_eq!(url.as_str(), "ws://pds:2583/xrpc/com.atproto.sync.subscribeRepos");
++        assert!(
++            upstream_url(
++                "attacker.example",
++                "anything",
++                Some("pds.example.org"),
++                Some("http://pds:2583")
++            )
++            .is_err()
++        );
++        for bad in [
++            "ftp://pds:2583",
++            "http://user:password@pds:2583",
++            "http://pds:2583?cursor=7",
++            "http://pds:2583/other",
++        ] {
++            assert!(
++                upstream_url("pds.example.org", "anything", Some("pds.example.org"), Some(bad))
++                    .is_err()
++            );
++        }
++    }
++}
++
+ impl Drop for Connection {
+     fn drop(&mut self) {
+         drop(self.close());
+diff --git a/rsky-relay/src/crawler/manager.rs b/rsky-relay/src/crawler/manager.rs
+index ccf2c69..123c8db 100644
+--- a/rsky-relay/src/crawler/manager.rs
++++ b/rsky-relay/src/crawler/manager.rs
+@@ -21,6 +21,8 @@ const SLEEP: Duration = Duration::from_millis(10);
+ 
+ #[derive(Debug, Error)]
+ pub enum ManagerError {
++    #[error("fjall error: {0}")]
++    Fjall(#[from] fjall::Error),
+     #[error("spawn error: {0}")]
+     Spawn(#[from] io::Error),
+     #[error("worker error: {0}")]
+@@ -186,7 +188,7 @@ impl Manager {
+         if request_crawl.cursor.is_none() {
+             request_crawl.cursor = loop {
+                 match self.get_cursor(&request_crawl.hostname) {
+-                    Ok(cursor) => break cursor,
++                    Ok(cursor) => break cursor.or_else(|| Some(Cursor::from(0))),
+                     Err(ManagerError::Sqlite(err))
+                         if err.sqlite_error_code() == Some(ErrorCode::DatabaseLocked) => {}
+                     Err(err) => Err(err)?,
+@@ -201,12 +203,19 @@ impl Manager {
+ 
+     fn get_cursor(&self, host: &str) -> Result<Option<Cursor>, ManagerError> {
+         let mut stmt = self.conn.prepare_cached("SELECT * FROM hosts WHERE host = ?1")?;
+-        Ok(stmt
++        let sqlite = stmt
+             .query_one((&host,), |row| {
+                 Ok(u64::try_from(row.get_unwrap::<_, i64>("cursor")).unwrap_or_default())
+             })
+             .optional()?
+-            .map(Into::into))
++            .map(Cursor::from);
++        let durable =
++            crate::types::upstream_checkpoint(&crate::types::DB, host)?.map(|(cursor, _)| cursor);
++        Ok(match (sqlite, durable) {
++            (Some(a), Some(b)) => Some(Cursor::from(a.get().max(b.get()))),
++            (Some(a), None) | (None, Some(a)) => Some(a),
++            (None, None) => None,
++        })
+     }
+ 
+     fn refresh_bans(&mut self) -> Result<(), ManagerError> {
+diff --git a/rsky-relay/src/main.rs b/rsky-relay/src/main.rs
+index 81d5743..6e64c9f 100644
+--- a/rsky-relay/src/main.rs
++++ b/rsky-relay/src/main.rs
+@@ -81,6 +81,10 @@ pub async fn main() -> Result<()> {
+     }
+ 
+     let args = Args::parse();
++    color_eyre::eyre::ensure!(
++        rsky_relay::config::PDS_HOST.is_some(),
++        "RELAY_PDS_HOST is required for the PARA relay"
++    );
+ 
+     let terminate_now = Arc::new(AtomicBool::new(false));
+     flag::register_conditional_shutdown(SIGINT, 1, Arc::clone(&terminate_now))?;
+@@ -104,6 +108,7 @@ pub async fn main() -> Result<()> {
+     });
+     let crawler = CrawlerManager::new(WORKERS_CRAWLERS, &message_tx, request_crawl_rx)?;
+     let publisher = PublisherManager::new(WORKERS_PUBLISHERS, subscribe_repos_rx)?;
++    let validator_handle = &handle;
+     #[expect(clippy::vec_init_then_push)]
+     let ret = thread::scope(move |s| {
+         let mut handles = Vec::<ScopedJoinHandle<'_, Result<_, RelayError>>>::new();
+@@ -125,7 +130,6 @@ pub async fn main() -> Result<()> {
+         #[expect(clippy::expect_used)]
+         let mut signals =
+             SignalsInfo::<WithOrigin>::new(TERM_SIGNALS).expect("failed to init signals");
+-        let mut validator_logged = false;
+         'outer: loop {
+             for signal_info in signals.pending() {
+                 if TERM_SIGNALS.contains(&signal_info.signal) {
+@@ -137,11 +141,10 @@ pub async fn main() -> Result<()> {
+                     break 'outer;
+                 }
+             }
+-            // Validator dying should NOT take down the relay.
+-            // Log it once and keep serving firehose to subscribers.
+-            if validator_dead.load(Ordering::Relaxed) && !validator_logged {
+-                validator_logged = true;
+-                tracing::error!("validator stopped unexpectedly, relay continues serving");
++            // Fail closed: Docker must restart a relay whose ingestion stopped.
++            if validator_dead.load(Ordering::Relaxed) || validator_handle.is_finished() {
++                tracing::error!("validator stopped unexpectedly, shutting down relay");
++                break 'outer;
+             }
+             thread::sleep(SLEEP);
+         }
+@@ -160,9 +163,9 @@ pub async fn main() -> Result<()> {
+     }
+     match handle.await {
+         Ok(Ok(())) => tracing::info!("validator stopped cleanly"),
+-        Ok(Err(e)) => tracing::error!("validator stopped with error: {e}"),
++        Ok(Err(e)) => return Err(e.into()),
+         Err(e) if e.is_cancelled() => tracing::info!("validator aborted on shutdown"),
+-        Err(e) => tracing::error!("validator task panicked: {e}"),
++        Err(e) => return Err(e.into()),
+     }
+     ret
+ }
+diff --git a/rsky-relay/src/publisher/connection.rs b/rsky-relay/src/publisher/connection.rs
+index db11b8f..60b1da3 100644
+--- a/rsky-relay/src/publisher/connection.rs
++++ b/rsky-relay/src/publisher/connection.rs
+@@ -116,6 +116,28 @@ impl Connection {
+             self.close(FUTURE_CLOSE)?;
+             return Ok(false);
+         }
++        match firehose.first_key_value()? {
++            Some((key, _)) => {
++                let oldest = Cursor::from(key);
++                if self.cursor.get() < oldest.get() && (self.cursor.get() != 0 || oldest.get() > 1)
++                {
++                    if !self.send(self.cursor, Bytes::from_static(OUTDATED_MSG))? {
++                        return Ok(true);
++                    }
++                    self.cursor = oldest;
++                }
++            }
++            None if seq.get() > 0 && self.cursor.get() <= seq.get() => {
++                if self.send(self.cursor, Bytes::from_static(OUTDATED_MSG))? {
++                    self.cursor = seq.successor();
++                }
++                return Ok(true);
++            }
++            None => {}
++        }
++        if self.cursor.get() > seq.get() {
++            return Ok(true);
++        }
+         for msg in firehose.range(self.cursor..=seq) {
+             let (k, v) = msg?;
+             seq = k.into();
+diff --git a/rsky-relay/src/publisher/worker.rs b/rsky-relay/src/publisher/worker.rs
+index 67d2041..71d3873 100644
+--- a/rsky-relay/src/publisher/worker.rs
++++ b/rsky-relay/src/publisher/worker.rs
+@@ -34,11 +34,14 @@ pub struct Worker {
+     firehose: PartitionHandle,
+     poll: Poll,
+     events: Events,
++    durable_only: bool,
+ }
+ 
+ impl Worker {
+     pub fn new(id: usize, command_rx: CommandReceiver) -> Result<Self, WorkerError> {
+-        Self::with_keyspace(id, command_rx, &DB)
++        let mut worker = Self::with_keyspace(id, command_rx, &DB)?;
++        worker.durable_only = true;
++        Ok(worker)
+     }
+ 
+     pub fn with_keyspace(
+@@ -47,13 +50,26 @@ impl Worker {
+         let firehose = db.open_partition("firehose", PartitionCreateOptions::default())?;
+         let poll = Poll::new()?;
+         let events = Events::with_capacity(1024);
+-        Ok(Self { id, connections: Vec::new(), next_idx: 0, command_rx, firehose, poll, events })
++        Ok(Self {
++            id,
++            connections: Vec::new(),
++            next_idx: 0,
++            command_rx,
++            firehose,
++            poll,
++            events,
++            durable_only: false,
++        })
+     }
+ 
+     pub fn run(mut self) -> Result<(), WorkerError> {
+         let span = tracing::info_span!("publisher", id = %self.id);
+         let _enter = span.enter();
+-        let mut seq = self.firehose.last_key_value()?.map(|(k, _)| k.into()).unwrap_or_default();
++        let mut seq = if self.durable_only {
++            Cursor::from(crate::types::DURABLE_CURSOR.load(Ordering::Acquire))
++        } else {
++            self.firehose.last_key_value()?.map(|(k, _)| k.into()).unwrap_or_default()
++        };
+         while self.update(&mut seq)? {
+             thread::yield_now();
+         }
+@@ -111,10 +127,20 @@ impl Worker {
+                 self.handle_command(command, *seq);
+             }
+ 
+-            for msg in self.firehose.range((*seq + 1)..=(*seq + 32)) {
+-                let (k, v) = msg?;
+-                *seq = k.into();
+-                self.send(*seq, &Bytes::from_owner(v));
++            let durable = if self.durable_only {
++                crate::types::DURABLE_CURSOR.load(Ordering::Acquire)
++            } else {
++                u64::MAX
++            };
++            if seq.get() < durable {
++                for msg in self
++                    .firehose
++                    .range((*seq + 1)..=Cursor::from(seq.get().saturating_add(32).min(durable)))
++                {
++                    let (k, v) = msg?;
++                    *seq = k.into();
++                    self.send(*seq, &Bytes::from_owner(v));
++                }
+             }
+ 
+             let mut events = std::mem::replace(&mut self.events, Events::with_capacity(0));
+diff --git a/rsky-relay/src/server/server.rs b/rsky-relay/src/server/server.rs
+index 0ff7676..42a49e1 100644
+--- a/rsky-relay/src/server/server.rs
++++ b/rsky-relay/src/server/server.rs
+@@ -205,7 +205,9 @@ impl Server {
+             None
+         };
+ 
+-        let listener = TcpListener::bind(format!("127.0.0.1:{PORT}"))?;
++        let listener = TcpListener::bind(
++            std::env::var("RELAY_LISTEN").unwrap_or_else(|_| format!("127.0.0.1:{PORT}")),
++        )?;
+         listener.set_nonblocking(true)?;
+         let base_url = Url::parse("http://example.com")?;
+         let now = Instant::now();
+@@ -312,7 +314,7 @@ impl Server {
+         let url = Url::options().base_url(Some(&self.base_url)).parse(path)?;
+ 
+         match (method, url.path()) {
+-            ("GET", "/_health") => write_response(&mut stream, "200 OK", "ok"),
++            ("GET", "/_health" | "/xrpc/_health") => write_response(&mut stream, "200 OK", "ok"),
+             ("GET", "/") => write_response(&mut stream, "200 OK", INDEX_ASCII),
+             #[cfg(not(feature = "labeler"))]
+             ("GET", PATH_LIST_HOSTS) => {
+@@ -362,6 +364,16 @@ impl Server {
+                     if let Ok(request_crawl) =
+                         serde_json::from_reader::<_, RequestCrawl>(&self.buf[offset..len])
+                     {
++                        if crate::config::PDS_HOST
++                            .as_deref()
++                            .is_some_and(|host| request_crawl.hostname != host)
++                        {
++                            return write_response(
++                                &mut stream,
++                                "403 Forbidden",
++                                "{\"error\":\"Forbidden\",\"message\":\"only the configured PDS may be crawled\"}",
++                            );
++                        }
+                         if self.is_host_banned(&request_crawl.hostname) {
+                             tracing::info!(host = %request_crawl.hostname, "rejecting requestCrawl for banned host");
+                             return write_response(
+@@ -542,6 +554,13 @@ impl Server {
+ 
+     #[cfg(not(feature = "labeler"))]
+     fn query_hosts(&mut self) -> Result<()> {
++        if let Some(hostname) = crate::config::PDS_HOST.as_ref() {
++            if !self.is_host_banned(hostname) {
++                self.request_crawl_tx
++                    .push(RequestCrawl { hostname: hostname.clone(), cursor: None })?;
++            }
++            return Ok(());
++        }
+         let client = reqwest::blocking::Client::builder()
+             .user_agent("rsky-relay")
+             .https_only(true)
+diff --git a/rsky-relay/src/types.rs b/rsky-relay/src/types.rs
+index 5b2d120..8298e02 100644
+--- a/rsky-relay/src/types.rs
++++ b/rsky-relay/src/types.rs
+@@ -9,8 +9,7 @@ use fjall::{Keyspace, PartitionCreateOptions, Slice};
+ use thingbuf::{Recycle, mpsc};
+ 
+ use crate::config::{
+-    BLOCK_SIZE, CACHE_SIZE, DISK_SIZE, FSYNC_MS, MEMTABLE_SIZE, QUEUE_DISK_SIZE, QUEUE_TTL_SECONDS,
+-    TTL_SECONDS, WRITE_BUFFER_SIZE,
++    BLOCK_SIZE, CACHE_SIZE, DISK_SIZE, FSYNC_MS, MEMTABLE_SIZE, TTL_SECONDS, WRITE_BUFFER_SIZE,
+ };
+ 
+ pub type MessageSender = mpsc::blocking::Sender<Message, MessageRecycle>;
+@@ -18,6 +17,42 @@ pub type MessageReceiver = mpsc::blocking::Receiver<Message, MessageRecycle>;
+ 
+ #[expect(clippy::unwrap_used)]
+ pub static DB: LazyLock<Keyspace> = LazyLock::new(|| open_keyspace(&db_path()).unwrap());
++// Only events below this watermark may reach subscribers. An acknowledged
++// downstream cursor must survive SIGKILL without being reused for another event.
++pub static DURABLE_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++pub fn replay_head(db: &Keyspace, firehose: &fjall::PartitionHandle) -> fjall::Result<Cursor> {
++    let metadata = db.open_partition("metadata", PartitionCreateOptions::default())?;
++    let saved = metadata.get("head")?.map(Cursor::from).unwrap_or_default();
++    let tail = firehose.last_key_value()?.map(|(key, _)| Cursor::from(key)).unwrap_or_default();
++    Ok(Cursor::from(saved.get().max(tail.get())))
++}
++
++pub fn save_replay_head(db: &Keyspace, cursor: Cursor) -> fjall::Result<()> {
++    let metadata = db.open_partition("metadata", PartitionCreateOptions::default())?;
++    metadata.insert("head", cursor.as_ref())
++}
++
++pub fn upstream_checkpoint(db: &Keyspace, host: &str) -> fjall::Result<Option<(Cursor, i64)>> {
++    let metadata = db.open_partition("metadata", PartitionCreateOptions::default())?;
++    let Some(value) = metadata.get(format!("upstream/{host}"))? else { return Ok(None) };
++    let Ok(bytes) = <[u8; 16]>::try_from(value.as_ref()) else { return Ok(None) };
++    let mut cursor = [0; 8];
++    let mut time = [0; 8];
++    cursor.copy_from_slice(&bytes[..8]);
++    time.copy_from_slice(&bytes[8..]);
++    Ok(Some((Cursor::from(u64::from_be_bytes(cursor)), i64::from_be_bytes(time))))
++}
++
++pub fn save_upstream_checkpoint(
++    db: &Keyspace, host: &str, cursor: Cursor, time: i64,
++) -> fjall::Result<()> {
++    let metadata = db.open_partition("metadata", PartitionCreateOptions::default())?;
++    let mut bytes = [0; 16];
++    bytes[..8].copy_from_slice(cursor.as_ref());
++    bytes[8..].copy_from_slice(&time.to_be_bytes());
++    metadata.insert(format!("upstream/{host}"), bytes)
++}
+ 
+ #[inline]
+ pub fn db_path() -> PathBuf {
+@@ -38,8 +73,9 @@ pub fn open_keyspace(path: &std::path::Path) -> fjall::Result<Keyspace> {
+ }
+ 
+ fn queue_options() -> PartitionCreateOptions {
++    // Pending delivery is an obligation, not an expiring replay cache.
++    // The validator applies a capacity limit and fails closed when it fills.
+     PartitionCreateOptions::default()
+-        .compaction_strategy(Strategy::Fifo(Fifo::new(QUEUE_DISK_SIZE, QUEUE_TTL_SECONDS)))
+ }
+ 
+ fn firehose_options() -> PartitionCreateOptions {
+@@ -83,6 +119,7 @@ pub fn intake_bytes_add(len: usize) {
+     INFLIGHT_INTAKE_BYTES.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+ }
+ 
++#[allow(deprecated)] // Keep the upstream MSRV; Rust 1.99 deprecates fetch_update.
+ pub fn intake_bytes_sub(len: usize) {
+     #[expect(clippy::unwrap_used)]
+     INFLIGHT_INTAKE_BYTES
+@@ -365,4 +402,21 @@ mod tests {
+         }
+         let _ks: &fjall::Keyspace = &DB;
+     }
++    #[test]
++    fn para_cursor_survives_retention_and_database_restart() {
++        let dir = tempfile::tempdir().unwrap();
++        {
++            let db = open_keyspace(dir.path()).unwrap();
++            let firehose =
++                db.open_partition("firehose", PartitionCreateOptions::default()).unwrap();
++            firehose.insert(Cursor::from(42), b"event").unwrap();
++            save_replay_head(&db, Cursor::from(42)).unwrap();
++            firehose.remove(Cursor::from(42)).unwrap();
++            db.persist(fjall::PersistMode::SyncAll).unwrap();
++        }
++        let db = open_keyspace(dir.path()).unwrap();
++        let firehose = db.open_partition("firehose", PartitionCreateOptions::default()).unwrap();
++        assert!(firehose.first_key_value().unwrap().is_none());
++        assert_eq!(replay_head(&db, &firehose).unwrap().get(), 42);
++    }
+ }
+diff --git a/rsky-relay/src/validator/event.rs b/rsky-relay/src/validator/event.rs
+index 327b089..a0d7c02 100644
+--- a/rsky-relay/src/validator/event.rs
++++ b/rsky-relay/src/validator/event.rs
+@@ -19,6 +19,10 @@ pub type DidKey = [u8; 35];
+ 
+ #[derive(Debug, Error)]
+ pub enum ParseError {
++    #[error("upstream history gap: OutdatedCursor; reconcile before resuming")]
++    OutdatedCursor,
++    #[error("upstream rejected the subscription: {0}")]
++    UpstreamError(String),
+     #[error("header error: {0}")]
+     Header(#[from] ciborium::de::Error<std::io::Error>),
+     #[error("body error: {0}")]
+@@ -77,9 +81,22 @@ pub struct Commit {
+ #[derive(Debug, Serialize, Deserialize)]
+ #[serde(tag = "action", rename_all = "camelCase")]
+ pub enum SubscribeReposCommitOperation {
+-    Create { path: String, cid: Cid },
+-    Update { path: String, cid: Cid, prev_data: Option<Cid> },
+-    Delete { path: String, prev_data: Option<Cid> },
++    Create {
++        path: String,
++        cid: Cid,
++    },
++    Update {
++        path: String,
++        cid: Cid,
++        #[serde(rename = "prev")]
++        prev_data: Option<Cid>,
++    },
++    Delete {
++        path: String,
++        cid: Option<Cid>,
++        #[serde(rename = "prev")]
++        prev_data: Option<Cid>,
++    },
+ }
+ 
+ impl PartialEq for SubscribeReposCommitOperation {
+@@ -142,6 +159,7 @@ pub struct SubscribeReposCommit {
+     pub blocks: Vec<u8>,
+     pub ops: Vec<SubscribeReposCommitOperation>,
+     pub blobs: Vec<String>, // NOTE: DEPRECATED
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub prev_data: Option<Cid>,
+     pub time: DateTime<Utc>,
+ }
+@@ -167,6 +185,7 @@ pub struct SubscribeReposIdentity {
+     pub seq: u64,
+     pub did: String,
+     pub time: DateTime<Utc>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub handle: Option<String>,
+ }
+ 
+@@ -180,13 +199,14 @@ pub struct SubscribeReposAccount {
+     pub did: String,
+     pub time: DateTime<Utc>,
+     pub active: bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub status: Option<AccountStatus>,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ pub struct SubscribeReposInfo {
+     pub name: String,
+-    pub message: String,
++    pub message: Option<String>,
+ }
+ 
+ /// Subscribe to stream of labels (and negations). Public endpoint implemented by mod services.
+@@ -256,7 +276,15 @@ impl SubscribeReposEvent {
+             }
+         };
+         if header.operation_ == -1 {
+-            return Ok(None);
++            let body = serde_ipld_dagcbor::from_reader::<
++                std::collections::BTreeMap<String, String>,
++                _,
++            >(&mut reader)
++            .ok();
++            return Err(ParseError::UpstreamError(
++                body.and_then(|body| body.get("error").cloned())
++                    .unwrap_or_else(|| "malformed error frame".to_owned()),
++            ));
+         }
+         let body = match header.type_.as_ref() {
+             "#commit" => Self::Commit(serde_ipld_dagcbor::from_reader(&mut reader)?),
+@@ -272,7 +300,10 @@ impl SubscribeReposEvent {
+             }
+             "#info" => {
+                 let info = serde_ipld_dagcbor::from_reader::<SubscribeReposInfo, _>(&mut reader)?;
+-                tracing::debug!(name = %info.name, message = %info.message, "received #info");
++                if info.name == "OutdatedCursor" {
++                    return Err(ParseError::OutdatedCursor);
++                }
++                tracing::debug!(name = %info.name, message = ?info.message, "received #info");
+                 return Ok(None);
+             }
+             _ => {
+@@ -284,6 +315,13 @@ impl SubscribeReposEvent {
+     }
+ 
+     pub fn serialize(self, capacity: usize, seq: Cursor) -> Result<Vec<u8>, SerializeError> {
++        if seq.get() > 9_007_199_254_740_991 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "relay cursor exceeds JavaScript safe integer range",
++            )
++            .into());
++        }
+         let mut writer = io::Cursor::new(Vec::with_capacity(capacity));
+ 
+         let header = Header { operation_: 1, type_: Cow::Borrowed(self.type_()) };
+@@ -508,26 +546,28 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn parse_op_minus_one_returns_none() {
++    fn parse_op_minus_one_refuses_rejected_subscription() {
+         // Header { type: "", op: -1 } -> ciborium-encoded.
+         let mut buf = Vec::new();
+         ciborium::ser::into_writer(&Header { type_: Cow::Borrowed(""), operation_: -1 }, &mut buf)
+             .unwrap();
+-        assert!(SubscribeReposEvent::parse(&buf).unwrap().is_none());
++        assert!(matches!(SubscribeReposEvent::parse(&buf), Err(ParseError::UpstreamError(_))));
+     }
+ 
+     #[test]
+-    fn parse_info_returns_none() {
++    fn parse_outdated_cursor_requires_reconciliation() {
+         let mut buf = Vec::new();
+         ciborium::ser::into_writer(
+             &Header { type_: Cow::Borrowed("#info"), operation_: 1 },
+             &mut buf,
+         )
+         .unwrap();
+-        let info =
+-            SubscribeReposInfo { name: "OutdatedCursor".to_owned(), message: "msg".to_owned() };
++        let info = SubscribeReposInfo {
++            name: "OutdatedCursor".to_owned(),
++            message: Some("msg".to_owned()),
++        };
+         serde_ipld_dagcbor::to_writer(&mut buf, &info).unwrap();
+-        assert!(SubscribeReposEvent::parse(&buf).unwrap().is_none());
++        assert!(matches!(SubscribeReposEvent::parse(&buf), Err(ParseError::OutdatedCursor)));
+     }
+ 
+     #[test]
+@@ -627,7 +667,11 @@ mod tests {
+             cid: empty_cid(),
+             prev_data: None,
+         };
+-        let c = SubscribeReposCommitOperation::Delete { path: "p2".to_owned(), prev_data: None };
++        let c = SubscribeReposCommitOperation::Delete {
++            path: "p2".to_owned(),
++            cid: None,
++            prev_data: None,
++        };
+         assert_eq!(a, b);
+         assert_ne!(a, c);
+         assert!(a < c);
+@@ -660,13 +704,88 @@ mod tests {
+         assert!(
+             SubscribeReposCommitOperation::Delete {
+                 path: "p".to_owned(),
++                cid: None,
+                 prev_data: Some(empty_cid()),
+             }
+             .is_valid()
+         );
+         assert!(
+-            !SubscribeReposCommitOperation::Delete { path: "p".to_owned(), prev_data: None }
+-                .is_valid()
++            !SubscribeReposCommitOperation::Delete {
++                path: "p".to_owned(),
++                cid: None,
++                prev_data: None
++            }
++            .is_valid()
++        );
++    }
++
++    #[test]
++    fn para_wire_ops_preserve_previous_cids_and_null_delete_cid() {
++        use ipld_core::ipld::Ipld;
++        for action in ["update", "delete"] {
++            let mut fields = std::collections::BTreeMap::from([
++                ("action".to_owned(), Ipld::String(action.to_owned())),
++                ("path".to_owned(), Ipld::String("com.para.community.board/one".to_owned())),
++                ("prev".to_owned(), Ipld::Link(empty_cid())),
++                (
++                    "cid".to_owned(),
++                    if action == "delete" { Ipld::Null } else { Ipld::Link(empty_cid()) },
++                ),
++            ]);
++            let bytes = serde_ipld_dagcbor::to_vec(&Ipld::Map(fields.clone())).unwrap();
++            let op: SubscribeReposCommitOperation = serde_ipld_dagcbor::from_slice(&bytes).unwrap();
++            assert!(op.is_valid());
++            let output: Ipld =
++                serde_ipld_dagcbor::from_slice(&serde_ipld_dagcbor::to_vec(&op).unwrap()).unwrap();
++            assert_eq!(output, Ipld::Map(std::mem::take(&mut fields)));
++        }
++    }
++
++    #[test]
++    fn para_large_upstream_cursor_is_exact_and_resequenced() {
++        let mut commit = make_commit();
++        commit.seq = 458_708_000_931_978_140;
++        let mut original = Vec::new();
++        ciborium::ser::into_writer(
++            &Header { operation_: 1, type_: Cow::Borrowed("#commit") },
++            &mut original,
++        )
++        .unwrap();
++        serde_ipld_dagcbor::to_writer(&mut original, &commit).unwrap();
++        let event = SubscribeReposEvent::parse(&original).unwrap().unwrap();
++        assert_eq!(event.seq().get(), 458_708_000_931_978_140);
++        let relayed = event.serialize(original.len(), Cursor::from(7)).unwrap();
++        assert_eq!(SubscribeReposEvent::parse(&relayed).unwrap().unwrap().seq().get(), 7);
++    }
++    #[test]
++    fn para_optional_identity_and_account_fields_are_omitted() {
++        use ipld_core::ipld::Ipld;
++        for event in [
++            SubscribeReposEvent::Identity(SubscribeReposIdentity {
++                seq: 1,
++                did: "did:plc:test".to_owned(),
++                time: fixed_time(),
++                handle: None,
++            }),
++            SubscribeReposEvent::Account(SubscribeReposAccount {
++                seq: 1,
++                did: "did:plc:test".to_owned(),
++                time: fixed_time(),
++                active: true,
++                status: None,
++            }),
++        ] {
++            let bytes = event.serialize(0, Cursor::from(1)).unwrap();
++            let mut reader = io::Cursor::new(bytes);
++            let _header: Header<'_> = ciborium::de::from_reader(&mut reader).unwrap();
++            let Ipld::Map(body) = serde_ipld_dagcbor::from_reader(&mut reader).unwrap() else {
++                panic!("expected map")
++            };
++            assert!(!body.contains_key("handle"));
++            assert!(!body.contains_key("status"));
++        }
++        assert!(
++            SubscribeReposEvent::Commit(make_commit()).serialize(0, Cursor::from(1 << 53)).is_err()
+         );
+     }
+ }
+diff --git a/rsky-relay/src/validator/manager.rs b/rsky-relay/src/validator/manager.rs
+index 8fbffbf..2276cef 100644
+--- a/rsky-relay/src/validator/manager.rs
++++ b/rsky-relay/src/validator/manager.rs
+@@ -25,6 +25,14 @@ const SLEEP: Duration = Duration::from_micros(100);
+ 
+ #[derive(Debug, Error)]
+ pub enum ManagerError {
++    #[error(
++        "pending identity queue is full; intake must restart from the saved upstream checkpoint"
++    )]
++    QueueFull,
++    #[error("repo checkpoint encoding error: {0}")]
++    CheckpointEncode(#[from] serde_ipld_dagcbor::EncodeError<std::collections::TryReserveError>),
++    #[error("upstream cursor exceeds SQLite's signed 64-bit range: {0}")]
++    CursorRange(#[from] std::num::TryFromIntError),
+     #[error("parse error: {0}")]
+     Parse(#[from] ParseError),
+     #[error("serialize error: {0}")]
+@@ -85,6 +93,9 @@ impl<R: IdentityResolver> Manager<R> {
+         )?;
+         let queue = DB.open_partition("queue", PartitionCreateOptions::default())?;
+         let firehose = DB.open_partition("firehose", PartitionCreateOptions::default())?;
++        DB.persist(PersistMode::SyncAll)?;
++        crate::types::DURABLE_CURSOR
++            .store(crate::types::replay_head(&DB, &firehose)?.get(), Ordering::Release);
+         Ok(Self {
+             message_rx,
+             hosts,
+@@ -114,6 +125,24 @@ impl<R: IdentityResolver> Manager<R> {
+         }
+         #[allow(unused_mut)]
+         let mut repos = 0;
++        // Fjall checkpoints are committed with the replay log on every batch;
++        // SQLite is a periodic catalog, never the only recovery cursor.
++        let metadata = DB.open_partition("metadata", PartitionCreateOptions::default())?;
++        for item in metadata.prefix("upstream/") {
++            let (key, _) = item?;
++            if let Some(host) =
++                std::str::from_utf8(&key).ok().and_then(|key| key.strip_prefix("upstream/"))
++            {
++                if let Some((cursor, micros)) = crate::types::upstream_checkpoint(&DB, host)? {
++                    if let Some(time) = DateTime::from_timestamp_micros(micros) {
++                        let entry = self.hosts.entry(host.to_owned()).or_insert((cursor, time));
++                        if cursor.get() >= entry.0.get() {
++                            *entry = (cursor, time);
++                        }
++                    }
++                }
++            }
++        }
+         #[cfg(not(feature = "labeler"))]
+         {
+             // TODO: move this to sqlite
+@@ -131,7 +160,7 @@ impl<R: IdentityResolver> Manager<R> {
+             }
+         }
+ 
+-        let mut cursor = self.firehose.last_key_value()?.map(|(k, _)| k.into()).unwrap_or_default();
++        let mut cursor = crate::types::replay_head(&DB, &self.firehose)?;
+         let mut queue_drained = 0;
+         let mut queue_pending = 0;
+         for res in self.queue.keys() {
+@@ -160,7 +189,19 @@ impl<R: IdentityResolver> Manager<R> {
+     }
+ 
+     fn persist(&mut self) -> Result<(), ManagerError> {
+-        // persist hosts data
++        // Persist repo state and all queued/published events BEFORE advancing
++        // SQLite's upstream checkpoints. A crash may cause duplicate intake,
++        // never a checkpoint that skips an event missing from the replay log.
++        #[cfg(not(feature = "labeler"))]
++        {
++            let repos = DB.open_partition("repos", PartitionCreateOptions::default())?;
++            let mut batch = DB.batch();
++            for (did, state) in &self.repos {
++                batch.insert(&repos, did.as_bytes(), serde_ipld_dagcbor::to_vec(state)?);
++            }
++            batch.commit()?;
++        }
++        DB.persist(PersistMode::SyncAll)?;
+         let tx = self.conn.transaction()?;
+         let mut stmt = tx.prepare_cached(
+             "
+@@ -172,7 +213,7 @@ impl<R: IdentityResolver> Manager<R> {
+         )?;
+         for (host, (cursor, time)) in &self.hosts {
+             if *time != DateTime::UNIX_EPOCH {
+-                stmt.execute((host, i64::try_from(cursor.get()).unwrap_or(i64::MAX), time))?;
++                stmt.execute((host, i64::try_from(cursor.get())?, time))?;
+             }
+         }
+         drop(stmt);
+@@ -190,6 +231,19 @@ impl<R: IdentityResolver> Manager<R> {
+         let now = Instant::now();
+         if self.last + HOSTS_WRITE_INTERVAL < now {
+             self.persist()?;
++            // Retry queued identities even when the PDS emits no further events.
++            let mut pending = std::collections::BTreeSet::new();
++            for item in self.queue.keys() {
++                let key = item?;
++                if let Some(did) =
++                    std::str::from_utf8(&key).ok().and_then(|key| key.split('>').next())
++                {
++                    pending.insert(did.to_owned());
++                }
++            }
++            for did in pending {
++                self.scan_did(cursor, &did)?;
++            }
+             self.last = now;
+         }
+ 
+@@ -211,6 +265,9 @@ impl<R: IdentityResolver> Manager<R> {
+             let event = match SubscribeReposEvent::parse(&msg.data) {
+                 Ok(Some(event)) => event,
+                 Ok(None) => continue,
++                Err(err @ (ParseError::OutdatedCursor | ParseError::UpstreamError(_))) => {
++                    return Err(err.into());
++                }
+                 Err(err) => {
+                     tracing::debug!(%err, "parse error");
+                     continue;
+@@ -289,7 +346,7 @@ impl<R: IdentityResolver> Manager<R> {
+                     (pds, Some(key))
+                 } else {
+                     if !lenient {
+-                        self.queue.insert(format!("{did}>{host}>{seq}"), msg.data.to_vec())?;
++                        self.enqueue(format!("{did}>{host}>{seq}"), &msg.data)?;
+                         self.hosts.insert(host.clone(), (seq, time));
+                         metrics::record_validator_deferred("resolver_pending");
+                         continue;
+@@ -308,7 +365,7 @@ impl<R: IdentityResolver> Manager<R> {
+                 if !lenient {
+                     tracing::debug!(?pds_owned, "hostname pds mismatch, fetching latest DID doc");
+                     self.resolver.request_direct(did);
+-                    self.queue.insert(format!("{did}>{host}>{seq}"), msg.data.to_vec())?;
++                    self.enqueue(format!("{did}>{host}>{seq}"), &msg.data)?;
+                     self.hosts.insert(host.clone(), (seq, time));
+                     metrics::record_validator_deferred("pds_mismatch");
+                     continue;
+@@ -379,23 +436,39 @@ impl<R: IdentityResolver> Manager<R> {
+             self.scan_did(cursor, &did)?;
+         }
+ 
++        let mut checkpoint_changed = false;
++        for (host, (received, time)) in &self.hosts {
++            let current = crate::types::upstream_checkpoint(&DB, host)?;
++            if current != Some((*received, time.timestamp_micros())) {
++                crate::types::save_upstream_checkpoint(
++                    &DB,
++                    host,
++                    *received,
++                    time.timestamp_micros(),
++                )?;
++                checkpoint_changed = true;
++            }
++        }
++        if checkpoint_changed || cursor.get() > crate::types::DURABLE_CURSOR.load(Ordering::Acquire)
++        {
++            crate::types::save_replay_head(&DB, *cursor)?;
++            DB.persist(PersistMode::SyncAll)?;
++            crate::types::DURABLE_CURSOR.store(cursor.get(), Ordering::Release);
++        }
++
+         Ok(true)
+     }
+ 
++    fn enqueue(&self, key: String, data: &[u8]) -> Result<(), ManagerError> {
++        if self.queue.disk_space() >= crate::config::QUEUE_DISK_SIZE || self.queue.len()? >= 512 {
++            return Err(ManagerError::QueueFull);
++        }
++        self.queue.insert(key, data)?;
++        Ok(())
++    }
++
+     fn scan_did(&mut self, cursor: &mut Cursor, did: &str) -> Result<(), ManagerError> {
+         let Some((pds, key)) = self.resolver.resolve_owned(did)? else {
+-            // Evict all queue entries for this unresolvable DID to prevent unbounded growth
+-            let mut batch = DB.batch();
+-            let mut evicted = 0u64;
+-            for res in self.queue.prefix(did) {
+-                let (k, _) = res?;
+-                batch.remove(&self.queue, k);
+-                evicted += 1;
+-            }
+-            if evicted > 0 {
+-                batch.commit()?;
+-                tracing::debug!(evicted, did, "evicted queue entries for unresolvable DID");
+-            }
+             return Ok(());
+         };
+ 
+@@ -485,36 +558,8 @@ impl<R: IdentityResolver> Manager<R> {
+ impl<R: IdentityResolver> Drop for Manager<R> {
+     fn drop(&mut self) {
+         SHUTDOWN.store(true, Ordering::Relaxed);
+-
+         if let Err(err) = self.persist() {
+-            tracing::warn!(%err, "unable to persist host state\n{:#?}", self.hosts);
+-        }
+-
+-        #[cfg(not(feature = "labeler"))]
+-        match DB.open_partition("repos", PartitionCreateOptions::default()) {
+-            Ok(repos) => {
+-                let len = self.repos.len();
+-                let mut batch = Batch::with_capacity(DB.clone(), len);
+-                for (did, state) in self.repos.drain() {
+-                    #[expect(clippy::unwrap_used)]
+-                    batch.insert(
+-                        &repos,
+-                        did.into_bytes(),
+-                        serde_ipld_dagcbor::to_vec(&state).unwrap(),
+-                    );
+-                }
+-                tracing::info!(%len, "persisting repos");
+-                if let Err(err) = batch.commit() {
+-                    tracing::warn!(%err, "unable to persist repo state");
+-                }
+-            }
+-            Err(err) => {
+-                tracing::warn!(%err, "unable to open repos tree");
+-            }
+-        }
+-
+-        if let Err(err) = DB.persist(PersistMode::SyncAll) {
+-            tracing::warn!(%err, "unable to flush db");
++            tracing::warn!(%err, "unable to persist relay checkpoints");
+         }
+     }
+ }
+diff --git a/rsky-relay/src/validator/resolver.rs b/rsky-relay/src/validator/resolver.rs
+index d03a24e..ce28650 100644
+--- a/rsky-relay/src/validator/resolver.rs
++++ b/rsky-relay/src/validator/resolver.rs
+@@ -90,13 +90,13 @@ impl Resolver {
+     fn with_db_path(db_path: &str) -> Result<Self, ResolverError> {
+         #[expect(clippy::unwrap_used)]
+         let cache = LruCache::new(NonZeroUsize::new(CAPACITY_CACHE).unwrap());
+-        let flag = if *DO_PLC_EXPORT {
+-            OpenFlags::SQLITE_OPEN_READ_WRITE
+-        } else {
+-            OpenFlags::SQLITE_OPEN_READ_ONLY
+-        };
++        let flag = OpenFlags::SQLITE_OPEN_READ_WRITE;
+         let conn = Connection::open_with_flags(db_path, flag | OpenFlags::SQLITE_OPEN_CREATE)?;
+         conn.busy_timeout(std::time::Duration::from_secs(5))?;
++        if !*DO_PLC_EXPORT {
++            // Direct resolution needs no full PLC export or Python bootstrap.
++            conn.execute_batch("CREATE TABLE IF NOT EXISTS plc_operations (cid TEXT PRIMARY KEY, did TEXT, created_at TEXT, nullified INTEGER, operation BLOB); CREATE TABLE IF NOT EXISTS plc_keys (did TEXT PRIMARY KEY, pds_endpoint TEXT, pds_key TEXT, labeler_endpoint TEXT, labeler_key TEXT);")?;
++        }
+         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 1000;")?;
+         if *DO_PLC_EXPORT {
+             match conn.execute("PRAGMA secure_delete = OFF", []) {
+@@ -109,11 +109,19 @@ impl Resolver {
+         }
+         let now = Instant::now();
+         let last = now.checked_sub(PLC_EXPORT_INTERVAL).unwrap_or(now);
+-        let after = conn.query_one(
+-            "SELECT created_at FROM plc_operations ORDER BY created_at DESC LIMIT 1",
+-            [],
+-            |row| Ok(Some(row.get("created_at")?)),
+-        )?;
++        let after = conn
++            .query_row(
++                "SELECT created_at FROM plc_operations ORDER BY created_at DESC LIMIT 1",
++                [],
++                |row| Ok(Some(row.get("created_at")?)),
++            )
++            .or_else(|err| {
++                if matches!(err, rusqlite::Error::QueryReturnedNoRows) {
++                    Ok(None)
++                } else {
++                    Err(err)
++                }
++            })?;
+         let client = Client::builder()
+             .user_agent("rsky-relay")
+             .timeout(REQ_TIMEOUT)
+@@ -127,6 +135,11 @@ impl Resolver {
+     }
+ 
+     pub fn expire(&mut self, did: &str, time: DateTime<Utc>) {
++        if !*DO_PLC_EXPORT {
++            self.cache.pop(did);
++            self.request_direct(did);
++            return;
++        }
+         if let Some(after) = &self.after {
+             if DateTime::parse_from_rfc3339(after).map_or(true, |after| after < time) {
+                 tracing::trace!("expiring did");
+@@ -394,7 +407,13 @@ fn parse_key_endpoint(endpoint: Option<&str>, key: Option<&str>) -> Option<(DidE
+                 Ok(key) => {
+                     // endpoint can be null for legacy doc formats
+                     let pds = endpoint.and_then(|endpoint| {
+-                        Some(endpoint.strip_prefix("https://")?.trim_end_matches('/').into())
++                        let host = endpoint.strip_prefix("https://").or_else(|| {
++                            endpoint.strip_prefix("http://").filter(|host| {
++                                crate::config::PDS_HOST.as_deref()
++                                    == Some(host.trim_end_matches('/'))
++                            })
++                        })?;
++                        Some(host.trim_end_matches('/').into())
+                     });
+                     return Some((pds, key));
+                 }
+diff --git a/rsky-relay/src/validator/types.rs b/rsky-relay/src/validator/types.rs
+index acbaa10..47d6e98 100644
+--- a/rsky-relay/src/validator/types.rs
++++ b/rsky-relay/src/validator/types.rs
+@@ -222,7 +222,7 @@ impl Node {
+                     Ok(false)
+                 }
+             }
+-            SubscribeReposCommitOperation::Delete { path, prev_data } => {
++            SubscribeReposCommitOperation::Delete { path, prev_data, .. } => {
+                 #[expect(clippy::unwrap_used)]
+                 let Some(found) = self.insert(path.as_str(), prev_data.unwrap(), -1)? else {
+                     return Ok(true);

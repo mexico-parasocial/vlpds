@@ -10,7 +10,7 @@ make dev
              mismo dentro de cada servicio y desde tu Mac
   ├─ plc        :2582  did-method-plc, construido desde el commit que usan los bancos de prueba de vlpds
   ├─ vlpds      :2583  --memory --dev-mode (nada persiste)
-  ├─ relay      :2470  indigo, renumera el firehose de vlpds
+  ├─ relay      :2470  vlRelay (en memoria), renumera el firehose de vlpds
   ├─ dataplane  :2585  indexa el firehose del relay en Postgres
   ├─ appview    :2584  api.js
   ├─ bsync      :2586  construido desde WatZappa main
@@ -44,9 +44,10 @@ Variables útiles al levantar:
 - **El AppView desactiva la protección SSRF** (`BSKY_DISABLE_SSRF_PROTECTION`)
   porque si no, se niega a resolver DIDs contra el PLC en `localhost`. Solo en
   desarrollo.
-- **El relay se registra por su base.** Solo acepta hosts con IP pública,
-  incluso por su ruta de admin; `dev/up.sh` inserta `localhost:2583` en su
-  tabla de hosts y lo reinicia.
+- **El relay sigue el PDS configurado.** vlRelay lee `localhost:2583`
+  (`--host`, `dev/compose.vlrelay.yaml`) y resuelve DIDs contra el PLC local.
+  La primera vez `make dev` construye su imagen desde el commit fijado.
+  `make dev PARA_RELAY=rsky` usa rsky ([RSKY-RELAY.md](RSKY-RELAY.md)).
 - **Nada persiste.** Es más fácil empezar de cero que reparar un estado
   local. Las llaves (rotación PLC y firma del AppView) sí se guardan en
   `.dev/dev.env` para no cambiar de identidad en cada arranque.
@@ -74,9 +75,9 @@ el DID del AppView dice `localhost`, así que desde el teléfono las peticiones
 que vlpds reenvía funcionan (vlpds está en tu Mac), pero no las que la app
 haga directo al AppView por su DID.
 
-Recuerda que con vlpds la app no puede crear comunidades, unirse ni votar
-([VLPDS.md §3](VLPDS.md#3-la-brecha-de-compara)). Para trabajar en esas
-pantallas, usa la variante tradicional ([tradicional/LIBRETO.md](tradicional/LIBRETO.md)).
+El fork nativo permite crear comunidades, unirse y votar (con verificador M8).
+Para invitaciones de fundadores, factores iM8 y alpha, aún hace falta la variante
+tradicional. Consulta [Escrituras nativas](NATIVE-PARA-WRITES.md).
 
 ## Probar la producción en tu máquina
 

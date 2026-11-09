@@ -77,7 +77,7 @@ edges:
   (`PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`, `PDS_EMAIL_SMTP_URL`, `PDS_INVITE_INTERVAL`, ...), so
   an existing `pds.env` mostly carries over.
 - Some settings live in the bucket. The shard layout, the active feature level, the rate-limit config,
-  the relay list and the added handle domains are cluster-wide, and you change them at runtime from the
+  the relay list, the added handle domains and the third-party sign-in providers are cluster-wide, and you change them at runtime from the
   [admin console](admin-console.md) or `vlpds admin`. A crawler list set in the console overrides
   `--crawlers` until it's reset.
 - To check a config, run `vlpds --memory-plan` with the same flags. It prints the memory plan as JSON
@@ -130,29 +130,49 @@ capacity, used) and `vlpds_meta_cache_shortfall_bytes`. Details:
 ## Shards and lease TTL
 
 ```diagram
-caption: "One lease, four numbers. The node renews by CAS every TTL/5; its own validity ends 0.8 × TTL after the last renewal was sent; a renewal slower than 0.4 × TTL fail-stops it; peers take over after 1.2 × TTL without a change."
+caption: "One lease, four numbers. The node renews by CAS every renew interval (TTL/5 by default); its own validity ends TTL − skew after the last renewal was sent; a stall longer than TTL − skew − renew fail-stops it; peers take over after TTL + skew without a change."
 nodes:
   - { id: r, label: renew, sub: every TTL/5, at: [0, 0], size: [8, 3], tone: accent }
-  - { id: c, label: ceiling, sub: "0.4 × TTL round trip", at: [11, 0], size: [9, 3], tone: rust }
-  - { id: v, label: valid until, sub: "0.8 × TTL after send", at: [23, 0], size: [9, 3], tone: violet }
-  - { id: t, label: takeover, sub: "1.2 × TTL unchanged", at: [35, 0], size: [9, 3], tone: danger }
+  - { id: c, label: margin, sub: "TTL − skew − renew", at: [11, 0], size: [9, 3], tone: rust }
+  - { id: v, label: valid until, sub: "TTL − skew after send", at: [23, 0], size: [9, 3], tone: violet }
+  - { id: t, label: takeover, sub: "TTL + skew unchanged", at: [35, 0], size: [9, 3], tone: danger }
 edges:
   - r -> c
   - c -> v
   - v -> t
 ```
 
-| `--lease-ttl-ms` | Renew every | Renewal ceiling | Peer takeover after a crash | Lone node's crash restart, first write | Idle control-plane cost |
-|---|---|---|---|---|---|
-| 10,000 (default, standard) | 2 s | 4 s | ~12 s, or 3–5 s if the port refuses | ~11 s (measured) | 3 Class A per 2 s |
-| 60,000 (tiny) | 12 s | 24 s | ~72 s | ~53 s (measured) | ~0.3 M Class A/mo in all |
-| 300,000 | 60 s | 120 s | ~6 min | ~281 s (measured) | saves pennies more |
+`--lease-renew-ms` and `--lease-skew-ms` default to TTL/5 each. The node refuses to start if renew +
+skew is over TTL/2 or the skew is outside TTL/20 to TTL/5. The margin is the longest store stall a
+renewal can ride out, so it stays at least half the TTL. The skew bounds the clock-rate drift the
+liveness rule tolerates (skew/TTL), and at most TTL/5 keeps the sustained renewal ceiling,
+(TTL − skew)/2, at 0.4 × TTL or more, where the TTL-relative alerts put it.
 
-A graceful restart (SIGTERM) can write again in about a second at any TTL, because the node fences its
-own log and deletes its lease on the way out. Only a crash waits, since the new process can't write
-until its clock passes the last renewal's send time plus a TTL. Keep the TTL at 10 s or more in
-production. Below that, a brief store hiccup over the ceiling stops the node. Safety never depends on
-the TTL, which only decides when a takeover happens. See [Architecture](../architecture.md#leases).
+| Lease (TTL / renew / skew) | Stall margin | Renewal ceiling | Peer takeover (hung node or dead host; crashed process) | Lone node's crash restart, first write | Idle control-plane cost |
+|---|---|---|---|---|---|
+| 10 s / 2 s / 2 s (default, standard) | 6 s | 4 s | ~12 s; 3–5 s | ~11 s (measured) | 3 Class A per 2 s |
+| 60 s / 12 s / 12 s | 36 s | 24 s | ~72 s | ~53 s (measured) | ~0.3 M Class A/mo in all |
+| 120 s / 12 s / 12 s (tiny) | 96 s | 54 s | ~132 s; 18–30 s | ~113 s (estimated) | the same as 60 s |
+| 300 s / 60 s / 60 s | 180 s | 120 s | ~6 min | ~281 s (measured) | saves pennies more |
+
+The tiny profile runs 120 s with a 12 s renew and skew because R2 sometimes answers nothing for
+40–90 s. At 60 s its 36 s margin turned each such stall into a fail-stop and ~50 s of downtime. The
+96 s margin rides them out (less the few seconds from the stall's end to the next lease-write
+attempt) at the same write rate. A graceful restart (SIGTERM) can write again in about a second at
+any TTL, because the node fences its own log and deletes its lease on the way out. Only a crash
+waits, since the new process can't write until its clock passes the last renewal's send time plus a
+TTL.
+
+In a cluster the TTL is a failover choice, made per deployment. A node that hangs or is partitioned
+(not crashed: a refused connect presumes a crashed node dead at once) keeps its shards for TTL +
+skew after its last renewal, and the merged firehose waits on its log until then. Peers wait the
+longer of their own TTL + skew and the one the node's lease publishes, so mixed settings during a
+rolling change never take over a live node early. Leases publish their timing only once feature
+level 3 (`lease-timing`) is active, and a lease without it (a lower level, or an older build) is
+judged by the observer's own TTL + skew. Until level 3 is finalized, give every node of a cluster
+the same TTL and skew. A lone node keeps its own margin either way. Keep the TTL at 10 s or more in production. Below that, a brief
+store hiccup stops the node. Safety never depends on the TTL, which only decides when a takeover
+happens. See [Architecture](../architecture.md#leases).
 
 The keyspace is 65,536 hash slots grouped into shards. `--shards` (default 64, at most 65,536) only
 sets the initial layout of a new prefix. After that, shards split and merge online
@@ -235,7 +255,8 @@ A node sheds load before it runs out of memory. Each limit returns an error the 
 | `--max-connections` | 50,000 | Open connections per listener. More wait in the accept queue (`--listen-backlog` 16,384, and raise `net.core.somaxconn` too). |
 | `--max-exports`, `--export-stall-secs` | 32, 60 | getRepo streams at once (more wait 10 s, then 503). A stream whose client reads nothing for 60 s is ended. |
 | `--max-import-mb`, `--import-memory-mb` | 1,024, 1/16 of the budget | Largest CAR importRepo takes, and the memory imports may hold at once. |
-| `--max-blob-mb` | 100 | Largest uploadBlob. |
+| `--max-blob-mb` | 100 | Largest uploadBlob, and describeServer's `blobUploadLimit`. At most 4768 (5 GB). The console can lower it per account. |
+| `--max-blob-override-mb` | `--max-blob-mb` | The most the console can raise one account's largest blob to, at most 4768. See [Email and moderation](email-and-moderation.md#upload-quotas). |
 | `--blob-quota-gb`, `--blob-uploads-per-day` | 25, 500 | Per-account blob bytes stored and uploads per UTC day (0 means unlimited). The console overrides them per account. See [Email and moderation](email-and-moderation.md#upload-quotas). |
 | `--blob-quarantine-days` | 30 | How long a taken-down blob's bytes are kept (restorable) before they're deleted. |
 | Argon2 permits | one per core, at most 16 | Password hashing. Sign-ins wait at most 2 s for a turn, then get 503 `Overloaded` with Retry-After. |
@@ -268,13 +289,13 @@ has the flags the sections above don't cover.
 | Services | `--appview`, `--report-service` (`<url>,<did>`), `--bsky-app-view-cdn-url-pattern`, `--mod-service-did`. `--appview-override` (`<url>,<did>`) with `--appview-override-accounts`, `--appview-override-methods` and `--appview-override-fallback` (on) sends listed accounts' listed methods to a second AppView (off by default). Once the console saves the override's config object, that wins over these flags on every node. See [AppView override](../proxying.md#appview-override) |
 | Spaces | `--spaces` (off): AT Protocol Spaces, permissioned data, tracking the reference's alpha. With it on, `com.atproto.space.*` and `com.atproto.simplespace.*` are served here and never proxied. `--space-repo-max-records` (100,000) caps one account's repo in one space, and `--space-oplog-retention` (`7d`) is how long `listRepoOps` keeps ops. See [Operating Spaces](../spaces/operating.md). |
 | Relays | `--crawlers` (`bsky.network`), `--crawl-interval-secs` (1,200). See [Relays and crawling](relays-and-crawling.md). `--asn-lookup` (`bgp.tools`) looks up the AS of each firehose subscriber for the console's Firehose page. It sends subscriber addresses to bgp.tools' whois, batched and cached for a day. `off` turns it off. |
-| Accounts | `--invite-required`, `--invite-interval-ms`, `--invite-epoch-ms`, `--trusted-device-days` (30, 0 turns "Trust this browser" off), `--resolve-lexicons`, `--privacy-policy-url`, `--terms-of-service-url`, `--contact-email-address`, `--delete-after` (on) and `--delete-after-min-hold-days` (3) (see [Scheduled deletion](email-and-moderation.md#scheduled-deletion)) |
+| Accounts | `--invite-required`, `--invite-interval-ms`, `--invite-epoch-ms`, `--trusted-device-days` (30, 0 turns "Trust this browser" off), `--resolve-lexicons`, `--privacy-policy-url`, `--terms-of-service-url`, `--contact-email-address`, `--delete-after` (on) and `--delete-after-min-hold-days` (3) (see [Scheduled deletion](email-and-moderation.md#scheduled-deletion)); third-party sign-in is runtime config, see [Sign-in providers](sign-in-providers.md) |
 | Email | `--email-smtp-url[-file]` or `--email-api-url` with `--email-api-token[-file]`, `--email-from-address`, `--email-brand-name` and the other branding flags, `--moderation-email-smtp-url[-file]` or `--moderation-email-api-url` (`--moderation-email-api-token[-file]`), `--moderation-email-address`, and `--mail-daily-budget` (900 account mails per UTC day, cluster-wide). See [Email and moderation](email-and-moderation.md). |
 | SlateDB | `--sst-compression` (`zstd`), `--compaction-polling` (`adaptive`), `--compaction-poll` (30 s), `--slatedb-gc-min-age` (10 min), `--slatedb-checkpoint-lifetime` (1 h), `--slatedb-detach-interval` |
 | Resharding | `--reshard-split-mb`, `--reshard-split-writes`, `--reshard-gc-grace` (1 h), `--forced-detach-after` (5 min), `--full-compaction-every` (off) |
 | Takeover | `--preload-recent` (2,048 repos per shard), `--forwarded-write-start-ms` (1,000), `--retry-unapplied-writes` (on), `--checkpoint-stagger` (on) |
 | Repo cache | `--cache-per-worker` (50,000 repos), `--lazy-mst-prefetch-kb` (1,024) |
-| Blobs | `--max-blob-mb`, `--blob-gc-grace-secs` (6 h), `--blob-quota-gb`, `--blob-uploads-per-day`, `--blob-quarantine-days` |
+| Blobs | `--max-blob-mb`, `--blob-gc-grace-secs` (6 h), `--blob-gc-interval-secs` (a quarter of the grace, at most 1 h: each sweep lists every blob in the bucket from every node, so with many small blobs a longer interval saves LIST requests and leaves orphans longer), `--blob-quota-gb`, `--blob-uploads-per-day`, `--blob-quarantine-days` |
 | Web UI | `--ui-dir` (the image's `/usr/share/vlpds/ui`). Startup fails if it isn't a complete build. |
 | Logging | `--log-format` (`text`, `json`), `RUST_LOG` (`info,slatedb=warn`), `--exit-state-file`, `--pyroscope-url` (profiling builds) |
 | Development | `--dev-mode`, `--memory` (in-memory store), `--allow-bulk-create`, `--no-rate-limits`, `--inject-put-ms`, `--lexicon-authority-override <authority>=<did>` (repeatable, `--dev-mode` only: lexicons of that NSID authority come from the DID's repo with no DNS lookup) |

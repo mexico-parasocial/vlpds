@@ -15,6 +15,7 @@ pub use crate::appview_override::AppviewOverride;
 /// No Debug: it holds secrets (tokens, S3/SMTP credentials, KEK config).
 #[derive(Clone)]
 pub struct Config {
+    pub para: crate::para::Config,
     pub public_url: String,
     pub handle_domain: String,
     pub service_did: String,
@@ -90,10 +91,14 @@ pub struct Config {
     pub moderation_mailer: Option<crate::mail::SharedMailer>,
     pub email_branding: crate::mail::Branding,
     pub max_blob_size: u64,
+    /// The most a per-account `maxBlobBytes` may be (`--max-blob-override-mb`).
+    pub max_blob_override: u64,
     pub privacy_policy_url: Option<String>,
     pub terms_of_service_url: Option<String>,
     pub contact_email_address: Option<String>,
     pub blob_gc_grace: Duration,
+    /// None: [`crate::xrpc::blobs::default_gc_interval`] of the grace.
+    pub blob_gc_interval: Option<Duration>,
     /// Per-account stored blob bytes; 0: unlimited. Overridable per DID.
     pub blob_quota_bytes: u64,
     /// Per-account uploadBlob calls per UTC day; 0: unlimited.
@@ -306,6 +311,7 @@ impl Default for Config {
             disk_cache_shard_bytes: None,
             appview: None,
             appview_override: None,
+            para: crate::para::Config::default(),
             report_service: None,
             appview_cdn_url_pattern: None,
             crawlers: Vec::new(),
@@ -318,10 +324,12 @@ impl Default for Config {
             email_branding: Default::default(),
             cluster: None,
             max_blob_size: 100 << 20,
+            max_blob_override: 100 << 20,
             privacy_policy_url: None,
             terms_of_service_url: None,
             contact_email_address: None,
             blob_gc_grace: Duration::from_secs(6 * 3600),
+            blob_gc_interval: None,
             blob_quota_bytes: DEFAULT_BLOB_QUOTA_GB * 1_000_000_000,
             blob_uploads_per_day: DEFAULT_BLOB_UPLOADS_PER_DAY,
             blob_quarantine: Duration::from_secs(DEFAULT_BLOB_QUARANTINE_DAYS * 86_400),
@@ -606,6 +614,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         tids: vlatproto::tid::TidClock::new(),
         public_url: cfg.public_url.clone(),
         handle_domains: Arc::new(crate::handle_domains::HandleDomains::new(&cfg.handle_domain)),
+        federated: Default::default(),
         write_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_inflight_writes)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_queued_reads.max(1))),
         exports: Arc::new(tokio::sync::Semaphore::new(cfg.max_exports.max(1))),

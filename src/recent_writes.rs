@@ -31,18 +31,20 @@ const SHARDS: usize = 64;
 
 pub const POST: &str = "app.bsky.feed.post";
 pub const PROFILE_PATH: &str = "app.bsky.actor.profile/self";
+/// PARA posts, which the `com.para.feed.*` reads munge.
+pub const PARA_POST: &str = "com.para.post";
 
 #[derive(Clone, Debug)]
 pub struct Rec {
     pub path: Arc<str>,
     pub rev: u64,
     pub cid: Cid,
-    /// Posts and the profile only: the records munging reads.
+    /// Posts (and PARA posts) and the profile only: the records munging reads.
     pub bytes: Option<Bytes>,
 }
 
 pub fn keeps_bytes(path: &str) -> bool {
-    path == PROFILE_PATH || crate::worker::collection_of(path) == POST
+    path == PROFILE_PATH || matches!(crate::worker::collection_of(path), POST | PARA_POST)
 }
 
 /// (partition id, ownership epoch) an entry was made in.

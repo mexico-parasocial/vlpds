@@ -23,6 +23,12 @@ pub fn blob_quota_row_fixtures(did: &str) -> Vec<PrivateRow> {
     super::blob_quota::fixture_rows(did)
 }
 
+/// A blob quota override with `maxBlobBytes`
+/// (`private/blob_quota_max_blob.json`), added after level 2 was released.
+pub fn blob_quota_max_blob_row_fixtures(did: &str) -> Vec<PrivateRow> {
+    super::blob_quota::max_blob_fixture_rows(did)
+}
+
 /// Scoped app passwords, also added after level 1's `private/rows.json`
 /// was frozen (`private/app_password_scopes.json`).
 pub fn app_password_scope_row_fixtures(did: &str) -> Vec<PrivateRow> {
@@ -79,14 +85,73 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
             authenticated_at: 1_790_000_050,
             auth_epoch: "00ff".into(),
             auth_cred: Some(cred),
+            app_handoff_until: 0,
         }],
         pending_2fa: None,
         pending_2fa_failures: 0,
         pending_2fa_epoch: String::new(),
+        pending_2fa_auth_cred: None,
+        pending_2fa_first: None,
         trusted_until: 0,
     };
     rows.push((did.into(), o::session_key("ses-passkey"), enc(&ses)));
     rows.push(("oauth:dev:dev-passkey".into(), "oauth/dev".into(), enc(&dev)));
+    rows
+}
+
+/// Third-party sign-in (feature level 2, `private/federated.json`): the
+/// account's identities, flow state rows, the sign-in log's provider, and
+/// sessions and a device carrying `fed:` references.
+pub fn federated_row_fixtures(did: &str) -> Vec<PrivateRow> {
+    use crate::oauth::client::ClientAuth;
+    use crate::oauth::store as o;
+    let fed = crate::federated::auth_ref("https://accounts.example.com", "110248495921238986420");
+    let both = format!("{fed} {}", super::passkeys::auth_ref("AAEC"));
+    let mut rows = super::federated::fixture_rows(did);
+    rows.extend(super::signin::federated_fixture_rows(did));
+    rows.extend(super::server::passkey_session_fixture_rows(did, &both));
+    let ses = o::Session {
+        id: "ses-federated".into(),
+        did: did.into(),
+        client_id: "https://app.example/client-metadata.json".into(),
+        client_auth: ClientAuth::None,
+        dpop_jkt: "jkt".into(),
+        scope: "atproto".into(),
+        token_scope: "atproto".into(),
+        created_at: 1_790_000_000,
+        updated_at: 1_790_000_100,
+        expires_at: 1_790_003_700,
+        token_id: "tok-3".into(),
+        refresh_gen: 0,
+        refresh_salt: "salt".into(),
+        device_id: Some("dev-federated".into()),
+        request_id: Some("req-federated".into()),
+        auth_cred: Some(fed.clone()),
+        space_collections: None,
+        created_ip: None,
+        ip: None,
+    };
+    let dev = o::Device {
+        id: "dev-federated".into(),
+        created_at: 1_790_000_000,
+        last_seen_at: 1_790_000_100,
+        user_agent: None,
+        accounts: vec![o::DeviceAccount {
+            did: did.into(),
+            authenticated_at: 1_790_000_050,
+            auth_epoch: "00ff".into(),
+            auth_cred: Some(both),
+            app_handoff_until: 1_790_000_170,
+        }],
+        pending_2fa: Some((did.into(), 1_790_000_090)),
+        pending_2fa_failures: 1,
+        pending_2fa_epoch: "00ff".into(),
+        pending_2fa_auth_cred: None,
+        pending_2fa_first: Some(o::FirstFactor { cred: fed, provider: "Example".into(), app: true }),
+        trusted_until: 0,
+    };
+    rows.push((did.into(), o::session_key("ses-federated"), enc(&ses)));
+    rows.push(("oauth:dev:dev-federated".into(), "oauth/dev".into(), enc(&dev)));
     rows
 }
 
@@ -95,7 +160,10 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 9] = [
+    let checks: [Check; 13] = [
+        super::para::account::check_row,
+        super::para::alpha::check_row,
+        super::para::migration::check_row,
         super::server::check_row,
         super::admin::check_row,
         super::email2fa::check_row,
@@ -104,6 +172,7 @@ pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Resul
         super::signin::check_row,
         super::passkeys::check_row,
         super::mfa::check_row,
+        super::federated::check_row,
         check_shared_row,
     ];
     for check in checks {
@@ -218,10 +287,13 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
             authenticated_at: 1_790_000_050,
             auth_epoch: String::new(),
             auth_cred: None,
+            app_handoff_until: 0,
         }],
         pending_2fa: Some((did.into(), 1_790_000_060)),
         pending_2fa_failures: 1,
         pending_2fa_epoch: String::new(),
+        pending_2fa_auth_cred: None,
+        pending_2fa_first: None,
         trusted_until: 0,
     };
     let authz =
