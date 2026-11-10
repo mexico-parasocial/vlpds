@@ -756,6 +756,11 @@ fn verifier_configuration_and_claim_contracts_are_strict() {
     assert_eq!(vlpds::para::ballot_claim(&claim).unwrap()["signal"], 3);
     claim["signal"] = json!(4);
     assert!(vlpds::para::ballot_claim(&claim).is_none());
+    // No neutral ballot (OD-10 §7.5): a signal of 0 is not a ballot.
+    claim["signal"] = json!(0);
+    assert!(vlpds::para::ballot_claim(&claim).is_none());
+    claim["signal"] = json!(-3);
+    assert_eq!(vlpds::para::ballot_claim(&claim).unwrap()["signal"], -3);
     claim["signal"] = json!(1);
     claim["delegatedFrom"] = json!(["did:plc:abc"]);
     assert!(vlpds::para::ballot_claim(&claim).is_none());
@@ -859,4 +864,66 @@ async fn large_collection_lookup_refuses_without_writing() {
         .err(400, "ParaLookupLimit");
     assert_eq!(before, s.app.head(&a.did).await.ok().unwrap().commit);
     task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn horizontal_governance_is_retired_and_boards_are_always_hierarchical() {
+    let (s, _, task) = fixture().await;
+    let a = s.create_account("hier").await;
+    let horizontal = json!({"name":"Horizontal","quadrant":"MX-NL","governanceMode":"horizontal"});
+    s.xrpc.post("com.para.community.createBoard", &horizontal, &a.auth()).await.err(400, "InvalidRequest");
+    // A client that still sends the old default is served the only model left.
+    let input = json!({"name":"Hierarchical","quadrant":"MX-NL","governanceMode":"hierarchical"});
+    let created = s.xrpc.post("com.para.community.createBoard", &input, &a.auth()).await.ok();
+    let key = created["uri"].as_str().unwrap().rsplit('/').next().unwrap();
+    let board = s.get_record(&a.did, "com.para.community.board", key).await.ok();
+    assert!(board["value"].get("governanceMode").is_none());
+    let events = s.list_records(&a.did, "com.para.community.authorityEvent", &[]).await.ok();
+    let actions: Vec<_> = events["records"].as_array().unwrap().iter().map(|r| r["value"]["action"].clone()).collect();
+    assert!(actions.contains(&json!("owner.grant")) && !actions.contains(&json!("moderator.grant")));
+    let owner = events["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["value"]["action"] == "owner.grant")
+        .unwrap();
+    assert!(owner["value"].get("expiresAt").is_none());
+    // No write may introduce horizontal governance on a board.
+    let mut record = board["value"].clone();
+    record["governanceMode"] = json!("horizontal");
+    s.xrpc
+        .post(
+            "com.atproto.repo.putRecord",
+            &json!({"repo":a.did,"collection":"com.para.community.board","rkey":key,"record":record}),
+            &a.auth(),
+        )
+        .await
+        .err(400, "ParaCommandRequired");
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn space_writes_run_the_ballot_policy() {
+    use crate::common::spaces::SpaceClient;
+    const SCOPE: &str = "space:com.example.group?collection=com.para.community.vote&collection=com.para.civic.vote&action=read&action=create&action=update&action=delete&manage=create&manage=update&manage=delete";
+    let s = TestServer::spawn_with(|c| {
+        c.spaces = true;
+        c.para = vlpds::para::Config::new(true, None, None).unwrap();
+    })
+    .await;
+    let owner = SpaceClient::new(&s, "spballot", SCOPE).await;
+    let space = owner.create_space("com.example.group", "main").await;
+    let ballot = json!({"$type":"com.para.community.vote","voter":owner.did,"signal":3,"createdAt":now_iso()});
+    // A frozen ballot collection is refused in a space as in the repo, and `validate: false` does not waive it.
+    owner.create_record(&space, "com.para.community.vote", Some("a"), ballot.clone()).await.err(400, "BallotRefused");
+    owner
+        .post(
+            "com.atproto.space.applyWrites",
+            json!({"space":space,"repo":owner.did,"validate":false,"writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"com.para.community.vote","rkey":"b","value":ballot}]}),
+        )
+        .await
+        .err(400, "BallotRefused");
+    // A public cabildeo ballot needs its proof shape and verifier wherever it is written.
+    let bare = json!({"$type":"com.para.civic.vote","subject":"at://did:plc:abc/com.para.civic.cabildeo/x","subjectType":"cabildeo","createdAt":now_iso()});
+    owner.put_record(&space, "com.para.civic.vote", "c", bare).await.err(400, "BallotRefused");
 }

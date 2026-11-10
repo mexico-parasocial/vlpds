@@ -106,9 +106,11 @@ salas cifradas, que es lo que exige el chat nativo de PARA
 
 ## Sin chat
 
-PARA puede salir sin Matrix y conservar la gobernanza. El matrix-bridge no es
-solo chat: también sirve constitución, propuestas y decisiones, sorteo (drand),
-reportes, sanciones y panel de moderación, insignias y extracción. Con el
+PARA puede salir sin Matrix y conservar la gobernanza. Las propuestas, los
+votos y las decisiones son cabildeos que cuenta el AppView; el bridge ya no tiene
+motor de propuestas, sorteo (drand), resúmenes ni extracción. Sin chat sigue
+sirviendo la constitución de cada comunidad, los reportes y sanciones con su panel
+de moderación y el estado de acceso verificado que lee del AppView. Con el
 perfil `governance` en lugar de `matrix` corre solo:
 
 ```bash
@@ -126,7 +128,7 @@ make up
   `/api/unread`, `/api/mark-read`, `/api/space-for-community`,
   `/api/dm-requests*`, `/api/devices*`, el push gateway y las transacciones del
   appservice) responden `503 {"error":"CHAT_DISABLED"}`. `/api/push-token`
-  sigue guardando el token de Expo: con él se avisa a quien sale sorteado.
+  sigue guardando el token de Expo, para cuando se encienda el chat.
 - La app web que construye la plataforma recibe `EXPO_PUBLIC_CHAT_ENABLED=false`
   sola (sale de `PROFILES`). Las builds nativas lo necesitan en su entorno de
   EAS: ocultan chat, mensajes directos y contadores de no leídos, y dejan las

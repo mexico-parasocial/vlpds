@@ -112,7 +112,8 @@ pub fn ballot_claim(record: &J) -> Option<J> {
                 && proof_format(&record["eligibilityProofRef"], "m8:policy:v1:", false) =>
         {
             let signal = record["signal"].as_i64()?;
-            if !(-3..=3).contains(&signal) {
+            // No neutral ballot (OD-10 §7.5): whoever takes no stance casts none.
+            if signal == 0 || !(-3..=3).contains(&signal) {
                 return None;
             }
             claim["signal"] = json!(signal);

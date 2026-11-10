@@ -72,8 +72,29 @@ leaving preserves the authorization history. Raw board creation and identity or
 governance-mode transitions require dedicated commands so clients cannot bypass
 the community creation recipe or name registry. Structured role assignments and
 chamber assignments cannot be self-granted, and expired roles do not authorize
-moderation. Horizontal governance changes require a current facilitator and bounded,
-ratified role terms. Deletes of old frozen ballots remain allowed.
+moderation. Every community is hierarchical: horizontal governance (`governanceMode`,
+facilitator terms, `roleRotationRules`) is retired as in WatZappa, `createBoard`
+refuses `governanceMode: "horizontal"` and always founds the community with a
+non-expiring `owner.grant`, and no write may introduce it on a board. A policy
+ballot's `signal` is -3..-1 or 1..3; there is no neutral ballot. The same ballot
+policy runs on `com.atproto.space.*` writes (`createRecord`, `putRecord`,
+`applyWrites`), so a permissioned space is not a way around the freeze or the proof
+checks. Deletes of old frozen ballots remain allowed.
+
+Communities founded under horizontal governance (`governanceMode: "horizontal"`, a
+90-day `moderator.grant` instead of `owner.grant`) are left without an owner when
+WatZappa's AppView migration `20261105T120000000Z-drop-board-governance-mode` runs.
+VLPDS cannot repair that: authority events must be issued by the repository owner,
+and an owner is restored only by an `owner.recover` decision (a cabildeo with a
+`protectedAction`, voting open at least 72 hours, closed with quorum). Before that
+migration, list the affected communities (read-only, public XRPC):
+
+```bash
+python3 para/scripts/list-horizontal-boards.py --pds https://pds.example.org
+```
+
+Each entry shows the board, its creator and its authority events, so the members
+can be told to open a recovery cabildeo. A fresh deployment has none.
 
 M8 verifiers must use HTTPS or loopback HTTP. Requests contain the bound repository
 DID and the claim, never an account JWT. Redirects are refused; `204` accepts,

@@ -203,6 +203,18 @@
     quiet: true
   when: vlpds_cluster_enabled | bool
 
+- name: The host has room for clamd beside vlpds
+  ansible.builtin.assert:
+    that:
+      - vlpds_mem_limit_mb | int + vlpds_antivirus_mem_limit_mb | int <= ansible_facts.memtotal_mb
+      - vlpds_antivirus_mem_limit_mb | int >= 2048
+    fail_msg: >-
+      vlpds_antivirus: vlpds_mem_limit_mb ({{ vlpds_mem_limit_mb }}) + vlpds_antivirus_mem_limit_mb
+      ({{ vlpds_antivirus_mem_limit_mb }}, at least 2048 for clamd's signatures) exceed the host's
+      {{ ansible_facts.memtotal_mb }} MiB
+    quiet: true
+  when: vlpds_antivirus | bool
+
 - name: Rendered settings contain no line breaks
   ansible.builtin.assert:
     that:

@@ -152,6 +152,8 @@ pub struct App {
     /// revocations. None without the flag.
     pub spaces: Option<Arc<crate::space::Spaces>>,
     pub space_blob_accounts: blobs::SpaceBlobAccounts,
+    /// `--av-socket`: the clamd scanner uploadBlob feeds. None: off.
+    pub av: Option<Arc<crate::antivirus::Scanner>>,
     /// Ends the node's listeners at shutdown.
     pub http_drain: crate::server::Drain,
     /// What the console shows that changed (`vlpds.admin.subscribeChanges`).

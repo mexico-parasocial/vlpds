@@ -1166,6 +1166,46 @@ async fn create_case(
     Ok(Json(c))
 }
 
+/// uploadBlob's malware scan found `signature` in `did`'s blob `cid`: a
+/// case for the moderators (actioned: the takedown is linked to it), and the
+/// blob taken down under it, so the
+/// same bytes are refused at once if they come again (`is_blob_takendown`)
+/// and, when uploadBlob kept them (`blob-quarantine/`, a repo moving in), never
+/// served and purged after --blob-quarantine-days. Returns the case id.
+pub(super) async fn antivirus_hit(app: &App, did: &str, cid: &str, signature: &str, kept: bool) -> XResult<String> {
+    let who = Who { actor: "antivirus".into(), ip: None, auth: None };
+    let now = vlatproto::events::now_rfc3339();
+    let s = SubjectRef::blob(did, cid);
+    let what =
+        if kept { "kept in quarantine (a repo moving in references it)" } else { "refused; the bytes were not stored" };
+    let c = Case {
+        id: app.tids.next().to_string(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        status: "open".into(),
+        source: format!("antivirus: clamd found {signature} in an upload"),
+        subjects: vec![s.clone()],
+        notes: vec![Note {
+            at: now,
+            actor: who.actor.clone(),
+            auth: None,
+            ip: None,
+            text: format!("uploadBlob by {did}: {cid} matched {signature}; {what}."),
+        }],
+        actions: Vec::new(),
+    };
+    put_obj(app, &case_path(app, &c.id)?, &c, PutMode::Create).await.map_err(store_err)?;
+    audit(app, &who, "case.create", None, Some(&c.source), Some(&c.id), None).await?;
+    let act = Action {
+        applied: true,
+        reason: Some(format!("malware scan: {signature}")),
+        r#ref: Some(format!("av:{signature}")),
+        case_id: Some(c.id.clone()),
+    };
+    apply(app, &s, &act, &who).await?;
+    Ok(c.id)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateCaseIn {

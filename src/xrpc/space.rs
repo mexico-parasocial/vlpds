@@ -194,6 +194,7 @@ struct Prepared {
 /// checked as a repo write's are (`check_blobs`), by the caller.
 async fn prepare(
     app: &Arc<App>,
+    did: &str,
     collection: String,
     rkey: String,
     mut record: JsonValue<'_>,
@@ -201,6 +202,10 @@ async fn prepare(
 ) -> XResult<Prepared> {
     check_path(&collection, Some(&rkey))?;
     check_rkey_slur(Some(&rkey))?;
+    // PARA's ballot policy applies to a space record as to a repo record: a ballot written here must not
+    // skip the freeze or the proof checks (WatZappa runs `ballotWritePolicyRefusal` in its shared
+    // prepareWrite for the same reason). `validate: false` does not waive it.
+    crate::para::check(app, did, &collection, &record.to_json()).await?;
     let schema = crate::lexicon::resolve_record_schema(app, &collection, validate).await;
     let (cid, bytes, blobs, status, decls) =
         encode_record(&mut record, &collection, &rkey, validate, schema.as_deref())?;
@@ -234,7 +239,7 @@ async fn create_record_inner(app: &Arc<App>, creds: &Credentials, body: RecordBo
     creds.need_space(&space.target(), SpaceAccess::Write("create", &collection))?;
     check_path(&collection, rkey.as_deref())?;
     let rkey = rkey.unwrap_or_else(|| app.tids.next().to_string());
-    let p = prepare(app, collection, rkey, record, validate).await?;
+    let p = prepare(app, &did, collection, rkey, record, validate).await?;
     let _held = super::repo::check_blobs(app, &did, &p.decls).await?;
     let path = format!("{}/{}", p.collection, p.rkey);
     let w = SpaceWrite::Create { collection: p.collection, rkey: p.rkey, cid: p.cid, bytes: p.bytes, blobs: p.blobs };
@@ -269,7 +274,7 @@ async fn put_record_inner(app: &Arc<App>, creds: &Credentials, body: RecordBody)
         // neither would do: the refusal names the create scope, as for a new record
         creds.need_space(&t, SpaceAccess::Write("create", &collection))?;
     }
-    let p = prepare(app, collection, rkey, record, validate).await?;
+    let p = prepare(app, &did, collection, rkey, record, validate).await?;
     let _held = super::repo::check_blobs(app, &did, &p.decls).await?;
     let path = format!("{}/{}", p.collection, p.rkey);
     let w = SpaceWrite::Update {
@@ -375,7 +380,7 @@ async fn apply_writes_inner(app: &Arc<App>, creds: &Credentials, body: RecordBod
             (_, None) => return Err(XrpcError::bad("InvalidRequest", "update requires rkey")),
         };
         let value = w.get_mut("value").map(|x| std::mem::replace(x, JsonValue::Null)).unwrap_or(JsonValue::Null);
-        let p = prepare(app, collection, rkey, value, validate).await?;
+        let p = prepare(app, &did, collection, rkey, value, validate).await?;
         statuses.push(p.status);
         decls.extend(p.decls);
         ops.push(match action {

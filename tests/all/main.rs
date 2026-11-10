@@ -22,6 +22,7 @@ mod admin_changes;
 mod admin_cli;
 mod admin_cluster;
 mod admin_proxy;
+mod antivirus;
 mod api_mail;
 mod app_passwords;
 mod auth;

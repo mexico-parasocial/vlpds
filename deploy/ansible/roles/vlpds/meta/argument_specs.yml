@@ -370,6 +370,22 @@ argument_specs:
       vlpds_trusted_proxies:
         description: See defaults/main.yml (vlpds_trusted_proxies).
         type: list
+      vlpds_antivirus:
+        description: "Scan uploaded blobs with a clamav container beside vlpds (--av-socket; docs/_antivirus-scanning.md). Its memory limit comes off vlpds_mem_limit_mb's default."
+        type: bool
+      vlpds_antivirus_image:
+        description: The clamav image (clamd + freshclam).
+        type: str
+      vlpds_antivirus_mem_limit_mb:
+        description: clamav container memory limit (MiB); signatures take about 1.2-1.6 GB, twice that while reloading.
+        type: int
+      vlpds_antivirus_fail_mode:
+        description: "closed: uploads clamd can't judge get a retryable 503; open: stored unscanned (--av-fail-mode)."
+        type: str
+        choices: [closed, open]
+      vlpds_antivirus_max_threads:
+        description: clamd's MaxThreads; vlpds keeps one fewer scans in flight (--av-max-concurrency).
+        type: int
       vlpds_extra_env:
         description: Extra VLPDS_* env vars / flags, for anything not covered above.
         type: dict

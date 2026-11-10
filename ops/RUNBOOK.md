@@ -1841,6 +1841,70 @@ the `space revocation not stored` warnings in the logs (their `space` and
 
 ---
 
+### VlpdsAntivirusDown
+
+**Means:** clamd hasn't answered this node's `VERSION` poll for 5 minutes
+(`vlpds_blob_av_up` 0, warning `antivirus: clamd VERSION failed`). Under
+`--av-fail-mode closed` every uploadBlob gets `503 ScanUnavailable`. Clients
+retry, but no image or file goes up. Under `open`, uploads are stored unscanned
+(`vlpds_blob_av_total{result="skipped"}`). A repo moving in is never refused.
+
+**Confirm:** `docker ps` / `docker logs vlpds-clamav` on the node. clamd takes
+30-60 s to load its signatures after a start or restart, and an OOM kill shows
+as a restart loop (`docker inspect vlpds-clamav --format '{{.State.OOMKilled}}'`).
+
+**Do:** restart it (`docker compose up -d clamav` in the deploy path). If it was
+OOM-killed, raise `vlpds_antivirus_mem_limit_mb` (signatures take about 1.2-1.6 GB,
+twice that during a reload). If clamd will stay down and uploads matter more,
+redeploy with `vlpds_antivirus_fail_mode: open`, and set it back afterwards.
+
+### VlpdsAntivirusErrors
+
+**Means:** clamd answers, but over 2% of scans get no verdict. The usual causes
+are a timeout (`--av-timeout-secs`), a full queue (more scans than clamd's
+`MaxThreads`), or `INSTREAM size limit exceeded`, which means clamd's
+`StreamMaxLength` is under `--max-blob-mb`.
+
+**Confirm:** vlpds warnings `antivirus: no verdict: ...` carry clamd's reply.
+`vlpds_blob_av_scan_seconds` shows whether scans are slow.
+
+**Do:** for size limits, redeploy with the role. It derives clamd's
+`StreamMaxLength` from `vlpds_max_blob_mb` (`CLAMD_CONF_*` in the compose
+file), so a hand-edited `--max-blob-mb` can outgrow it. For load, raise `vlpds_antivirus_max_threads` (and memory)
+or `--av-timeout-secs`.
+
+### VlpdsAntivirusSignaturesStale
+
+**Means:** the signature database version hasn't changed in 3 days. freshclam
+isn't updating, so new malware isn't recognised.
+
+**Confirm:** `docker logs vlpds-clamav | grep -i freshclam`. Look for mirror
+rate limits (HTTP 429 from database.clamav.net), DNS or egress failures, or a
+full disk under the `clamav-db` volume.
+
+**Do:** fix the cause. freshclam retries on its own. A cooldown from a rate
+limit clears by itself; don't restart in a loop, because that extends it.
+
+### VlpdsMalwareUploaded
+
+**Means:** an upload matched a ClamAV signature. vlpds already acted. A normal
+upload was refused (`400 BlobRejected`) and its bytes weren't kept. A blob of a
+repo moving in was kept in `blob-quarantine/` and is never served. Either way
+there's a case with the signature in its source, and the blob is taken down
+under the ref `av:<signature>`.
+
+**Confirm:** `vlpds.admin.listCases` (console: Cases). Look for source
+`antivirus: clamd found ...` and the uploader in the case's note.
+
+**Do:** judge the account, not just the file. One hit can be an accident (an
+infected attachment someone forwarded). Repeated hits from one account, or the
+same signature across new accounts, call for an account takedown. For a false
+positive, a quarantined blob is restored like any blob takedown (Restore on
+the case). A refused upload has no bytes to restore: reversing its takedown
+only lets the user try again, and the same bytes will be refused again
+while the signature still matches. Report the false positive upstream
+(https://www.clamav.net/reports/fp); the next signature update fixes it.
+
 ## Procedures
 
 ### Secrets as files

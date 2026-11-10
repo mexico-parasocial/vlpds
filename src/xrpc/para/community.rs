@@ -195,10 +195,15 @@ pub(super) async fn create_board(State(app): AppState, Auth(creds): Auth, Json(i
         Some(J::String(region)) => Some(region.trim()).filter(|region| !region.is_empty()),
         Some(_) => return Err(XrpcError::bad("InvalidRequest", "region must be a string")),
     };
-    let mode = input["governanceMode"].as_str().unwrap_or("hierarchical");
+    // Horizontal governance is retired in WatZappa: every community is hierarchical. `governanceMode`
+    // is no longer part of the contract; a client still sending "hierarchical" is harmless, "horizontal"
+    // is refused rather than silently turned into a hierarchical community.
+    if input["governanceMode"].as_str().is_some_and(|mode| mode != "hierarchical") {
+        return Err(XrpcError::bad("InvalidRequest", "Horizontal governance is retired; every community is hierarchical"));
+    }
     let admission = input["admissionMode"].as_str().unwrap_or("open");
-    if !["hierarchical", "horizontal"].contains(&mode) || !["open", "assembly_approval"].contains(&admission) {
-        return Err(XrpcError::bad("InvalidRequest", "Invalid governance or admission mode"));
+    if !["open", "assembly_approval"].contains(&admission) {
+        return Err(XrpcError::bad("InvalidRequest", "Invalid admission mode"));
     }
     for (key, cid, record) in list(&app, &did, BOARD).await? {
         if slug(record["name"].as_str().unwrap_or("")) == slug(name)
@@ -257,26 +262,19 @@ pub(super) async fn create_board(State(app): AppState, Auth(creds): Auth, Json(i
     let subdelegates = format!("para://community/{key}/subdelegates");
     let starter_name =
         input["founderStarterPackName"].as_str().map(str::to_owned).unwrap_or(format!("Founders: {name}"));
-    let mut b = json!({"$type":BOARD,"name":name,"quadrant":quadrant,"delegatesChatId":delegates,"subdelegatesChatId":subdelegates,"status":"draft","founderStarterPackUri":pack_uri,"governanceMode":mode,"admissionMode":admission,"createdAt":now});
+    let mut b = json!({"$type":BOARD,"name":name,"quadrant":quadrant,"delegatesChatId":delegates,"subdelegatesChatId":subdelegates,"status":"draft","founderStarterPackUri":pack_uri,"admissionMode":admission,"createdAt":now});
     if let Some(region) = region {
         b["region"] = json!(region);
     }
     if let Some(d) = input.get("description") {
         b["description"] = d.clone();
     }
-    let mut moderator = json!({"did":did,"role":if mode=="horizontal"{"Founding facilitator"}else{"Founding moderator"},"badge":"Community Creator","capabilities":["appoint_deputies","edit_role_descriptions","review_applicants","publish_governance_updates","set_official_representatives"],"validFrom":now});
+    let moderator = json!({"did":did,"role":"Founding moderator","badge":"Community Creator","capabilities":["appoint_deputies","edit_role_descriptions","review_applicants","publish_governance_updates","set_official_representatives"],"validFrom":now});
     let mut governance = json!({"$type":GOVERNANCE,"community":format!("p/{name}"),"communityId":slug,"slug":slug,"createdAt":now,"updatedAt":now,"moderators":[],"officials":[],"deputies":[],"metadata":{"state":"seeded","reviewCadence":"Initial setup","lastPublishedAt":now},"editHistory":[{"id":"seed-governance","action":"publish_governance_updates","actorDid":did,"createdAt":now,"summary":"Initial governance charter seeded during community creation."}]});
-    if mode == "horizontal" {
-        moderator["validUntil"] = json!((chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339());
-        governance["roleRotationRules"] = json!({"$type":"com.para.community.governanceConfig#roleRotationRules","facilitatorMaxDays":30,"moderatorMaxDays":90,"stewardMaxDays":180,"requiresAssemblyRatification":true});
-    }
     governance["moderators"] = json!([moderator]);
     let membership = json!({"$type":MEMBER,"community":board_uri,"membershipState":"active","roles":["owner","moderator"],"source":"createBoard","joinedAt":now});
     let authority = json!({"$type":AUTHORITY,"community":board_uri,"subject":did,"action":"member.activate","issuer":did,"effectiveAt":now,"version":1,"basis":"foundingTransition","createdAt":now});
-    let mut office = json!({"$type":AUTHORITY,"community":board_uri,"subject":did,"action":if mode=="horizontal"{"moderator.grant"}else{"owner.grant"},"issuer":did,"effectiveAt":now,"predecessor":uri(&did,AUTHORITY,&key),"version":2,"basis":"foundingTransition","createdAt":now});
-    if mode == "horizontal" {
-        office["expiresAt"] = json!((chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339());
-    }
+    let office = json!({"$type":AUTHORITY,"community":board_uri,"subject":did,"action":"owner.grant","issuer":did,"effectiveAt":now,"predecessor":uri(&did,AUTHORITY,&key),"version":2,"basis":"foundingTransition","createdAt":now});
     let records = vec![
         (BOARD, key.clone(), b, Some(None)),
         (MEMBER, key.clone(), membership, Some(None)),
@@ -454,62 +452,6 @@ async fn share_action(app: Arc<App>, creds: Credentials, input: J, action: &str)
     Ok(Json(json!({"uri":record["uri"],"cid":record["cid"],"action":record})))
 }
 
-pub(super) async fn check_governance(app: &App, did: &str, record: &J) -> XResult<()> {
-    let slug = text(record, "slug")?;
-    let boards = list(app, did, BOARD).await?;
-    if !boards.iter().any(|(key, _, b)| {
-        b["governanceMode"] == "horizontal" && format!("{}-{key}", self::slug(b["name"].as_str().unwrap_or(""))) == slug
-    }) {
-        return Ok(());
-    }
-    let (_, old) = read(app, did, GOVERNANCE, slug)
-        .await?
-        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Horizontal governance must be created by createBoard"))?;
-    let now = chrono::Utc::now();
-    let timestamp = |v: &J| v.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-    let moderator = old["moderators"].as_array().and_then(|ms| {
-        ms.iter().find(|m| {
-            m["did"] == did
-                && timestamp(&m["validUntil"]).is_some_and(|t| t > now)
-                && timestamp(&m["validFrom"]).is_none_or(|t| t <= now)
-        })
-    });
-    if !moderator.is_some_and(|m| {
-        m["capabilities"].as_array().is_some_and(|cs| cs.iter().any(|c| c == "publish_governance_updates"))
-    }) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "Only current elected facilitators may publish horizontal governance",
-        ));
-    }
-    for (field, limit, default) in [
-        ("moderators", "moderatorMaxDays", 90),
-        ("officials", "stewardMaxDays", 180),
-        ("deputies", "moderatorMaxDays", 90),
-    ] {
-        for role in record[field].as_array().into_iter().flatten() {
-            let until = timestamp(&role["validUntil"])
-                .ok_or_else(|| XrpcError::bad("InvalidRequest", "Horizontal roles require validUntil"))?;
-            let from = timestamp(&role["validFrom"]).map(|t| t.with_timezone(&chrono::Utc)).unwrap_or(now);
-            let max = old["roleRotationRules"][limit].as_i64().unwrap_or(default);
-            if until <= now
-                || until.signed_duration_since(from)
-                    > chrono::Duration::try_days(max)
-                        .filter(|d| *d > chrono::Duration::zero())
-                        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Invalid role rotation limit"))?
-                || (old["roleRotationRules"]["requiresAssemblyRatification"] == true
-                    && role.get("ratifiedBy").is_none())
-            {
-                return Err(XrpcError::bad(
-                    "InvalidRequest",
-                    "Invalid horizontal role term or missing assembly ratification",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(super) async fn check_membership(app: &App, did: &str, key: &str, record: &J) -> XResult<()> {
     let community = text(record, "community")?;
     let (owner, board_key) = at_uri(community, BOARD)?;
@@ -583,10 +525,11 @@ pub(super) async fn check_content(app: &App, did: &str, coll: &str, record: &J) 
 }
 
 pub(super) async fn check_board(app: &App, did: &str, key: &str, record: &J, command: bool) -> XResult<()> {
+    // Horizontal governance is retired. A legacy board that still carries it may be edited as it is, but
+    // no write may introduce it.
     let mode = record["governanceMode"].as_str().unwrap_or("hierarchical");
     let admission = record["admissionMode"].as_str().unwrap_or("open");
-    if !["hierarchical", "horizontal"].contains(&mode)
-        || !["open", "assembly_approval"].contains(&admission)
+    if !["open", "assembly_approval"].contains(&admission)
         || !["draft", "active"].contains(&record["status"].as_str().unwrap_or(""))
     {
         return Err(XrpcError::bad("InvalidRequest", "Unsupported community policy"));
@@ -608,6 +551,8 @@ pub(super) async fn check_board(app: &App, did: &str, key: &str, record: &J, com
                 "Community identity and governance transitions require a dedicated command",
             ));
         }
+    } else if mode != "hierarchical" {
+        return Err(XrpcError::bad("InvalidRequest", "Horizontal governance is retired; every community is hierarchical"));
     } else if !command {
         return Err(XrpcError::bad(
             "ParaCommandRequired",

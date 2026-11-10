@@ -5,6 +5,7 @@
 
 use super::sync::assert_available;
 use super::*;
+use crate::antivirus::Verdict;
 use futures::StreamExt;
 use object_store::{Attribute, Attributes, ObjectStore, PutMultipartOptions, WriteMultipart};
 use sha2::{Digest, Sha256};
@@ -97,8 +98,19 @@ async fn upload_blob(State(app): AppState, Auth(creds): Auth, headers: HeaderMap
     let mut attrs = Attributes::new();
     attrs.insert(Attribute::ContentType, mime.clone().into());
 
-    let mut up =
-        Upload { app: &app, did: &did, attrs, mime, head: Vec::new(), buf: Vec::new(), buffered: 0, multipart: None };
+    // the scan reads the body as it arrives (crate::antivirus)
+    let scan = app.av.as_ref().map(|av| av.start());
+    let mut up = Upload {
+        app: &app,
+        did: &did,
+        attrs,
+        mime,
+        head: Vec::new(),
+        buf: Vec::new(),
+        buffered: 0,
+        multipart: None,
+        scan,
+    };
     let (cid, size) = match up.receive(body, max).await {
         Ok(v) => v,
         Err(e) => {
@@ -134,9 +146,48 @@ async fn upload_blob(State(app): AppState, Auth(creds): Auth, headers: HeaderMap
             return Err(e);
         }
     };
-    if let Err(e) = super::blob_quota::commit(&app, &did, &c, size, exempt, up.commit(cid)).await {
+    // a blob of the repo moving in is never refused: the repo references it
+    let imported = exempt.daily;
+    let mut dest = blob_path(&app, &did, cid);
+    let mut infected = None;
+    if let (Some(av), Some(scan)) = (app.av.as_ref(), up.scan.take()) {
+        match av.conclude(scan, &cid.digest).await {
+            Verdict::Clean | Verdict::Cached => {}
+            Verdict::Infected(sig) if imported => {
+                dest = super::moderation::quarantine_path(&app, &did, cid);
+                infected = Some(sig);
+            }
+            Verdict::Infected(sig) => {
+                up.abort().await;
+                if let Err(e) = super::moderation::antivirus_hit(&app, &did, &c, &sig, false).await {
+                    tracing::error!(%did, cid = %c, signature = %sig, "antivirus: recording the refusal: {}", e.message);
+                }
+                return Err(XrpcError::bad("BlobRejected", "The file failed the malware scan and was not stored"));
+            }
+            Verdict::Error(_) if !imported && !av.cfg.fail_open => {
+                up.abort().await;
+                crate::metrics::BLOB_AV.with_label_values(&["refused"]).inc();
+                return Err(XrpcError::unavailable(
+                    "ScanUnavailable",
+                    "The file could not be scanned for malware right now; try again shortly",
+                ));
+            }
+            Verdict::Error(_) => {
+                tracing::warn!(%did, cid = %c, imported, "antivirus: storing a blob unscanned");
+                crate::metrics::BLOB_AV.with_label_values(&["skipped"]).inc();
+            }
+        }
+    }
+    if let Err(e) = super::blob_quota::commit(&app, &did, &c, size, exempt, up.commit_to(dest)).await {
         up.abort().await;
         return Err(e);
+    }
+    if let Some(sig) = infected {
+        // stored in quarantine, never served: the case and takedown keep it there
+        if let Err(e) = super::moderation::antivirus_hit(&app, &did, &c, &sig, true).await {
+            tracing::error!(%did, cid = %c, signature = %sig, "antivirus: recording the quarantine: {}", e.message);
+        }
+        return Ok(Json(blob_json(&cid, &up.mime, size)));
     }
     crate::metrics::BLOB_UPLOADS.with_label_values(&[crate::metrics::blob_kind(&up.mime)]).inc();
     crate::metrics::BLOB_UPLOAD_BYTES.inc_by(size);
@@ -154,6 +205,8 @@ struct Upload<'a> {
     buf: Vec<Bytes>,
     buffered: usize,
     multipart: Option<(WriteMultipart, object_store::path::Path)>,
+    /// The malware scan being fed the body (`--av-socket`).
+    scan: Option<crate::antivirus::Session>,
 }
 
 impl Upload<'_> {
@@ -170,6 +223,9 @@ impl Upload<'_> {
                 return Err(too_large(max));
             }
             hasher.update(&chunk);
+            if let Some(scan) = &mut self.scan {
+                scan.feed(chunk.clone()).await;
+            }
             if self.head.len() < SNIFF_BYTES {
                 let n = (SNIFF_BYTES - self.head.len()).min(chunk.len());
                 self.head.extend_from_slice(&chunk[..n]);
@@ -192,17 +248,19 @@ impl Upload<'_> {
         Ok((cid, size))
     }
 
-    /// Drops a pending multipart upload (the in-memory body needs nothing).
+    /// Drops a pending multipart upload (the in-memory body needs nothing)
+    /// and an unfinished scan.
     async fn abort(&mut self) {
+        self.scan = None;
         if let Some((w, tmp)) = self.multipart.take() {
             let _ = w.abort().await;
             let _ = self.app.store.raw.delete(&tmp).await;
         }
     }
 
-    /// Stores the received bytes at `blob/{did}/{cid}`.
-    async fn commit(&mut self, cid: Cid) -> XResult<()> {
-        let dest = blob_path(self.app, self.did, cid);
+    /// Stores the received bytes at `dest`: `blob/{did}/{cid}`, or the
+    /// quarantine for an infected blob of a repo moving in.
+    async fn commit_to(&mut self, dest: object_store::path::Path) -> XResult<()> {
         let store = &self.app.store.raw;
         match self.multipart.take() {
             None => {

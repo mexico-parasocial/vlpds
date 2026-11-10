@@ -1297,3 +1297,59 @@ groups:
         annotations:
           summary: "{{ $value | humanizePercentage }} of space credential reads on {{ $labels.instance }} are refused"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacecredentialrejectshigh"
+
+  # ---------------------------------------------------------------------------
+  # Malware scanning of uploaded blobs (--av-socket; docs/_antivirus-scanning.md).
+  # Silent on nodes without it: they export none of these series.
+  # ---------------------------------------------------------------------------
+  - name: vlpds-antivirus
+    rules:
+      # clamd hasn't answered the node's VERSION poll (every 60 s) for 5 min.
+      # With --av-fail-mode closed every upload gets a 503 meanwhile; with open
+      # they are stored unscanned.
+      - alert: VlpdsAntivirusDown
+        expr: max by (instance) (vlpds_blob_av_up{job="vlpds"}) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "clamd is not answering {{ $labels.instance }}: uploads are refused (fail closed) or stored unscanned (fail open)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsantivirusdown"
+
+      # Over 2% of scans give no verdict, at over 0.05/s, for 10 min (guess),
+      # while clamd still answers VERSION: it is overloaded, slow, or refusing
+      # streams (StreamMaxLength under --max-blob-mb).
+      - alert: VlpdsAntivirusErrors
+        expr: >-
+          sum by (instance) (rate(vlpds_blob_av_total{job="vlpds",result="error"}[10m]))
+            / sum by (instance) (rate(vlpds_blob_av_total{job="vlpds",result=~"clean|cached|infected|error"}[10m])) > 0.02
+          and on (instance) sum by (instance) (rate(vlpds_blob_av_total{job="vlpds",result="error"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of upload scans on {{ $labels.instance }} get no verdict from clamd"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsantiviruserrors"
+
+      # freshclam normally raises the database version about daily; none in
+      # 3 days means updates are failing (network, mirror rate limit, disk).
+      - alert: VlpdsAntivirusSignaturesStale
+        expr: >-
+          max by (instance) (changes(vlpds_blob_av_db_version{job="vlpds"}[3d])) == 0
+          and on (instance) max by (instance) (vlpds_blob_av_up{job="vlpds"}) == 1
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "clamd's signatures on {{ $labels.instance }} have not updated in 3 days"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsantivirussignaturesstale"
+
+      # An upload matched a signature. Already handled (refused or
+      # quarantined, with a case); this asks someone to look at the case.
+      - alert: VlpdsMalwareUploaded
+        expr: sum by (instance) (increase(vlpds_blob_av_total{job="vlpds",result="infected"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} upload(s) on {{ $labels.instance }} matched a malware signature in the last 15 min"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmalwareuploaded"

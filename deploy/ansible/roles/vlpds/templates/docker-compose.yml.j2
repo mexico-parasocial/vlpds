@@ -65,6 +65,47 @@ services:
         max-file: "{{ vlpds_log_max_file }}"
     networks:
       - {{ vlpds_docker_network }}
+{% if vlpds_antivirus | bool %}
+
+  # Malware scanning for uploadBlob (VLPDS_AV_SOCKET=tcp://clamav:3310). Not
+  # published; vlpds starts without it (uploads get a retryable 503 while
+  # clamd loads its signatures, with vlpds_antivirus_fail_mode closed).
+  clamav:
+    image: {{ vlpds_antivirus_image | to_json }}
+    container_name: vlpds-clamav
+    restart: unless-stopped
+    # The image's init writes CLAMD_CONF_<Option> into its clamd.conf (its
+    # defaults keep TCPSocket 3310, the local socket its healthcheck uses,
+    # and logging). StreamMaxLength/MaxFileSize must cover --max-blob-mb or
+    # INSTREAM refuses big blobs ("size limit exceeded").
+    environment:
+      CLAMAV_NO_MILTERD: "true"
+      CLAMD_CONF_StreamMaxLength: "{{ vlpds_max_blob_mb | int + 1 }}M"
+      CLAMD_CONF_MaxFileSize: "{{ vlpds_max_blob_mb | int + 1 }}M"
+      CLAMD_CONF_MaxScanSize: "{{ [vlpds_max_blob_mb | int * 4, 400] | max }}M"
+      CLAMD_CONF_MaxThreads: "{{ vlpds_antivirus_max_threads }}"
+      CLAMD_CONF_MaxQueue: "{{ vlpds_antivirus_max_threads | int * 4 }}"
+      # keep scanning while a freshclam update loads (~2x signature memory)
+      CLAMD_CONF_ConcurrentDatabaseReload: "yes"
+    volumes:
+      - "clamav-db:/var/lib/clamav"
+    mem_limit: {{ vlpds_antivirus_mem_limit_mb }}m
+    memswap_limit: {{ vlpds_antivirus_mem_limit_mb }}m
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "{{ vlpds_log_max_size }}"
+        max-file: "{{ vlpds_log_max_file }}"
+    networks:
+      - {{ vlpds_docker_network }}
+{% endif %}
+{% if vlpds_antivirus | bool %}
+
+volumes:
+  clamav-db: {}
+{% endif %}
 
 networks:
   {{ vlpds_docker_network }}:

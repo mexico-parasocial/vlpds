@@ -66,7 +66,11 @@ vlpds_docker_subnet: 172.31.83.0/24
 
 # Container memory limit (MiB). The node sizes its default cache budget
 # from it and exports it as vlpds_memory_limit_bytes (VlpdsMemoryHigh).
-vlpds_mem_limit_mb: "{{ 2560 if vlpds_profile == 'tiny' else (ansible_facts.memtotal_mb * 0.85) | int }}"
+# With vlpds_antivirus, clamd's limit comes off the host's share first.
+vlpds_mem_limit_mb: >-
+  {{ 2560 if vlpds_profile == 'tiny'
+     else (ansible_facts.memtotal_mb * 0.85
+           - (vlpds_antivirus_mem_limit_mb | int if vlpds_antivirus | bool else 0)) | int }}
 vlpds_nofile_limit: 1048576
 # Graceful stop: SIGTERM, then this long before SIGKILL. RUNBOOK "Rolling
 # deploy": the close barrier may wait 30 s and the log quiesce 10 s, so at
@@ -304,6 +308,21 @@ vlpds_space_oplog_retention: ""
 # X-Forwarded-For when the peer is a trusted proxy: Caddy).
 vlpds_rate_limits: true
 vlpds_trusted_proxies: ["{{ vlpds_docker_subnet }}"]
+
+# Malware scanning of uploaded blobs (--av-socket; docs/_antivirus-scanning.md):
+# a clamav container (clamd + freshclam, signatures in the clamav-db volume,
+# options set through the image's CLAMD_CONF_* variables)
+# beside vlpds on its Docker network, reached at tcp://clamav:3310 and not
+# published. clamd keeps its signatures resident: about 1.2-1.6 GB, twice
+# that while a freshclam update reloads them (ConcurrentDatabaseReload).
+vlpds_antivirus: false
+# The Debian build: multi-arch (amd64, arm64). clamav/clamav is amd64 only.
+vlpds_antivirus_image: "clamav/clamav-debian:1.4"
+vlpds_antivirus_mem_limit_mb: 3584
+# closed: uploads clamd can't judge get a retryable 503; open: stored unscanned.
+vlpds_antivirus_fail_mode: closed
+# clamd's MaxThreads, and vlpds' --av-max-concurrency (one below it).
+vlpds_antivirus_max_threads: 8
 
 # Extra VLPDS_* env vars / flags, for anything not covered above.
 vlpds_extra_env: {}

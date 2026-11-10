@@ -13,11 +13,20 @@ services:
   synapse:
     container_name: !reset null
     profiles: [matrix]
+    # WatZappa los une a la red externa para-edge (su Caddy en el host). Aquí el
+    # edge es el Caddy del mismo proyecto y los alcanza por nombre en la red
+    # default; no existe una red para-edge que levantar.
+    networks: !override [default]
     depends_on: !override
       synapse-init:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+    # El listener de métricas de deploy/matrix/hardening.yaml (9000, nunca
+    # publicado); Alloy lo recoge por esta etiqueta.
+    labels:
+      para.metrics.port: '9000'
+      para.metrics.path: /_synapse/metrics
     environment:
       SYNAPSE_CACHE_FACTOR: ${SYNAPSE_CACHE_FACTOR:-0.5}
     stop_grace_period: 60s
@@ -35,6 +44,7 @@ services:
   para-idp:
     container_name: !reset null
     profiles: [matrix]
+    networks: !override [default]
     image: ${PARA_REGISTRY:-ghcr.io/mexico-parasocial}/watzappa-para-idp:${WATZAPPA_VERSION:-local}
     # Solo el edge habla con él.
     ports: !reset []
@@ -50,6 +60,7 @@ services:
   mas:
     container_name: !reset null
     profiles: [matrix]
+    networks: !override [default]
     ports: !reset []
     depends_on: !override
       postgres:
@@ -63,6 +74,7 @@ services:
   element-web:
     container_name: !reset null
     profiles: [matrix]
+    networks: !override [default]
     ports: !reset []
     # La config generada por make matrix-init para PARA_DOMAIN, no la versionada
     # (que apunta a matrix.para.social).

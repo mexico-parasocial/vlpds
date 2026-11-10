@@ -101,6 +101,8 @@ pub struct Config {
     pub blob_uploads_per_day: u32,
     /// How long a taken-down blob's bytes stay in quarantine.
     pub blob_quarantine: Duration,
+    /// `--av-socket`: scan uploaded blobs with clamd. None: no scanning.
+    pub antivirus: Option<crate::antivirus::Config>,
     /// Deactivated accounts with a `deleteAfter` are deleted once it has
     /// passed and they have been deactivated at least this long. None: kept.
     pub delete_after_min_hold: Option<Duration>,
@@ -327,6 +329,7 @@ impl Default for Config {
             blob_quota_bytes: DEFAULT_BLOB_QUOTA_GB * 1_000_000_000,
             blob_uploads_per_day: DEFAULT_BLOB_UPLOADS_PER_DAY,
             blob_quarantine: Duration::from_secs(DEFAULT_BLOB_QUARANTINE_DAYS * 86_400),
+            antivirus: None,
             delete_after_min_hold: Some(Duration::from_secs(DEFAULT_DELETE_AFTER_MIN_HOLD_DAYS * 86_400)),
             plc_url: crate::plc::DEFAULT_PLC_URL.into(),
             plc: Default::default(),
@@ -597,6 +600,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let changes = xrpc::changes::Changes::new(cluster.cfg.node_id.clone());
     let app = Arc::new(xrpc::App {
         spaces,
+        av: cfg.antivirus.clone().map(crate::antivirus::Scanner::spawn),
         space_blob_accounts: Default::default(),
         http_drain: Default::default(),
         changes,

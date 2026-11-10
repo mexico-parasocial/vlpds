@@ -1,9 +1,10 @@
 # Se aplica sobre overrides/matrix.yaml cuando PROFILES no incluye matrix (el
 # Makefile lo elige, ver PARA_BRIDGE_CHAT_OVERRIDE). El matrix-bridge corre en
-# el perfil governance sin chat (MATRIX_CHAT_ENABLED=false): sirve gobernanza
-# (constitución, propuestas, sorteo, moderación, insignias) desde el firehose y
-# Postgres, sin Synapse, MAS, para-idp ni Element. Ver docs/MATRIX.md, "Sin
-# chat".
+# el perfil governance sin chat (MATRIX_CHAT_ENABLED=false): sigue sirviendo la
+# constitución, los reportes y sanciones y el acceso verificado (que lee del
+# AppView) desde el firehose y Postgres, sin Synapse, MAS, para-idp ni Element.
+# Las propuestas y decisiones son cabildeos del AppView, no del bridge. Ver
+# docs/MATRIX.md, "Sin chat".
 services:
   matrix-bridge:
     depends_on: !override

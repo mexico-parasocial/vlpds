@@ -363,8 +363,5 @@ async fn check_record(app: &App, did: &str, coll: &str, key: &str, record: &J, c
     if coll == SHARE || coll == SHARE_ACTION {
         community::check_content(app, did, coll, record).await?;
     }
-    if coll == GOVERNANCE {
-        community::check_governance(app, did, record).await?;
-    }
     Ok(())
 }

@@ -658,6 +658,23 @@ struct Args {
     /// they are deleted.
     #[arg(long, env = "VLPDS_BLOB_QUARANTINE_DAYS", default_value_t = vlpds::server::DEFAULT_BLOB_QUARANTINE_DAYS)]
     blob_quarantine_days: u64,
+    /// clamd socket for scanning uploaded blobs: a unix socket path (e.g.
+    /// /run/clamav/clamd.ctl) or tcp://host:port. Unset: no scanning. clamd's
+    /// StreamMaxLength must be at least --max-blob-mb.
+    #[arg(long, env = "VLPDS_AV_SOCKET")]
+    av_socket: Option<String>,
+    /// What uploadBlob does when clamd gives no verdict: closed refuses it
+    /// (503 ScanUnavailable, retryable), open stores it unscanned. Either way
+    /// it is counted (vlpds_blob_av_total). A repo moving in is never refused.
+    #[arg(long, env = "VLPDS_AV_FAIL_MODE", value_enum, default_value_t = AvFailMode::Closed)]
+    av_fail_mode: AvFailMode,
+    /// Seconds clamd has to take a connection, each part of the stream, and
+    /// to answer once the upload is in.
+    #[arg(long, env = "VLPDS_AV_TIMEOUT_SECS", default_value_t = 30)]
+    av_timeout_secs: u64,
+    /// Scans in flight to clamd from this node (keep under clamd's MaxThreads).
+    #[arg(long, env = "VLPDS_AV_MAX_CONCURRENCY", default_value_t = 8)]
+    av_max_concurrency: usize,
     /// Delete deactivated accounts whose `deleteAfter` (set by
     /// deactivateAccount) has passed. false: keep them until deleted by
     /// hand.
@@ -1209,6 +1226,26 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AvFailMode {
+    /// Refuse the upload (503 ScanUnavailable).
+    Closed,
+    /// Store it unscanned.
+    Open,
+}
+
+fn antivirus_config(args: &Args) -> anyhow::Result<Option<vlpds::antivirus::Config>> {
+    let Some(s) = args.av_socket.as_deref().filter(|s| !s.trim().is_empty()) else { return Ok(None) };
+    anyhow::ensure!(args.av_timeout_secs > 0, "--av-timeout-secs must be at least 1");
+    anyhow::ensure!(args.av_max_concurrency > 0, "--av-max-concurrency must be at least 1");
+    Ok(Some(vlpds::antivirus::Config {
+        addr: vlpds::antivirus::Addr::parse(s)?,
+        fail_open: args.av_fail_mode == AvFailMode::Open,
+        timeout: Duration::from_secs(args.av_timeout_secs),
+        max_concurrency: args.av_max_concurrency,
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum AsnLookup {
     Off,
     #[value(name = "bgp.tools")]
@@ -1598,6 +1635,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         blob_quota_bytes: args.blob_quota_gb.saturating_mul(1_000_000_000),
         blob_uploads_per_day: args.blob_uploads_per_day,
         blob_quarantine: Duration::from_secs(args.blob_quarantine_days.saturating_mul(86_400)),
+        antivirus: antivirus_config(&args)?,
         delete_after_min_hold: args
             .delete_after
             .then(|| Duration::from_secs(args.delete_after_min_hold_days.saturating_mul(86_400))),

@@ -11,9 +11,12 @@
 #   idp.{$PARA_DOMAIN}     para-idp: proves the user holds a PARA identity key
 #   chat.{$PARA_DOMAIN}    Element Web
 #
-# Federation stays closed: no 8448 listener, and deploy/matrix/hardening.yaml
-# whitelists no server. Admin APIs answer an empty 404 unless the client is on
-# loopback or the private network (PARA_OPERATOR_CIDRS).
+# Federation stays closed: no 8448 listener, deploy/matrix/hardening.yaml
+# serves only the client API and whitelists no server, and the federation and
+# key paths answer 404 here as well. The Synapse admin API answers an empty 404
+# unless the client is on loopback or the private network (PARA_OPERATOR_CIDRS).
+# The MAS-to-Synapse API (/_synapse/mas) and Synapse metrics (reached over the
+# Compose network by MAS and Alloy) are never public.
 
 (para_matrix_headers) {
 	header {
@@ -36,10 +39,12 @@
 		respond 404
 	}
 
-	handle /.well-known/matrix/server {
-		header Content-Type application/json
-		respond `{"m.server": "{$MATRIX_SERVER_NAME}:443"}`
+	@private path /_synapse/mas /_synapse/mas/* /_synapse/metrics /_synapse/metrics/* /_matrix/federation/* /_matrix/key/*
+	handle @private {
+		respond 404
 	}
+
+	# No /.well-known/matrix/server: federation is closed.
 	handle /.well-known/matrix/client {
 		header Content-Type application/json
 		header Access-Control-Allow-Origin *

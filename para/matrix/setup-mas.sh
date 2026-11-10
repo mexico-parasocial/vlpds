@@ -46,6 +46,13 @@ MAS_PUBLIC_BASE="${MAS_PUBLIC_BASE:-http://localhost:8080/}"
 PARA_IDP_PUBLIC_URL="${PARA_IDP_PUBLIC_URL:-http://localhost:8090}"
 PARA_IDP_PUBLIC_URL="${PARA_IDP_PUBLIC_URL%/}"
 case "$MAS_PUBLIC_BASE" in */) ;; *) MAS_PUBLIC_BASE="${MAS_PUBLIC_BASE}/" ;; esac
+# Browsers and phones open these, so off localhost they must be HTTPS.
+for url in "$MAS_PUBLIC_BASE" "$PARA_IDP_PUBLIC_URL"; do
+    case "$url" in
+        https://*|http://localhost:*|http://127.0.0.1:*) ;;
+        *) echo "❌ ${url} must be https:// (plain http is only accepted for localhost)" >&2; exit 2 ;;
+    esac
+done
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  PARA — MAS + para-idp setup"
@@ -55,6 +62,12 @@ echo "   para-idp: ${PARA_IDP_PUBLIC_URL}"
 
 if [ -d "$MAS_DIR" ]; then
     echo "Existing MAS configuration preserved. Never delete it to upgrade: it holds encryption and signing keys."
+    if [ -f "${MAS_DIR}/config.yaml" ] && ! grep -qF "public_base: ${MAS_PUBLIC_BASE}" "${MAS_DIR}/config.yaml"; then
+        echo "⚠️  Its public_base differs from ${MAS_PUBLIC_BASE}."
+        echo "   WatZappa's deploy/matrix/set-public-urls.sh moves it (dry run first; MATRIX_MAS_PUBLIC_URL and"
+        echo "   MATRIX_IDP_PUBLIC_URL name the new origins). It restarts containers through WatZappa's own"
+        echo "   compose file, so recreate the platform's services afterwards: make up UP_ARGS=--force-recreate."
+    fi
     echo "See VLPDS para/docs/CHAT-STAGING.md for the reviewed MAS admin-client upgrade."
     exit 0
 fi
