@@ -15,6 +15,7 @@
 //   BSKY_DID_PLC_URL         default https://plc.directory
 //   BSKY_DISABLE_SSRF_PROTECTION  "true" lets identity lookups reach private
 //                            addresses, e.g. a PLC in the same compose network
+//   BSKY_HANDLE_RESOLVE_URL  dev only: resolve handles against this PDS first
 //   BSKY_REPO_PROVIDER       the firehose to index, e.g. ws://pds:2583. Without
 //                            it the data plane serves what is already indexed.
 //   BSKY_BSYNC_URL, BSKY_BSYNC_API_KEY, BSKY_BSYNC_HTTP_VERSION: optional bsync
@@ -51,6 +52,7 @@ const env = {
   port: maybeInt(process.env.BSKY_DATAPLANE_PORT) ?? 2585,
   plcUrl: process.env.BSKY_DID_PLC_URL || 'https://plc.directory',
   disableSsrfProtection: process.env.BSKY_DISABLE_SSRF_PROTECTION === 'true',
+  handleResolveUrl: process.env.BSKY_HANDLE_RESOLVE_URL || undefined,
   repoProvider: process.env.BSKY_REPO_PROVIDER || undefined,
   bsyncUrl: process.env.BSKY_BSYNC_URL || undefined,
   bsyncApiKey: process.env.BSKY_BSYNC_API_KEY || undefined,
@@ -80,6 +82,31 @@ const main = async () => {
     env.disableSsrfProtection ? globalThis.fetch : undefined,
   )
   log.info({ port: env.port }, 'dataplane is running')
+
+  // Dev only: handles like alice.test have no DNS record or well-known file,
+  // so the default resolver cannot verify them and the AppView shows
+  // "handle.invalid". With BSKY_HANDLE_RESOLVE_URL set, handles are resolved
+  // against that PDS first (what dev-env's mockResolvers does), then normally.
+  if (env.handleResolveUrl) {
+    const base = env.handleResolveUrl.replace(/\/+$/, '')
+    const resolver = dataplane.idResolver.handle
+    const resolveNormally = resolver.resolve.bind(resolver)
+    resolver.resolve = async (handle) => {
+      try {
+        const res = await fetch(
+          `${base}/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(handle)}`,
+        )
+        if (res.ok) {
+          const body = await res.json()
+          if (typeof body?.did === 'string') return body.did
+        }
+      } catch {
+        // fall through to the normal resolution
+      }
+      return resolveNormally(handle)
+    }
+    log.info({ url: base }, 'handles resolve against the PDS first (dev)')
+  }
 
   const repoSub = env.repoProvider
     ? new RepoSubscription({

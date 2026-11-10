@@ -162,6 +162,8 @@ services:
       BSKY_BSYNC_API_KEY: dev-bsync-key
       BSKY_BSYNC_HTTP_VERSION: '1.1'
       BSKY_DISABLE_SSRF_PROTECTION: 'true'
+      # alice.test no tiene DNS: se resuelve contra vlpds (si no, handle.invalid)
+      BSKY_HANDLE_RESOLVE_URL: http://localhost:2583
 
   appview:
     <<: *shared
