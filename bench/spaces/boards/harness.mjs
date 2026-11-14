@@ -1,7 +1,8 @@
 // The boards app (packages/boards) wired to the harness stack: the boards
 // client's credentials come from the harness's credential chain (local PLC,
 // timed XRPC client), and the appview syncs with its own member account and
-// takes notifies through a harness NotifyService.
+// takes notifies through a harness NotifyService, the endpoint its
+// authorizations register.
 import { Appview } from '../../../../boards/src/appview.mjs'
 import { BoardsClient as BaseClient } from '../../../../boards/src/client.mjs'
 import { signingKey } from '../lib/identity.mjs'
@@ -27,6 +28,6 @@ export function harnessAppview({ account, svc, ...opts }) {
     account,
     svc,
     keyOf: (did) => signingKey(did),
-    syncerFor: (board, snapshot) => new Syncer(`appview/${board.split('/')[5]}`, board, account, { snapshot }),
+    syncerFor: (board, snapshot) => new Syncer(`appview/${board.split('/')[5]}`, board, account, { snapshot, notify: svc.registration(board) }),
   })
 }
