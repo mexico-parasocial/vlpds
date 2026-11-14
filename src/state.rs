@@ -34,7 +34,7 @@
 //! sH/{did}\0{sid}                   -> space repo head: URI, rev, LtHash state, count, created
 //! sR/{did}\0{sid}{coll}/{rkey}      -> record cid | rev | record bytes (as `R/`)
 //! sO/{did}\0{sid}{rev u64}{idx u16} -> oplog op: action, coll, rkey, cid?, prev?
-//! sP/{did}\0{sid}                   -> notifyWrite outbox: URI, repoRev, hash
+//! sP/{did}\0{sid}                   -> notifyRepoUpdate outbox: URI, repoRev, hash
 //! sb/{did}\0{sid}{cid}\0{path}       -> rev (space blob refs: space.listBlobs/getBlob)
 //! sc/{did}\0{cid}\0{sid}{path}       -> empty (the same refs by CID: blob GC)
 //!
@@ -43,8 +43,16 @@
 //! sS/{auth}\0{sid}                  -> the space (JSON: URI, policies, created, deleted)
 //! sM/{auth}\0{sid}{member}          -> member access
 //! sW/{auth}\0{sid}{writer}          -> writer state: repoRev, hash, spaceRev
-//! sQ/{auth}\0{sid}{spaceRev u64}    -> writer DID (listRepos order; latest state per writer only)
-//! sN/{auth}\0{sid}{service}         -> notify registration: endpoint, expiry
+//! sX/{auth}\0{sid}{writer}          -> a writer removed from the set: its last repoRev and hash, the removal's spaceRev
+//! sQ/{auth}\0{sid}{spaceRev u64}    -> writer DID (listWriters order; each writer's latest change only)
+//! sG/{auth}\0{sid}{reg id}           -> notify registration: endpoint, token, expiry, expiry notice claimed
+//! sE/{auth}\0{sid}{reg id}           -> a notice to a registration that a send couldn't deliver
+//! sN/{auth}\0{sid}{service}         -> a registerNotify registration (read only, dropped once expired)
+//! sD/{auth}\0{sid}{service}         -> a notifySpaceDeleted retry (read only, dropped once expired)
+//!
+//! `{reg id}` is [`registration_id`]. A writer is in `sW` or `sX`, never
+//! both. The newer families are ones a build before them never reads, so
+//! it can run over a bucket that has them.
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
@@ -213,9 +221,12 @@ pub const SPACE_BLOB_FAMILY: &[u8] = b"sb/";
 pub const SPACE_BLOB_CID_FAMILY: &[u8] = b"sc/";
 pub const SPACE_LIST_FAMILY: &[u8] = b"sL/";
 pub const SPACE_DELETED_FAMILY: &[u8] = b"sD/";
+pub const SPACE_REMOVED_FAMILY: &[u8] = b"sX/";
+pub const SPACE_REG_FAMILY: &[u8] = b"sG/";
+pub const SPACE_NOTICE_FAMILY: &[u8] = b"sE/";
 
 /// Every Spaces family: rows that must never reach a firehose frame.
-pub const SPACE_FAMILIES: [&[u8]; 13] = [
+pub const SPACE_FAMILIES: [&[u8]; 16] = [
     SPACE_HEAD_FAMILY,
     SPACE_RECORD_FAMILY,
     SPACE_OPLOG_FAMILY,
@@ -229,6 +240,9 @@ pub const SPACE_FAMILIES: [&[u8]; 13] = [
     SPACE_BLOB_CID_FAMILY,
     SPACE_LIST_FAMILY,
     SPACE_DELETED_FAMILY,
+    SPACE_REMOVED_FAMILY,
+    SPACE_REG_FAMILY,
+    SPACE_NOTICE_FAMILY,
 ];
 
 /// Why an account is listed under a space URI in `sL/`.
@@ -321,11 +335,31 @@ pub fn space_seq_key(authority: &str, sid: &SpaceId, space_rev: u64) -> Vec<u8> 
     keyed(authority, SPACE_SEQ_FAMILY, &[authority.as_bytes(), b"\0", sid, &space_rev.to_be_bytes()])
 }
 
+/// A registration's id: sha256 of its endpoint and token, which together
+/// identify it.
+pub fn registration_id(endpoint: &str, token: &str) -> [u8; 32] {
+    Sha256::new().chain_update(endpoint).chain_update([0]).chain_update(token).finalize().into()
+}
+
+pub fn space_registration_key(authority: &str, sid: &SpaceId, id: &[u8; 32]) -> Vec<u8> {
+    keyed(authority, SPACE_REG_FAMILY, &[authority.as_bytes(), b"\0", sid, id])
+}
+
+/// A notice owed to a registration that a send couldn't deliver.
+pub fn space_notice_key(authority: &str, sid: &SpaceId, id: &[u8; 32]) -> Vec<u8> {
+    keyed(authority, SPACE_NOTICE_FAMILY, &[authority.as_bytes(), b"\0", sid, id])
+}
+
+pub fn space_removed_key(authority: &str, sid: &SpaceId, writer: &str) -> Vec<u8> {
+    keyed(authority, SPACE_REMOVED_FAMILY, &[authority.as_bytes(), b"\0", sid, writer.as_bytes()])
+}
+
+/// registerNotify's registration of `service`.
 pub fn space_notify_key(authority: &str, sid: &SpaceId, service: &str) -> Vec<u8> {
     keyed(authority, SPACE_NOTIFY_FAMILY, &[authority.as_bytes(), b"\0", sid, service.as_bytes()])
 }
 
-/// A notifySpaceDeleted owed to a service that a send couldn't reach.
+/// A notifySpaceDeleted to `service` that a send couldn't deliver.
 pub fn space_deleted_key(authority: &str, sid: &SpaceId, service: &str) -> Vec<u8> {
     keyed(authority, SPACE_DELETED_FAMILY, &[authority.as_bytes(), b"\0", sid, service.as_bytes()])
 }

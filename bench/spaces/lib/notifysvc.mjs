@@ -1,14 +1,22 @@
-// A syncing service's inbound side: a real did:plc whose
-// `#atproto_space_syncer` entry points here (or at a fault proxy in front of
-// here), so space hosts resolve and reach it like any registered service. It
-// verifies each call's service auth (iss = the space's authority, aud = this
-// service's id, lxm) against the authority's key from the PLC, records it,
-// and hands notifyWrite / notifySpaceDeleted to listeners. It also answers
-// managedspace.checkUserAccess as a managing app.
+// A syncing service's inbound side. As a syncer it's an endpoint registered
+// through authorizeSpaceSync's `notify` (http://localhost:<port>, or a fault
+// proxy in front of it): it answers confirmRegistration for the tokens it
+// issued and takes notifySpaceUpdate, which carries the token and no auth,
+// recording each call and handing it to listeners. As a managing app it's a
+// real did:plc whose `#atproto_space_syncer` entry points here, answering
+// managedspace.checkAccess, whose service auth (iss = the space's
+// authority, aud = this service's id, lxm) it verifies against the
+// authority's key from the PLC.
+import { randomBytes } from 'node:crypto'
 import http from 'node:http'
 import { verifySignature } from '@atproto/crypto'
 import { createServiceDid, signingKey } from './identity.mjs'
 import { decodeJwt, spaceDidOf } from './space.mjs'
+
+export const CONFIRM = 'com.atproto.space.confirmRegistration'
+export const NOTIFY = 'com.atproto.space.notifySpaceUpdate'
+export const CHECK_ACCESS = 'com.atproto.managedspace.checkAccess'
+const UNAUTHENTICATED = new Set([CONFIRM, NOTIFY])
 
 export class NotifyService {
   constructor(port, { publicPort } = {}) {
@@ -17,7 +25,26 @@ export class NotifyService {
     this.calls = []
     this.listeners = new Set()
     this.authFailures = []
-    this.access = () => false // checkUserAccess policy: (space, user, access, clientId) => bool
+    this.access = () => ({ read: false, write: false }) // checkAccess policy: (space, repo, clientId) => {read, write}, or null for an outage
+    this.tokens = new Map() // token -> space
+    this.spaceTokens = new Map() // space -> its token (one per space, stable across authorizations)
+    this.confirm = () => true // whether to confirm a registration: (space, token) => bool
+    this.respond = () => 200 // the status for a notifySpaceUpdate: (call) => status
+  }
+
+  get endpoint() {
+    return `http://localhost:${this.publicPort}`
+  }
+
+  /** The `notify` a syncer of `space` registers with: this endpoint and the space's token. */
+  registration(space) {
+    let token = this.spaceTokens.get(space)
+    if (!token) {
+      token = randomBytes(32).toString('base64url')
+      this.spaceTokens.set(space, token)
+      this.tokens.set(token, space)
+    }
+    return { endpoint: this.endpoint, token }
   }
 
   async start() {
@@ -82,7 +109,11 @@ export class NotifyService {
       body = raw
     }
     const at = performance.now()
-    const authErr = await this.verifyAuth(req.headers.authorization, lxm, body?.space)
+    const authErr = UNAUTHENTICATED.has(lxm)
+      ? this.tokens.get(body?.token) === body?.space
+        ? null
+        : 'a token this service did not issue for the space'
+      : await this.verifyAuth(req.headers.authorization, lxm, body?.space)
     const call = { lxm, body, at, wall: Date.now(), authErr }
     this.calls.push(call)
     const reply = (status, obj) => {
@@ -91,12 +122,21 @@ export class NotifyService {
     }
     if (authErr) {
       this.authFailures.push(call)
-      return reply(401, { error: 'AuthRequired', message: authErr })
+      return UNAUTHENTICATED.has(lxm)
+        ? reply(400, { error: 'InvalidToken', message: authErr })
+        : reply(401, { error: 'AuthRequired', message: authErr })
     }
-    if (lxm === 'com.atproto.managedspace.checkUserAccess') {
-      const ok = !!this.access(body.space, body.user, body.access, body.clientId)
-      return reply(200, { authorized: ok })
+    if (lxm === CHECK_ACCESS) {
+      const a = this.access(body.space, body.repo, body.clientId)
+      if (a === null) return reply(503, { error: 'Unavailable', message: 'the managing app is down' })
+      return reply(200, { read: !!a.read, write: !!a.write })
     }
+    if (lxm === CONFIRM) {
+      if (!this.confirm(body.space, body.token)) return reply(400, { error: 'InvalidToken', message: 'not confirmed' })
+      return reply(200, { challenge: body.challenge })
+    }
+    const status = this.respond(call)
+    if (status !== 200) return reply(status, { error: status >= 500 ? 'InternalServerError' : 'InvalidRequest' })
     for (const fn of this.listeners) {
       try {
         fn(call)

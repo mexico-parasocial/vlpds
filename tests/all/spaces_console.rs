@@ -31,32 +31,18 @@ async fn eventually(within: Duration, mut f: impl AsyncFnMut() -> bool) -> bool 
 
 async fn put_member(owner: &SpaceClient, space: &str, did: &str) {
     let body = json!({"space": space, "did": did, "read": true, "write": true});
-    owner.post("com.atproto.memberspace.putMember", body).await.ok();
+    owner.post("com.atproto.memberspace.putMembers", crate::common::spaces::one_member(&body)).await.ok();
 }
 
-/// A did:web syncer on loopback that takes every notify.
+/// A syncer endpoint on loopback that confirms its registrations and
+/// takes every notice.
 async fn syncer() -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    let (base, did) = (format!("http://{addr}"), format!("did:web:127.0.0.1%3A{}", addr.port()));
-    let d = did.clone();
-    let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
-        let (d, b) = (d.clone(), base.clone());
-        async move {
-            let body = match req.uri().path() {
-                "/.well-known/did.json" => {
-                    json!({"id": d, "service": [{"id": "#sync", "type": "Test", "serviceEndpoint": b}]})
-                }
-                _ => json!({}),
-            };
-            axum::response::Response::builder()
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap()
-        }
-    });
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let router = axum::Router::new()
+        .fallback(|axum::Json(body): axum::Json<J>| async move { axum::Json(json!({"challenge": body["challenge"]})) });
     tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
-    format!("{did}#sync")
+    base
 }
 
 const READS: [&str; 4] = [
@@ -81,7 +67,7 @@ async fn admin_only_and_off_without_the_flag() {
         a.get(m, &q).await.err_status(401);
         s.xrpc.get(m, &q, &Auth::Admin).await.ok();
     }
-    let body = json!({"did": a.did, "space": space, "service": "did:web:x.example#s", "reason": "r"});
+    let body = json!({"did": a.did, "space": space, "registration": "00".repeat(32), "reason": "r"});
     s.xrpc.post("vlpds.admin.removeSpaceRegistration", &body, &Auth::None).await.err_status(401);
     s.xrpc.post("vlpds.admin.removeSpaceRegistration", &body, &session).await.err_status(401);
 
@@ -94,7 +80,7 @@ async fn admin_only_and_off_without_the_flag() {
         r.err(501, "MethodNotImplemented");
         assert!(r.text().contains("--spaces"), "{m}: {}", r.text());
     }
-    let body = json!({"did": b.did, "space": "at://did:plc:x/space/com.example.group/main", "service": "did:web:x#s", "reason": "r"});
+    let body = json!({"did": b.did, "space": "at://did:plc:x/space/com.example.group/main", "registration": "00".repeat(32), "reason": "r"});
     off.xrpc.post("vlpds.admin.removeSpaceRegistration", &body, &Auth::Admin).await.err(501, "MethodNotImplemented");
 }
 
@@ -198,21 +184,21 @@ async fn registration_removal_is_audited() {
     let space = owner.create_space(TYPE, "main").await;
     let other = owner.create_space(TYPE, "other").await;
     let service = syncer().await;
-    let cred = owner.credential(&space).await;
-    let reg = json!({"space": space, "service": service});
-    owner.signed_post(&s.url, "com.atproto.space.registerNotify", reg, &cred, &owner.did).await.ok();
+    let notify = json!({"endpoint": service, "token": "t"});
+    owner.authorize_notify(&s.url, &space, notify).await.ok();
     let q = [("did", owner.did.as_str()), ("uri", space.as_str())];
     let d = s.xrpc.get("vlpds.admin.getSpaceInfo", &q, &Auth::Admin).await.ok();
     let regs = d["registrations"].as_array().unwrap();
+    let id = hex::encode(vlpds::state::registration_id(&service, "t"));
     assert_eq!(
-        (regs.len(), regs[0]["service"].clone(), regs[0]["host"].clone()),
-        (1, json!(service), json!("127.0.0.1"))
+        (regs.len(), regs[0]["registration"].clone(), regs[0]["host"].clone()),
+        (1, json!(id), json!("127.0.0.1"))
     );
-    assert!(regs[0].get("endpoint").is_none(), "the host only: {d}");
+    assert!(regs[0].get("endpoint").is_none() && regs[0].get("token").is_none(), "the host only: {d}");
 
-    let body = json!({"did": owner.did, "space": space, "service": service, "reason": ""});
+    let body = json!({"did": owner.did, "space": space, "registration": id, "reason": ""});
     s.xrpc.post("vlpds.admin.removeSpaceRegistration", &body, &Auth::Admin).await.err(400, "InvalidRequest");
-    let body = json!({"did": owner.did, "space": space, "service": service, "reason": "abusive syncer"});
+    let body = json!({"did": owner.did, "space": space, "registration": id, "reason": "abusive syncer"});
     s.xrpc.post("vlpds.admin.removeSpaceRegistration", &body, &Auth::Admin).await.ok();
     let d = s.xrpc.get("vlpds.admin.getSpaceInfo", &q, &Auth::Admin).await.ok();
     assert_eq!(d["registrations"], json!([]));
@@ -230,7 +216,7 @@ async fn registration_removal_is_audited() {
         (e[0]["action"].clone(), e[0]["reason"].clone()),
         (json!("space.registration.remove"), json!("abusive syncer"))
     );
-    assert_eq!(e[0]["detail"]["service"], json!(service));
+    assert_eq!(e[0]["detail"]["registration"], json!(id));
     assert_eq!(e[0]["subject"], json!({"kind": "space", "did": owner.did, "uri": space}));
     assert_eq!((&e[0]["actor"], &e[0]["auth"]), (&json!("admin"), &json!("token")), "{log}");
     let log = s.xrpc.get("vlpds.admin.getAuditLog", &[("space", "*")], &Auth::Admin).await.ok();

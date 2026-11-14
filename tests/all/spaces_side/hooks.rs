@@ -11,7 +11,7 @@
 //!   incarnation is configured with the front's URL and clients keep it
 //!   across a restart.
 //! - [`StubDid`]: a did:web on loopback (a remote space authority, writer or
-//!   syncer) that records the notifyWrite calls reaching it and can refuse
+//!   syncer) that records the notifications reaching it and can refuse
 //!   them.
 
 use crate::common::*;
@@ -354,10 +354,13 @@ pub fn kill9(s: &TestServer, store: &HookedStore) {
     s.app.node.halt();
 }
 
-/// One notifyWrite call that reached a [`StubDid`].
+/// One notifyRepoUpdate (as a space host) or notifySpaceUpdate (as a
+/// syncer: its `update`) that reached a [`StubDid`].
 #[derive(Clone, Debug)]
 pub struct Notified {
     pub body: J,
+    /// The space a notifySpaceUpdate names (Null for notifyRepoUpdate).
+    pub space: J,
     /// The service JWT's claims (unverified).
     pub claims: J,
     pub accepted: bool,
@@ -366,6 +369,8 @@ pub struct Notified {
 
 pub struct StubDid {
     pub did: String,
+    /// The endpoint it takes notifications at.
+    pub url: String,
     pub key: Arc<vlatproto::crypto::Keypair>,
     refuse: Arc<AtomicBool>,
     seen: Arc<Mutex<Vec<Notified>>>,
@@ -405,38 +410,50 @@ impl StubDid {
             ],
         });
         let (refuse, seen) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::<Notified>::new())));
-        let (r, s) = (refuse.clone(), seen.clone());
+        let notified = |update: bool| {
+            let (r, s) = (refuse.clone(), seen.clone());
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let (r, s) = (r.clone(), s.clone());
+                async move {
+                    let accepted = !r.load(Ordering::SeqCst);
+                    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                    let body: J = serde_json::from_slice(&body).unwrap_or(J::Null);
+                    let (body, space) = match update {
+                        true => (body["update"].clone(), body["space"].clone()),
+                        false => (body, J::Null),
+                    };
+                    s.lock().push(Notified { body, space, claims: jwt_claims(auth), accepted, at: Instant::now() });
+                    match accepted {
+                        true => axum::Json(json!({})).into_response(),
+                        false => (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({"error": "InternalServerError", "message": "refusing"})),
+                        )
+                            .into_response(),
+                    }
+                }
+            }
+        };
         let router = axum::Router::new()
             .route("/.well-known/did.json", axum::routing::get(move || std::future::ready(axum::Json(doc.clone()))))
+            .route("/xrpc/com.atproto.space.notifyRepoUpdate", axum::routing::post(notified(false)))
+            .route("/xrpc/com.atproto.space.notifySpaceUpdate", axum::routing::post(notified(true)))
             .route(
-                "/xrpc/com.atproto.space.notifyWrite",
-                axum::routing::post(move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
-                    let (r, s) = (r.clone(), s.clone());
-                    async move {
-                        let accepted = !r.load(Ordering::SeqCst);
-                        let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-                        s.lock().push(Notified {
-                            body: serde_json::from_slice(&body).unwrap_or(J::Null),
-                            claims: jwt_claims(auth),
-                            accepted,
-                            at: Instant::now(),
-                        });
-                        match accepted {
-                            true => axum::Json(json!({})).into_response(),
-                            false => (
-                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                axum::Json(json!({"error": "InternalServerError", "message": "refusing"})),
-                            )
-                                .into_response(),
-                        }
-                    }
+                "/xrpc/com.atproto.space.confirmRegistration",
+                axum::routing::post(|body: axum::Json<J>| async move {
+                    axum::Json(json!({"challenge": body["challenge"]}))
                 }),
             );
         tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
-        StubDid { did, key, refuse, seen }
+        StubDid { did, url: base, key, refuse, seen }
     }
 
-    /// Answer notifyWrite with a 503 (retryable) while `on`.
+    /// An authorizeSpaceSync `notify` for this stub as a syncer.
+    pub fn notify(&self, token: &str) -> J {
+        json!({"endpoint": self.url, "token": token})
+    }
+
+    /// Answer notifications with a 503 (retryable) while `on`.
     pub fn refuse(&self, on: bool) {
         self.refuse.store(on, Ordering::SeqCst);
     }
@@ -451,7 +468,7 @@ impl StubDid {
 
     /// No prevSpaceRev reached this service with two different successors
     /// (refused forwards count: the refusal may not be what it acted on). A
-    /// gap is benign (the service pulls listRepos); a fork never is.
+    /// gap is benign (the syncer pulls listWriters); a fork never is.
     pub fn assert_no_fork(&self, ctx: &str) {
         let seen = self.seen();
         let mut next: std::collections::BTreeMap<Option<&str>, &str> = Default::default();

@@ -523,13 +523,14 @@ struct RemoveIn {
     /// The space's authority (routes the call to its owner).
     did: String,
     space: String,
-    service: String,
+    /// The registration's id, hex, as the space's info lists it.
+    registration: String,
     reason: String,
     actor: Option<String>,
 }
 
-/// Drops a service's notify registration, as its unregisterNotify would,
-/// audited first (`space.registration.remove`).
+/// Drops a notify registration, as a refused authorization would, audited
+/// first (`space.registration.remove`).
 async fn remove_registration(
     State(app): AppState,
     Auth(creds): Auth,
@@ -549,15 +550,16 @@ async fn remove_registration(
     if reason.chars().count() > MAX_REASON {
         return Err(XrpcError::bad("InvalidRequest", format!("reason: longer than {MAX_REASON} characters")));
     }
-    if inp.service.is_empty() || inp.service.len() > crate::space::host::MAX_SERVICE_LEN {
-        return Err(XrpcError::bad("InvalidRequest", "service: not a registered service"));
-    }
+    let id: [u8; 32] = hex::decode(&inp.registration)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "registration: not a registration id"))?;
     app.partition(&space.authority)?;
     let who = Who::of(&creds, inp.actor.as_deref(), ip);
     let subject = SubjectRef::space(&space.uri, &space.authority);
-    let detail = json!({"space": space.uri, "service": inp.service});
+    let detail = json!({"space": space.uri, "registration": inp.registration});
     let e = audit(&app, &who, "space.registration.remove", Some(&subject), Some(reason), None, Some(detail)).await?;
-    remove_registration_row(&app, &space, inp.service).await?;
+    remove_registration_row(&app, &space, id).await?;
     Ok(Json(json!({"auditId": e.id})))
 }
 
@@ -565,29 +567,33 @@ async fn remove_registration(
 // registrations, fan-out lanes, revocations): the rest of this file only
 // goes through them.
 
-/// The space's notify registrations, endpoints cut to their host.
+/// The space's notify registrations, endpoints cut to their host and
+/// tokens left out.
 async fn registrations_view(app: &App, space: &Space) -> XResult<Vec<J>> {
-    let (live, expired) = crate::space::host::registrations(app, &space.authority, &space.sid).await.map_err(err)?;
+    let regs = crate::space::host::registrations(app, &space.authority, &space.sid).await.map_err(err)?;
     let host = |e: &str| reqwest::Url::parse(e).ok().and_then(|u| u.host_str().map(str::to_string));
-    let mut out: Vec<J> = live
-        .into_iter()
-        .map(|(service, row)| {
-            json!({"service": service, "host": host(&row.endpoint), "expiresAt": rfc3339(row.expires), "expired": false})
+    let view = |r: &crate::space::host::Registration, lapsed: bool| {
+        json!({
+            "registration": hex::encode(r.id),
+            "host": host(&r.row.endpoint),
+            "expiresAt": rfc3339(r.row.expires),
+            "lapsed": lapsed,
+            "expiryNotified": r.row.expiry_notified,
         })
-        .collect();
-    out.extend(expired.into_iter().map(|service| json!({"service": service, "expired": true})));
+    };
+    let mut out: Vec<J> = regs.active.iter().map(|r| view(r, false)).collect();
+    out.extend(regs.lapsed.iter().map(|r| view(r, true)));
     Ok(out)
 }
 
-async fn remove_registration_row(app: &App, space: &Space, service: String) -> XResult<()> {
+async fn remove_registration_row(app: &App, space: &Space, id: [u8; 32]) -> XResult<()> {
     use crate::space::repo::SpaceOp;
-    super::space::submit_space(app, &space.authority, space, SpaceOp::UnregisterNotify { service, expired_by: None })
-        .await?;
+    super::space::submit_space(app, &space.authority, space, SpaceOp::Unregister { id, lapsed_by: None }).await?;
     Ok(())
 }
 
 // TODO(spaces-sec): a per-space "revoke every outstanding credential" may
-// come with auto-revoke on removeMember, updateSpace and deleteSpace; the
+// come with auto-revoke on removeMembers, updateSpace and deleteSpace; the
 // console's button waits for it.
 
 fn node_status(sp: &crate::space::Spaces) -> J {

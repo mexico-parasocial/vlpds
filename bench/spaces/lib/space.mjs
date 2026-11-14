@@ -1,12 +1,12 @@
 // The space credential chain, as an app runs it with the reference library:
 // a delegation token from the user's own PDS, exchanged at the authority's
-// PDS for a credential bound to a fresh P-256 key, then reads anywhere with
-// `Authorization: Atproto-Space-Credential`, an audience and an RFC 9421
-// signature (@atproto/space createSpaceSigHeaders), plus a MAC request on the
-// reads a syncer trusts.
+// PDS with authorizeSpaceSync for a credential bound to a fresh P-256 key,
+// then reads anywhere with `Authorization: Atproto-Space-Credential`, an
+// audience and an RFC 9421 signature (@atproto/space createSpaceSigHeaders),
+// plus a MAC request (`Accept-Signature`) on the reads a syncer trusts.
 // The chain itself lives in the boards app (packages/boards/src/spaces); this
 // wires it to the harness's PLC and its timed XRPC client.
-import { COMMIT_MAC_TYPE, RECORD_MAC_TYPE, WANT_MAC_HEADER, encapsulate, formatWantMacHeader, verifyCommit } from '@atproto/space'
+import { COMMIT_MAC_PROFILE, RECORD_MAC_PROFILE, encapsulate, formatMacRequest, verifyCommit } from '@atproto/space'
 import { SpaceCred as BaseCred, Spaces } from '../../../../boards/src/spaces/cred.mjs'
 import { SPACE_TYPE } from './env.mjs'
 import { makeClient } from './http.mjs'
@@ -39,11 +39,11 @@ export async function createSpace(authority, skey, opts = {}) {
     skey,
     policy: opts.policy ?? POLICY.members(),
   })
-  return res.data.uri
+  return res.data.space
 }
 
 export async function putMember(authority, space, member, read = true, write = true) {
-  await authority.client.com.atproto.memberspace.putMember({ space, did: member.did ?? member, read, write })
+  await authority.client.com.atproto.memberspace.putMembers({ space, members: [{ did: member.did ?? member, read, write }] })
 }
 
 /** The delegation token: minted by the user's own PDS for the space. */
@@ -51,10 +51,12 @@ export async function delegationToken(actor, space) {
   return spaces.delegationToken(actor.client, space)
 }
 
-/** Exchange a delegation token at the authority's PDS (undefined: ask without one). */
+/** authorizeSpaceSync at the authority's PDS with a delegation token (undefined: ask without one). */
 export async function exchange(space, token, opts = {}) {
   const c = await spaces.exchange(space, token, opts)
-  return new SpaceCred(space, c.credential, c.key)
+  const cred = new SpaceCred(space, c.credential, c.key)
+  cred.spaceRev = c.spaceRev
+  return cred
 }
 
 /** A fresh credential for `actor` (delegation on their PDS, exchange at the authority). */
@@ -62,11 +64,11 @@ export async function credentialFor(actor, space, opts = {}) {
   return exchange(space, await delegationToken(actor, space), opts)
 }
 
-const MAC_TYPES = {
-  'com.atproto.space.getLatestCommit': COMMIT_MAC_TYPE,
-  'com.atproto.space.getRepo': COMMIT_MAC_TYPE,
-  'com.atproto.space.listRepoOps': COMMIT_MAC_TYPE,
-  'com.atproto.space.getRecord': RECORD_MAC_TYPE,
+const MAC_PROFILES = {
+  'com.atproto.space.getLatestCommit': COMMIT_MAC_PROFILE,
+  'com.atproto.space.getRepo': COMMIT_MAC_PROFILE,
+  'com.atproto.space.listRepoOps': COMMIT_MAC_PROFILE,
+  'com.atproto.space.getRecord': RECORD_MAC_PROFILE,
 }
 
 export class SpaceCred extends BaseCred {
@@ -84,16 +86,20 @@ export class SpaceCred extends BaseCred {
     const sign = this.signer()
     return makeClient(await repoHost(did), async (req) => {
       await sign(req)
-      const type = MAC_TYPES[new URL(req.url).pathname.replace(/^\/xrpc\//, '')]
-      if (type) req.headers.set(WANT_MAC_HEADER, formatWantMacHeader(type, (await encapsulate(kem)).keyShare))
+      const profile = MAC_PROFILES[new URL(req.url).pathname.replace(/^\/xrpc\//, '')]
+      if (profile) req.headers.set('accept-signature', formatMacRequest(profile, (await encapsulate(kem)).keyShare))
     })
   }
 }
 
 /** getLatestCommit of `did` with a MAC, verified (throws when it doesn't verify). */
 export async function headOf(cred, space, did) {
-  const { res, sharedSecret, mac } = await cred.macRead(did, COMMIT_MAC_TYPE, (cl, opts) => cl.com.atproto.space.getLatestCommit({ space, repo: did }, opts))
+  const { res, mac } = await cred.macRead(did, COMMIT_MAC_PROFILE, (cl, opts) => cl.com.atproto.space.getLatestCommit({ space, repo: did }, opts))
   const commit = res.data.commit
-  if (!mac || !verifyCommit(commit, { space, repo: did, sharedSecret, mac })) throw new Error(`getLatestCommit of ${did}: the commit's MAC did not verify`)
+  try {
+    verifyCommit(commit, { space, repo: did, ...mac })
+  } catch (e) {
+    throw new Error(`getLatestCommit of ${did}: the commit's MAC did not verify (${e.message})`)
+  }
   return commit
 }

@@ -4,7 +4,7 @@
 //!
 //! - `SpaceClient::new(&server, name, scope)`: account, PAR, consent, token.
 //! - `get`/`post`: DPoP-authenticated XRPC as that account.
-//! - `credential(space)`: getDelegationToken, then getSpaceCredential at the
+//! - `credential(space)`: getDelegationToken, then authorizeSpaceSync at the
 //!   authority's host, bound to the holder key.
 //! - `signed_get(base, nsid, query, credential, audience)`: a read with
 //!   `Authorization: Atproto-Space-Credential`, signed over the authorization and
@@ -53,7 +53,7 @@ impl Holder {
     /// them (`createSpaceSigHeaders`).
     pub fn headers(&self, authorization: &str, audience: &str) -> Vec<(String, String)> {
         let input = httpsig::signature_input();
-        let sig = self.sign(&httpsig::signature_base(authorization, &input, audience));
+        let sig = self.sign(&httpsig::credential_base(authorization, &input, audience));
         vec![
             ("authorization".to_string(), authorization.to_string()),
             (httpsig::AUDIENCE_HEADER.into(), audience.into()),
@@ -94,6 +94,16 @@ pub async fn resp(r: reqwest::Response) -> Resp {
 fn oauth_resp(r: oauth::Resp) -> Resp {
     let body = bytes::Bytes::from(serde_json::to_vec(&r.body).unwrap());
     Resp { status: r.status, headers: r.headers, body, json: r.body }
+}
+
+/// putMembers' body for one member, from `{space, did, read, write}`.
+pub fn one_member(v: &J) -> J {
+    json!({"space": v["space"], "members": [{"did": v["did"], "read": v["read"], "write": v["write"]}]})
+}
+
+/// removeMembers' body for one member, from `{space, did}`.
+pub fn one_did(v: &J) -> J {
+    json!({"space": v["space"], "dids": [v["did"]]})
 }
 
 /// A space URI.
@@ -230,7 +240,7 @@ impl SpaceClient {
                 }),
             )
             .await;
-        r.ok()["uri"].as_str().unwrap().to_string()
+        r.ok()["space"].as_str().unwrap().to_string()
     }
 
     pub async fn create_record(&self, space: &str, collection: &str, rkey: Option<&str>, record: J) -> Resp {
@@ -259,8 +269,8 @@ impl SpaceClient {
         self.get("com.atproto.space.getDelegationToken", &[("space", space)]).await
     }
 
-    /// getSpaceCredential at `host` (the authority's PDS) for `token`,
-    /// signed by this client's holder key.
+    /// authorizeSpaceSync at `host` (the authority's PDS) for `token`,
+    /// bound to this client's holder key.
     pub async fn exchange(&self, host: &str, space: &str, token: &str) -> Resp {
         self.exchange_as(&self.holder, host, space, token).await
     }
@@ -269,7 +279,7 @@ impl SpaceClient {
         self.exchange_with(holder, host, space, token, None).await
     }
 
-    /// getSpaceCredential with a client attestation (an `allowedApps`
+    /// authorizeSpaceSync with a client attestation (an `allowedApps`
     /// list's proof of which app asks).
     pub async fn exchange_with(
         &self,
@@ -279,12 +289,25 @@ impl SpaceClient {
         token: &str,
         attestation: Option<&str>,
     ) -> Resp {
-        let rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
-        let mut body = json!({"space": space, "credentialKid": holder.did, "delegationToken": token});
+        let mut body = json!({"space": space, "credentialKey": holder.did, "delegationToken": token});
         if let Some(a) = attestation {
             body["clientAttestation"] = json!(a);
         }
+        self.authorize(host, body).await
+    }
+
+    /// authorizeSpaceSync at `host` with `body` as is.
+    pub async fn authorize(&self, host: &str, body: J) -> Resp {
+        let rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.authorizeSpaceSync"));
         resp(rb.json(&body).send().await.unwrap()).await
+    }
+
+    /// A fresh credential for `space` at `host`, registering `notify`
+    /// ({endpoint, token}): the response as is.
+    pub async fn authorize_notify(&self, host: &str, space: &str, notify: J) -> Resp {
+        let token = self.delegation_token(space).await.ok()["token"].as_str().unwrap().to_string();
+        let body = json!({"space": space, "credentialKey": self.holder.did, "delegationToken": token, "notify": notify});
+        self.authorize(host, body).await
     }
 
     /// A fresh delegation token for `space` exchanged at `host`, with an
@@ -326,8 +349,7 @@ impl SpaceClient {
     }
 }
 
-/// A credential call with a JSON body (registerNotify, unregisterNotify),
-/// signed by `holder`.
+/// A credential call with a JSON body, signed by `holder`.
 pub async fn signed_post_as(
     http: &reqwest::Client,
     holder: &Holder,
@@ -386,24 +408,30 @@ pub async fn signed_get_kem(
     let mut want = None;
     if let (Some(ty), Some(kem)) = (mac_type(nsid), kem) {
         let (share, secret) = mac::encapsulate(kem).unwrap();
-        rb = rb.header(mac::WANT_MAC_HEADER, mac::format_want_mac(ty, &share));
-        want = Some((ty, secret));
+        rb = rb.header(mac::ACCEPT_SIGNATURE, mac::format_request(ty, &share));
+        want = Some((ty, share, secret));
     }
     let r = resp(rb.send().await.unwrap()).await;
-    if let (Some((ty, secret)), 200) = (want, r.status) {
-        verify_mac(&r, nsid, ty, &secret, find("space").unwrap_or(""), find("repo").unwrap_or(""));
+    if let (Some((ty, share, secret)), 200) = (want, r.status) {
+        verify_mac(&r, nsid, ty, &share, &secret, find("space").unwrap_or(""), find("repo").unwrap_or(""));
     }
     r
 }
 
-pub fn mac_type(nsid: &str) -> Option<mac::MacType> {
+pub fn mac_type(nsid: &str) -> Option<mac::Profile> {
     match nsid {
-        "com.atproto.space.getRecord" => Some(mac::MacType::Record),
+        "com.atproto.space.getRecord" => Some(mac::Profile::Record),
         "com.atproto.space.getLatestCommit" | "com.atproto.space.listRepoOps" | "com.atproto.space.getRepo" => {
-            Some(mac::MacType::Repo)
+            Some(mac::Profile::Commit)
         }
         _ => None,
     }
+}
+
+/// A response header, every field line joined.
+pub fn header_of(r: &Resp, name: &str) -> Option<String> {
+    let lines: Vec<&str> = r.headers.get_all(name).iter().filter_map(|v| v.to_str().ok()).collect();
+    (!lines.is_empty()).then(|| lines.join(", "))
 }
 
 /// `repo`'s `#atproto_kem` key as `base` publishes it (describeRepo).
@@ -426,26 +454,21 @@ pub fn response_commit(r: &Resp, nsid: &str) -> Option<commit::Commit> {
     }
 }
 
-/// Asserts a response's MAC verifies under `secret` (and that one came
-/// with a commit or record, and none without).
-pub fn verify_mac(r: &Resp, nsid: &str, ty: mac::MacType, secret: &[u8; 32], space: &str, repo: &str) {
-    let header = r.headers.get(mac::MAC_HEADER).map(|v| v.to_str().unwrap().to_string());
-    let vary = r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains(mac::WANT_MAC_HEADER));
-    assert!(vary, "{nsid}: Vary names the MAC request header");
+/// Asserts a response's MAC verifies under `secret` for `share`, over the
+/// commit or record the response carries.
+pub fn verify_mac(r: &Resp, nsid: &str, ty: mac::Profile, share: &str, secret: &[u8; 32], space: &str, repo: &str) {
+    let vary = r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains("Accept-Signature"));
+    assert!(vary, "{nsid}: Vary names Accept-Signature");
+    let h = |name: &str| header_of(r, name);
     match ty {
-        mac::MacType::Record => {
-            let m = mac::parse_mac(header.as_deref(), ty).expect("a record MAC");
+        mac::Profile::Record => {
             let (uri, cid) = (r.json["uri"].as_str().unwrap(), r.json["cid"].as_str().unwrap());
-            let cid = vlatproto::cid::Cid::parse(cid).unwrap().to_bytes();
-            assert!(commit::verify_record(secret, uri, &cid, &m), "{nsid}: the record MAC verifies");
+            mac::verify_record(uri, cid, share, secret, &h).unwrap_or_else(|e| panic!("{nsid}: the record MAC: {e}"));
         }
-        mac::MacType::Repo => match response_commit(r, nsid) {
-            Some(c) => {
-                let m = mac::parse_mac(header.as_deref(), ty).expect("a commit MAC");
-                assert!(commit::verify(&c, space, repo, secret, &m), "{nsid}: the commit MAC verifies");
-            }
-            None => assert!(header.is_none(), "{nsid}: a page without a commit has no MAC"),
-        },
+        mac::Profile::Commit => {
+            let c = response_commit(r, nsid).unwrap_or_else(|| panic!("{nsid}: a commit"));
+            commit::verify(&c, space, repo, share, secret, &h).unwrap_or_else(|e| panic!("{nsid}: the commit MAC: {e}"));
+        }
     }
 }
 

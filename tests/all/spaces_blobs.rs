@@ -98,8 +98,8 @@ async fn space_blobs_are_served_only_through_their_space() {
     let other = owner.create_space(TYPE, "other").await;
     let r = owner
         .post(
-            "com.atproto.memberspace.putMember",
-            json!({"space": space, "did": member.did, "read": true, "write": false}),
+            "com.atproto.memberspace.putMembers",
+            json!({"space": space, "members": [{"did": member.did, "read": true, "write": false}]}),
         )
         .await;
     r.ok();
@@ -148,7 +148,7 @@ async fn space_blobs_are_served_only_through_their_space() {
     let r = s.xrpc.get("com.atproto.space.getBlob", &oq, &Auth::None).await;
     assert_eq!(r.status, 401, "{r:?}");
 
-    // listBlobs: one space's, in CID order, paged; `since` a rev
+    // listBlobs: one space's, in CID order, paged
     let mut both = vec![cid(&only), cid(&shared)];
     both.sort();
     let r = list(&s, &member, &cred, &space, o, &[]).await.ok();
@@ -164,17 +164,11 @@ async fn space_blobs_are_served_only_through_their_space() {
     assert_eq!((cids(&p3), p3.get("cursor")), (vec![], None));
     let r = owner.get("com.atproto.space.listBlobs", &[("space", &other), ("repo", &owner.did)]).await.ok();
     assert_eq!(cids(&r), vec![cid(&elsewhere)]);
-    let rev = owner.get("com.atproto.space.getLatestCommit", &[("space", &space), ("repo", &owner.did)]).await.ok()
-        ["commit"]["rev"]
-        .as_str()
-        .unwrap()
-        .to_string();
     let (later, _) = upload(&s, &owner, 5).await;
     // `a` now names `later` instead of `only`
     owner.put_record(&space, COLL, "a", rec("a2", &[&later])).await.ok();
-    let r = list(&s, &member, &cred, &space, o, &[("since", &rev)]).await.ok();
-    assert_eq!(cids(&r), vec![cid(&later)]);
-    list(&s, &member, &cred, &space, o, &[("since", "nope")]).await.err(400, "InvalidRequest");
+    let r = list(&s, &member, &cred, &space, o, &[]).await.ok();
+    assert!(cids(&r).contains(&cid(&later)) && !cids(&r).contains(&cid(&only)), "{r}");
     get(&s, &member, &cred, &space, o, &only).await.err(400, "BlobNotFound");
     assert_eq!(get(&s, &member, &cred, &space, o, &later).await.status, 200);
     s.get_blob(&owner.did, &cid(&later)).await.err(400, "BlobNotFound");

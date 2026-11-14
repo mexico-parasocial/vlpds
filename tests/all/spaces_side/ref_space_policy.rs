@@ -1,4 +1,4 @@
-//! Ported from the reference's `tests/space/policy.test.ts` (98ef3a6b):
+//! Ported from the reference's `tests/space/policy.test.ts` (16bfeba7):
 //! the `com.atproto.space` lifecycle methods and the baseline policies
 //! (`personalspace`, `memberspace`, `managedspace`), with the records a
 //! policy publishes. Each test names its reference case. The
@@ -32,7 +32,7 @@ async fn list_members(owner: &SpaceClient, space: &str) -> Resp {
 }
 
 fn uris(listed: &J) -> Vec<String> {
-    listed["spaces"].as_array().unwrap().iter().filter_map(|s| s["uri"].as_str().map(String::from)).collect()
+    listed["spaces"].as_array().unwrap().iter().filter_map(|s| s["space"].as_str().map(String::from)).collect()
 }
 
 fn create_body(skey: &str) -> J {
@@ -102,7 +102,38 @@ async fn filters_spaces_by_space_type() {
     assert_eq!(listed, [other]);
 }
 
-/// lifecycle: "refuses an owner write until createSpace"
+/// lifecycle: "lists the state of the caller's repo in each space": each
+/// account's repoRev and data, and the space's revision for its authority
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lists_the_state_of_the_callers_repo() {
+    let net = Net::new(1).await;
+    let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
+    let empty = net.create_space(&alice, SpaceOpts { skey: Some("list-state-empty"), ..Default::default() }).await;
+    write(&alice, &space, W::new()).await.ok();
+    write(&bob, &space, W::new()).await.ok();
+    net.await_writer(&alice, &space, &bob.did).await;
+    let authority = alice.did.clone();
+    for actor in [&alice, &bob] {
+        let (rev, hash) = repo_state(actor, &space).await.unwrap();
+        let v = listed_view(actor, &authority, &space).await.unwrap();
+        assert_eq!(v["repoRev"], json!(rev), "{v}");
+        assert_eq!(json_bytes(&hash), v["data"]);
+    }
+    let a = listed_view(&alice, &authority, &space).await.unwrap();
+    assert!(a["spaceRev"].is_string(), "the authority's view has the space's revision: {a}");
+    assert!(listed_view(&bob, &authority, &space).await.unwrap().get("spaceRev").is_none());
+    assert_eq!(listed_view(&alice, &authority, &empty).await.unwrap(), json!({"space": empty}));
+}
+
+/// `target`'s entry in `actor`'s listSpaces of `authority`'s spaces.
+async fn listed_view(actor: &SpaceClient, authority: &str, target: &str) -> Option<J> {
+    let r = actor.get("com.atproto.space.listSpaces", &[("spaceDid", authority)]).await.ok();
+    r["spaces"].as_array().unwrap().iter().find(|s| s["space"] == json!(target)).cloned()
+}
+
+/// lifecycle: "refuses an authority write until createSpace"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refuses_an_owner_write_until_create_space() {
     let net = Net::new(0).await;
@@ -118,8 +149,8 @@ async fn refuses_an_owner_write_until_create_space() {
 // memberspace members
 // ---------------------------------------------------------------------------
 
-/// memberspace members: "adds and removes members, and the owner is not
-/// one of them"
+/// memberspace members: "adds and removes members, and the authority is
+/// not one of them"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adds_and_removes_members() {
     let net = Net::new(1).await;
@@ -137,15 +168,15 @@ async fn adds_and_removes_members() {
     assert!(!member_dids(&list_members(&alice, &space).await.ok()).contains(&bob.did));
 }
 
-/// memberspace members: "refuses membership changes from a non-owner
-/// member"
+/// memberspace members: "refuses membership changes from a member other
+/// than the authority"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refuses_membership_changes_from_a_non_owner() {
     let net = Net::new(2).await;
     let (alice, dan, carol) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("carol", 2).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&dan], ..Default::default() }).await;
-    put_member(&dan, &space, &carol, true, true).await.err(400, "NotSpaceOwner");
-    remove_member(&dan, &space, &dan).await.err(400, "NotSpaceOwner");
+    put_member(&dan, &space, &carol, true, true).await.err(400, "NotAuthorized");
+    remove_member(&dan, &space, &dan).await.err(400, "NotAuthorized");
 }
 
 /// memberspace members: "refuses listMembers to a space credential and to
@@ -157,10 +188,10 @@ async fn refuses_list_members_to_a_credential_and_a_non_owner() {
     let space = net.create_space(&alice, SpaceOpts { members: &[&carol, &dan], ..Default::default() }).await;
     let cred = net.credential_for(&carol, &space).await;
     cred.get(&net.pds[0].url, "com.atproto.memberspace.listMembers", &[("space", &space)]).await.client_err();
-    list_members(&dan, &space).await.err(400, "NotSpaceOwner");
+    list_members(&dan, &space).await.err(400, "NotAuthorized");
 }
 
-/// memberspace members: "putMember replaces both access values"
+/// memberspace members: "putMembers replaces both access values"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_member_replaces_both_access_values() {
     let net = Net::new(1).await;
@@ -184,7 +215,7 @@ async fn refuses_member_methods_under_another_policy() {
     list_members(&alice, &space).await.err(400, "PolicyMismatch");
 }
 
-/// memberspace members: "removeMember drops the member from the writer set"
+/// memberspace members: "removeMembers drops the member from the writer set"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remove_member_drops_the_writer() {
     let net = Net::new(0).await;
@@ -196,7 +227,7 @@ async fn remove_member_drops_the_writer() {
     assert!(net.writer_dids(&alice, &space).await.is_empty());
 }
 
-/// memberspace members: "putMember drops the member from the writer set
+/// memberspace members: "putMembers drops the member from the writer set
 /// when it revokes write"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_member_without_write_drops_the_writer() {
@@ -211,6 +242,102 @@ async fn put_member_without_write_drops_the_writer() {
     assert!(net.writer_dids(&alice, &space).await.is_empty());
 }
 
+/// memberspace members: "tells registered syncers of the writers a member
+/// change removes"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tells_registered_syncers_of_removed_writers() {
+    let net = Net::new(0).await;
+    let (alice, dan, bob, carol) = (
+        net.actor("alice", 0).await,
+        net.actor("dan", 0).await,
+        net.actor("bob", 0).await,
+        net.actor("carol", 0).await,
+    );
+    let syncer = MockService::syncer().await;
+    let space = net.create_space(&alice, SpaceOpts { members: &[&dan, &bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    write(&dan, &space, W::new().text("from a member")).await.ok();
+    write(&bob, &space, W::new().text("from a member")).await.ok();
+    net.await_writer(&alice, &space, &bob.did).await;
+    net.await_writer(&alice, &space, &dan.did).await;
+    put_member(&alice, &space, &dan, true, false).await.ok();
+    remove_member(&alice, &space, &bob).await.ok();
+    let removed = || {
+        let mut v: Vec<String> = syncer
+            .space_updates()
+            .iter()
+            .filter(|u| u["$type"] == "com.atproto.space.defs#repoRemoved")
+            .map(|u| u["repo"].as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut want = vec![dan.did.clone(), bob.did.clone()];
+    want.sort();
+    for _ in 0..100 {
+        if removed() == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(removed(), want);
+}
+
+/// memberspace members: "applies a batch of member changes in a single
+/// commit"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applies_a_batch_of_member_changes_in_one_commit() {
+    let net = Net::new(1).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 1).await);
+    let space = net.create_space(&alice, with_policy(memberspace(json!({"publishMembers": true})))).await;
+    let member_ops = || async {
+        let ops = alice.get("com.atproto.space.listRepoOps", &[("space", &space), ("repo", &alice.did)]).await.ok();
+        ops["ops"].as_array().unwrap().iter().filter(|o| o["collection"] == MEMBER).cloned().collect::<Vec<J>>()
+    };
+    let members =
+        json!([{"did": bob.did, "read": true, "write": true}, {"did": carol.did, "read": true, "write": false}]);
+    alice.post("com.atproto.memberspace.putMembers", json!({"space": space, "members": members})).await.ok();
+    let added = member_ops().await;
+    assert_eq!(added.len(), 2);
+    assert_eq!(added[0]["rev"], added[1]["rev"]);
+    alice
+        .post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [bob.did, carol.did]}))
+        .await
+        .ok();
+    let removed: Vec<J> = member_ops().await.into_iter().filter(|o| o["cid"].is_null()).collect();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(removed[0]["rev"], removed[1]["rev"]);
+    assert_eq!(list_members(&alice, &space).await.ok()["members"], json!([]));
+}
+
+/// memberspace members: "takes the last entry for a member listed twice"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takes_the_last_entry_for_a_member_listed_twice() {
+    let net = Net::new(1).await;
+    let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
+    let space = net.create_space(&alice, with_policy(memberspace(json!({"publishMembers": true})))).await;
+    let members =
+        json!([{"did": bob.did, "read": true, "write": true}, {"did": bob.did, "read": true, "write": false}]);
+    alice.post("com.atproto.memberspace.putMembers", json!({"space": space, "members": members})).await.ok();
+    assert_eq!(
+        list_members(&alice, &space).await.ok()["members"],
+        json!([{"did": bob.did, "read": true, "write": false}])
+    );
+}
+
+/// memberspace members: "ignores a DID that is not a member, leaving it in
+/// the writer set"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ignores_a_did_that_is_not_a_member() {
+    let net = Net::new(0).await;
+    let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
+    let space = net.create_space(&alice, with_policy(memberspace(json!({"publicWrite": true})))).await;
+    write(&dan, &space, W::new().text("from a non-member")).await.ok();
+    assert_eq!(net.await_writer(&alice, &space, &dan.did).await, vec![dan.did.clone()]);
+    remove_member(&alice, &space, &dan).await.ok();
+    assert_eq!(net.writer_dids(&alice, &space).await, vec![dan.did.clone()]);
+}
+
 // ---------------------------------------------------------------------------
 // policy
 // ---------------------------------------------------------------------------
@@ -222,7 +349,7 @@ async fn persists_what_create_space_was_given() {
     let alice = net.actor("alice", 0).await;
     let space = net.create_space(&alice, with_policy(managedspace(FORUM))).await;
     let got = get_space(&alice, &space).await.ok();
-    assert_eq!(got["uri"], json!(space));
+    assert_eq!(got["space"], json!(space));
     assert_eq!(got["policy"], json!({"$type": MANAGEDSPACE, "managingApp": FORUM, "publishPolicy": false}));
 }
 
@@ -256,7 +383,7 @@ async fn keeps_the_member_list_across_a_configuration_change() {
     assert_eq!(member_dids(&list_members(&alice, &space).await.ok()), vec![bob.did.clone()]);
 }
 
-/// policy: "refuses an update from a non-owner" (bob's token, presented to
+/// policy: "refuses an update from an account other than the authority" (bob's token, presented to
 /// the authority's PDS and to his own)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refuses_an_update_from_a_non_owner() {
@@ -304,7 +431,7 @@ async fn refuses_the_policy_to_another_account() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&dan], ..Default::default() }).await;
-    get_space(&dan, &space).await.err(400, "NotSpaceOwner");
+    get_space(&dan, &space).await.err(400, "NotAuthorized");
 }
 
 /// policy: "refuses to answer for a space this host does not govern"
@@ -314,7 +441,7 @@ async fn refuses_to_answer_for_a_space_this_host_does_not_govern() {
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
     let cred = net.credential_for(&bob, &space).await;
-    cred.get(&net.pds[1].url, "com.atproto.space.listRepos", &[("space", &space)]).await.err(400, "SpaceNotFound");
+    cred.get(&net.pds[1].url, "com.atproto.space.listWriters", &[("space", &space)]).await.err(400, "SpaceNotFound");
     get_space(&bob, &space).await.client_err();
 }
 
@@ -421,10 +548,10 @@ async fn leaves_a_did_web_port_unencoded_in_its_record_key() {
     let space = net.create_space(&alice, with_policy(memberspace(json!({"publishMembers": true})))).await;
     let did = "did:web:localhost%3A2583";
     let member = json!({"space": space, "did": did, "read": true, "write": true});
-    alice.post("com.atproto.memberspace.putMember", member).await.ok();
+    alice.post("com.atproto.memberspace.putMembers", crate::common::spaces::one_member(&member)).await.ok();
     let got = published_members(&alice, &space).await;
     assert_eq!(got.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["did:web:localhost:2583"]);
-    alice.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": did})).await.ok();
+    alice.post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [did]})).await.ok();
     assert!(published_members(&alice, &space).await.is_empty());
 }
 
@@ -581,12 +708,13 @@ async fn mints_without_a_delegation_token_when_read_is_public() {
 }
 
 /// credential mint gates: "hides a $name space from a request without a
-/// delegation token" (memberspace, personalspace, managedspace)
+/// delegation token" (memberspace, personalspace; a managedspace asks its
+/// app)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hides_a_space_from_a_request_without_a_delegation_token() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
-    for policy in [memberspace(json!({})), personalspace(), managedspace("did:web:unreachable.invalid#forum")] {
+    for policy in [memberspace(json!({})), personalspace()] {
         let space = net.create_space(&alice, with_policy(policy.clone())).await;
         let r = net.public_credential(&space, None).await.0;
         assert_eq!(r.error_name(), Some("SpaceNotFound"), "{policy}: {r:?}");
@@ -674,15 +802,37 @@ async fn refuses_restricted_apps_without_an_attestation() {
 // managedspace policy
 // ---------------------------------------------------------------------------
 
-const CHECK_ACCESS: &str = "com.atproto.managedspace.checkUserAccess";
+const CHECK_ACCESS: &str = "com.atproto.managedspace.checkAccess";
 
-async fn forum(authorized: Option<bool>) -> MockService {
+/// A managing app answering checkAccess with `read`/`write` (None: a 500).
+async fn forum(access: Option<(bool, bool)>) -> MockService {
     let app = MockService::spawn(&[("atproto_forum", "AtprotoForum")]).await;
-    match authorized {
-        Some(a) => app.respond(200, json!({"authorized": a})),
+    match access {
+        Some((read, write)) => app.respond(200, json!({"read": read, "write": write})),
         None => app.respond(500, json!({"error": "InternalError"})),
     }
     app
+}
+
+/// The space's registrations as the authority holds them (`sG`), as the
+/// reference's `getRegistrations` reads its store.
+async fn registrations(net: &Net, authority: &SpaceClient, space: &str) -> usize {
+    let p = net.pds[0].app.partition(&authority.did).ok().unwrap();
+    let prefix =
+        vlpds::state::space_prefix(vlpds::state::SPACE_REG_FAMILY, &authority.did, &vlpds::state::space_id(space));
+    let mut it = p.db.scan(prefix.clone()..vlsync_store::keys::prefix_end(&prefix)).await.unwrap();
+    let mut n = 0;
+    while it.next().await.unwrap().is_some() {
+        n += 1;
+    }
+    n
+}
+
+/// A registration's credential lapsing (a day and a minute ago, however
+/// long ago it was), through the authority's worker.
+async fn lapse(net: &Net, space: &str, syncer: &MockService, token: &str) {
+    let at = vlatproto::tid::now_micros() - (24 * 3600 + 60) * 1_000_000;
+    vlpds::xrpc::space::set_registration_expiry(&net.pds[0].app, space, &syncer.url, token, at).await.unwrap();
 }
 
 /// managedspace policy: "admits a user the managing app authorizes"
@@ -690,15 +840,12 @@ async fn forum(authorized: Option<bool>) -> MockService {
 async fn managing_app_admits_a_user_it_authorizes() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
-    let app = forum(Some(true)).await;
+    let app = forum(Some((true, true))).await;
     let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
     assert!(!net.credential_for(&carol, &space).await.credential.is_empty());
     let asked = app.calls_to(CHECK_ACCESS);
     assert_eq!(asked.len(), 1);
-    assert_eq!(
-        (&asked[0].body["space"], &asked[0].body["user"], &asked[0].body["access"]),
-        (&json!(space), &json!(carol.did), &json!("read"))
-    );
+    assert_eq!(asked[0].body, json!({"space": space, "repo": carol.did}));
     // service auth from the authority, so the app can tell who asks
     let auth = asked[0].auth.as_deref().unwrap_or("");
     assert!(auth.starts_with("Bearer "), "{auth}");
@@ -706,123 +853,325 @@ async fn managing_app_admits_a_user_it_authorizes() {
     assert_eq!((&claims["iss"], &claims["lxm"]), (&json!(alice.did), &json!(CHECK_ACCESS)));
 }
 
-/// managedspace policy: "refuses a user the managing app declines"
+/// managedspace policy: "asks the managing app about a request with no
+/// delegation token"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managing_app_is_asked_without_a_delegation_token() {
+    let net = Net::new(0).await;
+    let alice = net.actor("alice", 0).await;
+    let app = forum(Some((true, false))).await;
+    let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
+    let (r, _) = net.public_credential(&space, None).await;
+    assert!(r.ok()["credential"].is_string());
+    let asked = app.calls_to(CHECK_ACCESS);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].body, json!({"space": space}));
+}
+
+/// managedspace policy: "refuses a user the managing app declines", and a
+/// request without a delegation token doesn't learn the space exists
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managing_app_refuses_a_user_it_declines() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
-    let app = forum(Some(false)).await;
+    let app = forum(Some((false, false))).await;
     let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
     let token = delegation_token(&carol, &space).await;
     net.mint_credential(&space, &token, None).await.0.err(400, "SpaceNotFound");
+    net.public_credential(&space, None).await.0.err(400, "SpaceNotFound");
 }
 
-/// managedspace policy: "denies when the managing app errors"
+/// managedspace policy: "fails without a credential when the managing app
+/// errors": no answer is a failure to retry, not a refusal
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managing_app_denies_when_it_errors() {
+async fn managing_app_errors_fail_upstream() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
     let app = forum(None).await;
     let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
     let token = delegation_token(&carol, &space).await;
-    net.mint_credential(&space, &token, None).await.0.err(400, "SpaceNotFound");
+    net.mint_credential(&space, &token, None).await.0.err(502, "UpstreamFailure");
 }
 
-/// managedspace policy: "denies when the managing app cannot be resolved"
+/// managedspace policy: "fails without a credential when the managing app
+/// cannot be resolved"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managing_app_denies_when_unresolvable() {
+async fn managing_app_unresolvable_fails_upstream() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
     let space = net.create_space(&alice, with_policy(managedspace("did:web:nonexistent.invalid#forum"))).await;
     let token = delegation_token(&carol, &space).await;
-    net.mint_credential(&space, &token, None).await.0.err(400, "SpaceNotFound");
+    net.mint_credential(&space, &token, None).await.0.err(502, "UpstreamFailure");
 }
 
-/// managedspace policy: "records a writer the managing app admits"
+/// managedspace policy: "keeps a registration through a managing app
+/// outage, and withdraws it on refusal"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managing_app_admits_a_writer() {
+async fn managing_app_outage_keeps_a_registration() {
+    let net = Net::new(2).await;
+    let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
+    let app = forum(Some((true, true))).await;
+    let syncer = MockService::syncer().await;
+    let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
+    let reauthorize = || net.credential_notify(&carol, &space, syncer.notify_registration("notify-token"));
+    reauthorize().await.ok();
+    assert_eq!(registrations(&net, &alice, &space).await, 1);
+    app.respond(500, json!({"error": "InternalError"}));
+    reauthorize().await.err(502, "UpstreamFailure");
+    assert_eq!(registrations(&net, &alice, &space).await, 1);
+    app.respond(200, json!({"read": false, "write": false}));
+    reauthorize().await.err(400, "SpaceNotFound");
+    assert_eq!(registrations(&net, &alice, &space).await, 0);
+}
+
+/// managedspace policy: "retries a write notification through a managing
+/// app outage": the space host's 502 leaves the writer's outbox row in
+/// place, and its retry lands once the app answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managing_app_outage_retries_a_write_notification() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
-    let app = forum(Some(true)).await;
+    let app = forum(None).await;
+    let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
+    let outbox = net.pds[1].app.spaces.as_ref().unwrap().outbox.clone();
+    outbox.set_retry_base(Duration::from_millis(200));
+    write(&bob, &space, W::new()).await.ok();
+    app.await_calls(CHECK_ACCESS, 1, Duration::from_secs(10)).await.expect("asked");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!net.writer_dids(&alice, &space).await.contains(&bob.did));
+    app.respond(200, json!({"read": false, "write": true}));
+    assert!(net.await_writer(&alice, &space, &bob.did).await.contains(&bob.did), "recorded on retry");
+}
+
+/// managedspace policy: "records a writer the managing app admits, even one
+/// it does not let read"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managing_app_admits_a_writer_it_does_not_let_read() {
+    let net = Net::new(1).await;
+    let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
+    let app = forum(Some((false, true))).await;
     let space = net.create_space(&alice, with_policy(managedspace(&app.service_ref()))).await;
     write(&bob, &space, W::new().text("admitted by the managing app")).await.ok();
     let dids = net.await_writer(&alice, &space, &bob.did).await;
     assert!(dids.contains(&bob.did), "{dids:?}");
     let asked = app.calls_to(CHECK_ACCESS);
-    let check = asked.iter().find(|c| c.body["user"] == json!(bob.did) && c.body["access"] == json!("write"));
-    assert!(check.is_some_and(|c| c.body.get("clientId").is_none()), "{asked:?}");
+    assert_eq!(asked[0].body, json!({"space": space, "repo": bob.did}));
+    let token = delegation_token(&bob, &space).await;
+    net.mint_credential(&space, &token, None).await.0.err(400, "SpaceNotFound");
 }
 
 // ---------------------------------------------------------------------------
 // notify registration
 // ---------------------------------------------------------------------------
 
-const NOTIFY_WRITE: &str = "com.atproto.space.notifyWrite";
+const CONFIRM: &str = "com.atproto.space.confirmRegistration";
+const UPDATE: &str = "com.atproto.space.notifySpaceUpdate";
+const REPO_WRITE: &str = "com.atproto.space.defs#repoWrite";
+const EXPIRED: &str = "com.atproto.space.notifySpaceUpdate#registrationExpired";
 
-/// notify registration: "registers, forwards writes, and stops once
-/// withdrawn"
+/// Waits until `svc` has had `n` notifySpaceUpdate calls.
+async fn updates(svc: &MockService, n: usize) -> Vec<J> {
+    svc.await_calls(UPDATE, n, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|| panic!("{n} updates: {:?}", svc.space_updates()));
+    svc.space_updates()
+}
+
+/// notify registration: "confirms a new registration, and forwards writes
+/// with its token"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn registers_forwards_writes_and_stops_once_withdrawn() {
+async fn confirms_a_registration_and_forwards_with_its_token() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
     let syncer = MockService::syncer().await;
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
-    let cred = net.credential_for(&carol, &space).await;
-    let pds1 = &net.pds[0].url;
-    let reg = json!({"space": space, "service": syncer.service_ref()});
-    let r = cred.post(pds1, "com.atproto.space.registerNotify", reg.clone()).await.ok();
-    assert!(r["expiresAt"].is_string(), "a registration says when it expires: {r}");
+    let r = net.credential_notify(&carol, &space, syncer.notify_registration("first-token")).await;
+    assert!(r.ok()["credential"].is_string());
+    let confirmations = syncer.calls_to(CONFIRM);
+    assert_eq!(confirmations.len(), 1);
+    assert_eq!(
+        (&confirmations[0].body["space"], &confirmations[0].body["token"]),
+        (&json!(space), &json!("first-token"))
+    );
+    assert!(confirmations[0].body["challenge"].is_string());
 
-    write(&bob, &space, W::new().text("forwarded")).await.ok();
-    let got = syncer.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(10)).await.expect("forwarded");
-    assert_eq!((&got[0].body["space"], &got[0].body["repo"]), (&json!(space), &json!(bob.did)));
+    write(&bob, &space, W::new()).await.ok();
+    updates(&syncer, 1).await;
+    let call = &syncer.calls_to(UPDATE)[0];
+    assert_eq!((&call.body["space"], &call.body["token"]), (&json!(space), &json!("first-token")));
+    assert_eq!((&call.body["update"]["$type"], &call.body["update"]["repo"]), (&json!(REPO_WRITE), &json!(bob.did)));
 
-    cred.post(pds1, "com.atproto.space.unregisterNotify", reg.clone()).await.ok();
-    let before = syncer.calls_to(NOTIFY_WRITE).len();
-    write(&bob, &space, W::new().text("not forwarded")).await.ok();
-    net.await_writer(&alice, &space, &bob.did).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(syncer.calls_to(NOTIFY_WRITE).len(), before, "delivered after unregistering");
-    cred.post(pds1, "com.atproto.space.unregisterNotify", reg).await.ok();
+    // renewing with the same token keeps one registration, unconfirmed
+    net.credential_notify(&carol, &space, syncer.notify_registration("first-token")).await.ok();
+    assert_eq!(registrations(&net, &alice, &space).await, 1);
+    assert_eq!(syncer.calls_to(CONFIRM).len(), 1);
 }
 
-/// notify registration: "stops delivering to a registration past its
-/// expiry, and resumes on renewal". The reference backdates the row in its
-/// store; here the test hook expires it through the authority's worker.
-/// vlpds prunes an expired registration rather than withholding it, and a
-/// renewal registers it again either way.
+/// notify registration: "treats a different token as a separate
+/// registration"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stops_past_expiry_and_resumes_on_renewal() {
+async fn a_different_token_is_a_separate_registration() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
     let syncer = MockService::syncer().await;
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
-    let cred = net.credential_for(&carol, &space).await;
-    let pds1 = &net.pds[0].url;
-    let reg = json!({"space": space, "service": syncer.service_ref()});
-    cred.post(pds1, "com.atproto.space.registerNotify", reg.clone()).await.ok();
-    let expired = vlatproto::tid::now_micros() - 1_000_000;
-    vlpds::xrpc::space::set_registration_expiry(&net.pds[0].app, &space, &syncer.service_ref(), expired).await.unwrap();
-
-    write(&bob, &space, W::new().text("after expiry")).await.ok();
-    net.await_writer(&alice, &space, &bob.did).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(syncer.calls_to(NOTIFY_WRITE).len(), 0, "delivered past its expiry");
-
-    cred.post(pds1, "com.atproto.space.registerNotify", reg).await.ok();
-    write(&bob, &space, W::new().text("after renewal")).await.ok();
-    syncer.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(10)).await.expect("forwarded after renewal");
+    for token in ["first-token", "second-token"] {
+        net.credential_notify(&carol, &space, syncer.notify_registration(token)).await.ok();
+    }
+    write(&bob, &space, W::new()).await.ok();
+    updates(&syncer, 2).await;
+    let mut tokens: Vec<String> =
+        syncer.calls_to(UPDATE).iter().map(|c| c.body["token"].as_str().unwrap().to_string()).collect();
+    tokens.sort();
+    assert_eq!(tokens, ["first-token", "second-token"]);
 }
 
-/// notify registration: "refuses a service that cannot be resolved"
+/// notify registration: "refuses an authorization whose registration is
+/// not confirmed"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn refuses_a_service_that_cannot_be_resolved() {
+async fn refuses_an_unconfirmed_registration() {
     let net = Net::new(2).await;
-    let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
-    let space = net.create_space(&alice, SpaceOpts { members: &[&carol], ..Default::default() }).await;
-    let cred = net.credential_for(&carol, &space).await;
-    let body = json!({"space": space, "service": "did:web:nonexistent.invalid#syncer"});
-    cred.post(&net.pds[0].url, "com.atproto.space.registerNotify", body).await.err(400, "ServiceNotResolvable");
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    syncer.confirm_registrations(false);
+    syncer.respond(200, json!({"challenge": "not-the-one"}));
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token"))
+        .await
+        .err(400, "RegistrationNotConfirmed");
+    assert_eq!(registrations(&net, &alice, &space).await, 0);
+}
+
+/// notify registration: "sends a lapsed registration an expiry notice in
+/// place of the next update, then nothing more", and reauthorizing renews it
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapsed_registration_gets_one_expiry_notice() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    lapse(&net, &space, &syncer, "notify-token").await;
+
+    write(&bob, &space, W::new()).await.ok();
+    let got = updates(&syncer, 1).await;
+    let cred = net.credential_for(&alice, &space).await;
+    let listed = cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &[("space", &space)]).await.ok();
+    assert_eq!(got, [json!({"$type": EXPIRED, "spaceRev": listed["cursor"]})]);
+
+    write(&bob, &space, W::new()).await.ok();
+    net.await_writer(&alice, &space, &bob.did).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(syncer.space_updates().len(), 1, "nothing more");
+    assert_eq!(registrations(&net, &alice, &space).await, 1, "kept, for a deletion notice");
+
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    write(&bob, &space, W::new()).await.ok();
+    let got = updates(&syncer, 2).await;
+    assert_eq!(got[1]["$type"], json!(REPO_WRITE));
+}
+
+/// notify registration: "unregisters a syncer that rejects its expiry
+/// notice", and registering again is confirmed again
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unregisters_a_syncer_that_rejects_its_expiry_notice() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    syncer.respond(400, json!({"error": "InvalidToken"}));
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    lapse(&net, &space, &syncer, "notify-token").await;
+    write(&bob, &space, W::new()).await.ok();
+    updates(&syncer, 1).await;
+    for _ in 0..100 {
+        if registrations(&net, &alice, &space).await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(registrations(&net, &alice, &space).await, 0);
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    assert_eq!(syncer.calls_to(CONFIRM).len(), 2);
+}
+
+/// notify registration: "retries an expiry notice through a transient
+/// failure"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retries_an_expiry_notice_through_a_transient_failure() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    syncer.respond(503, json!({}));
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    lapse(&net, &space, &syncer, "notify-token").await;
+    write(&bob, &space, W::new()).await.ok();
+    updates(&syncer, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    syncer.respond(200, json!({}));
+    let ahead = vlatproto::tid::now_micros() + 3_600_000_000;
+    assert_eq!(vlpds::space::notices::retry_due(&net.pds[0].app, ahead).await.unwrap(), 1);
+    let kinds: Vec<J> = syncer.space_updates().iter().map(|u| u["$type"].clone()).collect();
+    assert_eq!(kinds, [json!(EXPIRED), json!(EXPIRED)]);
+    assert_eq!(registrations(&net, &alice, &space).await, 1);
+}
+
+/// notify registration: "keeps an active registration through a rejected
+/// update": updates are best effort, and only a rejected expiry notice
+/// unregisters
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeps_an_active_registration_through_a_rejected_update() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    syncer.respond(401, json!({"error": "InvalidToken"}));
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("notify-token")).await.ok();
+    write(&bob, &space, W::new()).await.ok();
+    updates(&syncer, 1).await;
+    assert_eq!(registrations(&net, &alice, &space).await, 1);
+    syncer.respond(200, json!({}));
+    write(&bob, &space, W::new()).await.ok();
+    updates(&syncer, 2).await;
+}
+
+/// notify registration: "withdraws the registration carried by a refused
+/// authorization", and a guessed token withdraws nothing
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdraws_the_registration_a_refused_authorization_carries() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, syncer.notify_registration("syncer-token")).await.ok();
+    remove_member(&alice, &space, &carol).await.ok();
+    net.credential_notify(&carol, &space, syncer.notify_registration("guessed-token")).await.err(400, "SpaceNotFound");
+    assert_eq!(registrations(&net, &alice, &space).await, 1);
+    net.credential_notify(&carol, &space, syncer.notify_registration("syncer-token")).await.err(400, "SpaceNotFound");
+    assert_eq!(registrations(&net, &alice, &space).await, 0);
+    write(&bob, &space, W::new()).await.ok();
+    net.await_writer(&alice, &space, &bob.did).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(syncer.space_updates().is_empty());
+}
+
+/// notify registration: "delivers to each registration without waiting on
+/// a slow one"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivers_to_each_registration_without_waiting_on_a_slow_one() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let slow = MockService::syncer().await;
+    let fast = MockService::syncer().await;
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    net.credential_notify(&carol, &space, slow.notify_registration("a-slow-token")).await.ok();
+    net.credential_notify(&carol, &space, fast.notify_registration("b-fast-token")).await.ok();
+    let held = slow.gate.clone().lock_owned().await;
+    write(&bob, &space, W::new()).await.ok();
+    assert!(fast.await_calls(UPDATE, 1, Duration::from_secs(2)).await.is_some(), "the fast one waited");
+    drop(held);
+    slow.await_calls(UPDATE, 1, Duration::from_secs(10)).await.expect("the slow one, once released");
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +1209,7 @@ async fn delete_purges_the_authority_repo_and_keeps_a_tombstone() {
     delete_space(&alice, &space).await.ok();
 }
 
-/// deletion: "answers SpaceDeleted on credential renewal"
+/// deletion: "answers SpaceDeleted on reauthorization"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn answers_space_deleted_on_credential_renewal() {
     let net = Net::new(2).await;
@@ -881,24 +1230,48 @@ async fn answers_space_deleted_without_a_delegation_token() {
     net.public_credential(&space, None).await.0.err(400, "SpaceDeleted");
 }
 
-/// deletion: "notifies registered syncers"
+/// deletion: "answers SpaceDeleted regardless of the request
+/// authorization"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_space_deleted_regardless_of_authorization() {
+    let net = Net::new(2).await;
+    let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
+    let space = net.create_space(&alice, SpaceOpts { members: &[&carol], ..Default::default() }).await;
+    delete_space(&alice, &space).await.ok();
+    net.mint_credential(&space, "not-a-delegation-token", None).await.0.err(400, "SpaceDeleted");
+}
+
+/// deletion: "notifies registered syncers, including lapsed
+/// registrations": one that had its expiry notice gets the deletion notice
+/// too
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_notifies_registered_syncers() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
-    let syncer = MockService::syncer().await;
+    let (syncer, lapsed) = (MockService::syncer().await, MockService::syncer().await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&carol], ..Default::default() }).await;
-    let cred = net.credential_for(&carol, &space).await;
-    let reg = json!({"space": space, "service": syncer.service_ref()});
-    cred.post(&net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    for svc in [&syncer, &lapsed] {
+        net.credential_notify(&carol, &space, svc.notify_registration("notify-token")).await.ok();
+    }
+    lapse(&net, &space, &lapsed, "notify-token").await;
+    write(&alice, &space, W::new()).await.ok();
+    updates(&lapsed, 1).await;
     delete_space(&alice, &space).await.ok();
-    let got = syncer
-        .await_calls("com.atproto.space.notifySpaceDeleted", 1, Duration::from_secs(10))
-        .await
-        .expect("notifySpaceDeleted");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(syncer.calls_to("com.atproto.space.notifySpaceDeleted").len(), 1);
-    assert_eq!(got[0].body["space"], json!(space));
+    let deleted = json!({"$type": "com.atproto.space.notifySpaceUpdate#spaceDeleted"});
+    for svc in [&syncer, &lapsed] {
+        for _ in 0..200 {
+            if svc.space_updates().last() == Some(&deleted) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let last = svc.calls_to(UPDATE).last().cloned().expect("told");
+        assert_eq!(last.body, json!({"space": space, "token": "notify-token", "update": deleted}));
+    }
+    assert_eq!(
+        lapsed.space_updates(),
+        [json!({"$type": EXPIRED, "spaceRev": lapsed.space_updates()[0]["spaceRev"]}), deleted]
+    );
 }
 
 /// deletion: "leaves a member repo untouched"

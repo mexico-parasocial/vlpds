@@ -11,7 +11,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { crc32, deflateSync } from 'node:zlib'
 import { P256Keypair } from '@atproto/crypto'
-import { RECORD_MAC_TYPE } from '@atproto/space'
+import { RECORD_MAC_PROFILE } from '@atproto/space'
 import { Actor, RUN } from '../lib/actor.mjs'
 import { HOSTS, PORTS, VLPDS_ADMIN_TOKEN, log } from '../lib/env.mjs'
 import { NotImplemented, attempt, hfetch, rawXrpc, setTimingScope, sleep, waitFor } from '../lib/http.mjs'
@@ -191,15 +191,20 @@ async function listOwn(actor, space) {
   return out
 }
 
-async function listReposAll(cred, space) {
+/** The writer set from listWriters: repo -> its repoWrite entry (a removed writer isn't in it). */
+async function listWritersAll(cred, space) {
   const out = new Map()
   let cursor
   const host = await cred.hostClient()
   for (;;) {
-    const r = await host.com.atproto.space.listRepos({ space, cursor, limit: 100 })
+    const r = await host.com.atproto.space.listWriters({ space, cursor, limit: 100 })
     if (!r.data.repos.length) break
-    for (const e of r.data.repos) out.set(e.did, e)
+    for (const e of r.data.repos) {
+      if (e.$type === 'com.atproto.space.defs#repoRemoved') out.delete(e.repo)
+      else out.set(e.repo, e)
+    }
     cursor = r.data.cursor
+    if (!cursor) break
   }
   return out
 }
@@ -418,13 +423,13 @@ export async function runConfig(rep, cfg, env) {
     check(bobRepo.data.records.some((r) => `${S.board}/${S.bob.did}/${r.collection}/${r.rkey}` === S.P1 || r.uri === S.P1), 'dave reads bob\'s repo with his credential')
     const posts = await S.av.dave.getPosts(B, 'new')
     check(posts.posts.length === 3, 'dave reads the board through the appview', posts.posts.length)
-    const before = (await listReposAll(cred, B)).get(S.dave.did)
+    const before = (await listWritersAll(cred, B)).get(S.dave.did)
     const own = await attempt(() => S.daveC.comment(B, S.P1, `lurker talking ${SENTINEL}`))
     // reference rule: a read-only member may write its own repo; the authority just doesn't track it
     if (own.ok || own === undefined) rep.note(`${label}: dave's (read-only) comment was accepted by his host (reference rule: write governs tracking only)`)
     S.daveVote = await attempt(() => S.daveC.vote(B, S.P2, 'up'))
     await sleep(2500)
-    const listed = await listReposAll(cred, B)
+    const listed = await listWritersAll(cred, B)
     check(!before && !listed.has(S.dave.did), 'the authority does not track the lurker\'s repo')
     const th = await S.av.dave.getPostThread(S.P1)
     check(!JSON.stringify(th).includes('lurker talking'), "the lurker's comment never shows on the appview")
@@ -491,7 +496,7 @@ export async function runConfig(rep, cfg, env) {
     const B = S.board
     const oldCred = await S.carolC.credential(B)
     const daveCred = await S.daveC.credential(B)
-    const listed0 = (await listReposAll(daveCred, B)).get(S.carol.did)
+    const listed0 = (await listWritersAll(daveCred, B)).get(S.carol.did)
     await S.aliceC.removeMember(B, S.carol.did)
     const members = await S.aliceC.listMembers(B)
     check(!members.some((m) => m.did === S.carol.did), 'carol is off the member list')
@@ -500,8 +505,8 @@ export async function runConfig(rep, cfg, env) {
     const late = await attempt(() => S.carolC.comment(B, S.P1, `after removal ${SENTINEL}`))
     rep.note(`${label}: carol's write after removal: ${late.ok !== false ? 'accepted by her host' : `refused (${errName(late)})`}`)
     await sleep(2500)
-    const listed1 = (await listReposAll(daveCred, B)).get(S.carol.did)
-    check(listed0 && !listed1, 'removeMember drops carol from the writer set: listRepos no longer names her', `${listed0?.repoRev} -> ${listed1?.repoRev}`)
+    const listed1 = (await listWritersAll(daveCred, B)).get(S.carol.did)
+    check(listed0 && !listed1, 'removeMembers drops carol from the writer set: listWriters lists her as removed', `${listed0?.repoRev} -> ${listed1?.repoRev}`)
     const conv = await converge(() => compareView(S.av.dave, B, model(), { karma: [S.alice.did, S.bob.did, S.carol.did] }))
     check(!conv.diffs.length, `the appview hides carol's posts, comments and votes (${conv.ms} ms)`, conv.diffs.slice(0, 4).join('; '))
     const p1 = (await S.av.dave.getPosts(B, 'new')).posts.find((p) => p.uri === S.P1)
@@ -510,9 +515,9 @@ export async function runConfig(rep, cfg, env) {
     check(th.replies[0]?.deleted && th.replies[0].uri === S.c1 && th.replies[0].replies[0]?.uri === S.r1, "r1 hangs under a placeholder for carol's hidden c1", JSON.stringify(normTree(th.replies)))
     const oldRead = await attempt(async () => (await oldCred.repoClient(S.bob.did)).com.atproto.space.listRecords({ space: B, repo: S.bob.did }))
     rep.note(`${label}: carol's credential minted before removal ${oldRead.ok ? `still reads bob's repo until it expires (${Math.round(oldCred.expiresInMs() / 1000)} s left)` : `is refused (${errName(oldRead)})`}; the credential names no holder, so neither host nor appview can tell it's hers without a revocation`)
-    // the appview's syncer still holds the copy it had (removal isn't announced), which is why boards hides removed members by settings
-    const held = S.appview.boards.get(B)?.syncer.repos.has(S.carol.did)
-    rep.note(`${label}: after carol's removal the appview's syncer ${held ? 'still holds' : 'no longer holds'} her repo; a syncer starting now never pulls it (listRepos doesn't name her)`)
+    // the removal is sequenced and sent as repoRemoved, so the appview's syncer lets her repo go; boards hides removed members by settings either way
+    const dropped = await waitFor('carol dropped by the syncer', () => !S.appview.boards.get(B)?.syncer.repos.has(S.carol.did), { timeoutMs: 15_000 }).catch(() => false)
+    check(dropped, "the appview's syncer drops carol's repo on the repoRemoved update")
   }, { needs: ['2.post-comment-vote'] })
 
   await step('6.takedown', async (check) => {
@@ -532,15 +537,15 @@ export async function runConfig(rep, cfg, env) {
       const cred = await credentialFor(S.dave, B)
       const cl = await cred.repoClient(S.bob.did)
       const u = parseRecordUri(S.P1)
-      const g = await attempt(() => cred.macRead(S.bob.did, RECORD_MAC_TYPE, (c, opts) => c.com.atproto.space.getRecord({ space: B, repo: S.bob.did, collection: u.collection, rkey: u.rkey }, opts)).then((r) => r.res))
+      const g = await attempt(() => cred.macRead(S.bob.did, RECORD_MAC_PROFILE, (c, opts) => c.com.atproto.space.getRecord({ space: B, repo: S.bob.did, collection: u.collection, rkey: u.rkey }, opts)).then((r) => r.res))
       check(!g.ok && g.error === 'RecordNotFound', 'getRecord answers RecordNotFound', errName(g))
       const lr = await cl.com.atproto.space.listRecords({ space: B, repo: S.bob.did, limit: 100 })
       check(!lr.data.records.some((r) => r.uri === S.P1 || String(r.rkey) === u.rkey), 'listRecords leaves it out')
       const blob = await attempt(() => cl.com.atproto.space.getBlob({ space: B, repo: S.bob.did, cid: S.imgCid }))
       check(!blob.ok && blob.error === 'BlobNotFound', 'its image answers BlobNotFound', errName(blob))
       const head = await headOf(cred, B, S.bob.did)
-      const listedData = (await listReposAll(cred, B)).get(S.bob.did)?.data
-      rep.note(`${label}: during the takedown, listRepos' data for bob ${Buffer.from(listedData ?? []).equals(Buffer.from(head.data)) ? 'matches' : 'differs from'} his takedown-adjusted head (same rev ${head.rev}); syncers learn of a takedown only by pulling the repo`)
+      const listedData = (await listWritersAll(cred, B)).get(S.bob.did)?.data
+      rep.note(`${label}: during the takedown, listWriters' data for bob ${Buffer.from(listedData ?? []).equals(Buffer.from(head.data)) ? 'matches' : 'differs from'} his takedown-adjusted head (same rev ${head.rev}); syncers learn of a takedown only by pulling the repo`)
       const conv = await converge(() => compareView(av, B, model(), { karma: [S.alice.did, S.bob.did] }), 20_000, 200)
       check(!conv.diffs.length, `the appview converges on the board without P1 (${conv.ms} ms, poll-driven)`, conv.diffs.slice(0, 4).join('; '))
       rep.metrics[`${label}.takedown_to_appview_ms`] = conv.ms
@@ -554,7 +559,7 @@ export async function runConfig(rep, cfg, env) {
         const seen = new Set(before.json.entries.map((e) => e.id))
         check(after.json.entries.some((e) => !seen.has(e.id) && JSON.stringify(e).includes(u.rkey)), 'the read is in the audit log')
       } else rep.note(`${label}: getAuditLog ${before.status}; audit unchecked`)
-      const asMember = await attempt(() => cred.macRead(S.bob.did, RECORD_MAC_TYPE, (c, opts) => c.com.atproto.space.getRecord({ space: B, repo: S.bob.did, collection: u.collection, rkey: u.rkey }, opts)).then((r) => r.res))
+      const asMember = await attempt(() => cred.macRead(S.bob.did, RECORD_MAC_PROFILE, (c, opts) => c.com.atproto.space.getRecord({ space: B, repo: S.bob.did, collection: u.collection, rkey: u.rkey }, opts)).then((r) => r.res))
       check(!asMember.ok, 'members still can\'t read it')
     } finally {
       const off = await set(false)
@@ -603,9 +608,10 @@ export async function runConfig(rep, cfg, env) {
     const B = S.board
     await S.aliceC.deleteBoard(B)
     const c = await attempt(() => credentialFor(S.bob, B).then((data) => ({ data })))
-    check(!c.ok && c.error === 'SpaceDeleted', 'getSpaceCredential answers SpaceDeleted', errName(c))
-    const told = await waitFor('notifySpaceDeleted', () => S.svc.callsTo('com.atproto.space.notifySpaceDeleted', B).length > 0, { timeoutMs: 15_000 }).catch(() => false)
-    check(told, 'the appview got notifySpaceDeleted')
+    check(!c.ok && c.error === 'SpaceDeleted', 'authorizeSpaceSync answers SpaceDeleted', errName(c))
+    const deleted = () => S.svc.callsTo('com.atproto.space.notifySpaceUpdate', B).some((c) => c.body?.update?.$type === 'com.atproto.space.notifySpaceUpdate#spaceDeleted')
+    const told = await waitFor('spaceDeleted', deleted, { timeoutMs: 15_000 }).catch(() => false)
+    check(told, 'the appview got a spaceDeleted notice')
     const gone = await converge(async () => {
       const r = await S.av.bob.call('dev.example.boards.getBoard', null, { params: { board: B }, cred: (await S.bobC.credential(B).catch(() => null)) ?? S.bobC.creds.get(B) })
       return r.error === 'BoardNotFound' ? [] : [`getBoard ${r.status} ${r.error}`]
@@ -823,7 +829,7 @@ export async function runConfig(rep, cfg, env) {
     const deadline = Date.now() + 240_000
     let behind = []
     for (;;) {
-      const listed = await listReposAll(cred, B)
+      const listed = await listWritersAll(cred, B)
       behind = []
       for (const a of crowd) {
         if (!truth.repo(B, a.did).size && !listed.has(a.did)) continue
@@ -833,7 +839,7 @@ export async function runConfig(rep, cfg, env) {
       if (!behind.length || Date.now() > deadline) break
       await sleep(2000)
     }
-    check(!behind.length, 'listRepos has every writer at its head after failover', behind.slice(0, 3).join('; '))
+    check(!behind.length, 'listWriters has every writer at its head after failover', behind.slice(0, 3).join('; '))
     rep.metrics[`${label}.fault`] = { down_ms: S.fault?.downMs, acked_during_outage: stats.ackedDuringOutage, uncertain: stats.uncertain }
   }
 }

@@ -85,8 +85,9 @@ class Node {
     this.lastOps = new Map()
     mkdirSync(OUT, { recursive: true })
     const logf = createWriteStream(`${OUT}vlpds-n${this.i}.log`, { flags: 'a' })
-    logf.write(`\n==== start ${this.starts} ${new Date().toISOString()} ${BIN} ${this.args().join(' ')}\n`)
-    this.proc = spawn(BIN, this.args(), { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    const bin = this.opts.bin ?? BIN
+    logf.write(`\n==== start ${this.starts} ${new Date().toISOString()} ${bin} ${this.args().join(' ')}\n`)
+    this.proc = spawn(bin, this.args(), { env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     this.proc.stdout.pipe(logf)
     this.proc.stderr.pipe(logf)
     this.exited = new Promise((r) => this.proc.once('exit', (code, sig) => r({ code, sig })))
@@ -118,17 +119,18 @@ class Node {
 }
 
 export class Vlpds {
-  constructor({ cluster = false, memory = false, prefix = R2 ? R2.prefix : `spaces-${Date.now().toString(36)}`, extra = [] } = {}) {
+  /** `bin`: another vlpds binary than VLPDS_BIN (an older build, for the stored-data migration run). */
+  constructor({ cluster = false, memory = false, prefix = R2 ? R2.prefix : `spaces-${Date.now().toString(36)}`, extra = [], bin } = {}) {
     if (R2 && !(R2.endpoint && R2.bucket && R2.prefix && process.env.AWS_ACCESS_KEY_ID)) throw new Error('STORE=r2 needs VLPDS_BENCH_ENDPOINT, VLPDS_BENCH_BUCKET, R2_PREFIX and the AWS_* keys (run.sh loads them)')
     this.cluster = cluster
     this.prefix = prefix
-    const opts = { cluster, memory, prefix, extra }
+    const opts = { cluster, memory, prefix, extra, bin }
     this.nodes = cluster ? [0, 1, 2].map((i) => new Node(i, opts)) : [new Node(0, opts)]
     this.rr = 0
   }
 
   async start() {
-    if (!BIN) throw new Error('VLPDS_BIN is not set (run.sh builds it)')
+    if (!(this.nodes[0].opts.bin ?? BIN)) throw new Error('VLPDS_BIN is not set (run.sh builds it)')
     // a driver that dies (a node that never got healthy, say) must not leave the others running
     if (!this.exitHook) process.once('exit', (this.exitHook = () => this.nodes.forEach((n) => n.alive() && n.proc.kill('SIGKILL'))))
     if (this.cluster) {

@@ -137,6 +137,11 @@ spaces-fault seed="1" scale="small":
 spaces-cost host="vlpds" steps="":
     bench/spaces/run.sh cost {{host}} {{steps}}
 
+# Spaces stored data across an upgrade: an older vlpds binary writes spaces on its wire, then this build serves
+# them from the same bucket (old= the older binary's path)
+spaces-migrate old:
+    OLD_VLPDS_BIN={{old}} bench/spaces/run.sh migrate
+
 # boards (packages/boards), a Reddit-like private board on Spaces (bench/spaces/boards/README.md): user stories against
 # its appview's API and direct space reads (configs: all-vlpds vlpds-owner ref-owner; default all; CLUSTER=1 adds the kill -9 story)
 spaces-boards *configs:

@@ -1,5 +1,5 @@
 //! Revocation across a cluster (plan §2.6, phase 2): a credential revoked
-//! with notifyCredentialRevoked on one node is refused on every other node
+//! with notifyCredentialsRevoked on one node is refused on every other node
 //! within 1 s of the 200, including nodes that had it cached; and it stays
 //! refused on a node that restarts, one that was down when it was revoked
 //! (its nudge never arrived), and one that joins afterwards.
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use vlpds::space::token::{self, Mint, TokenType};
 
 const SHARDS: u32 = 6;
-const REVOKE: &str = "com.atproto.space.notifyCredentialRevoked";
+const REVOKE: &str = "com.atproto.space.notifyCredentialsRevoked";
 const SLA: Duration = Duration::from_secs(1);
 
 type Bucket = Arc<object_store::memory::InMemory>;
@@ -52,7 +52,7 @@ impl Fixture {
         let member = SpaceClient::new(owner, &unique_name("rvm"), &scope).await;
         let space = auth.create_space(&st, "rv").await;
         let m = json!({"space": space, "did": member.did, "read": true, "write": true});
-        auth.post("com.atproto.memberspace.putMember", m).await.ok();
+        auth.post("com.atproto.memberspace.putMembers", crate::common::spaces::one_member(&m)).await.ok();
         let rec = json!({"$type": collection, "text": "revocation target", "createdAt": now_iso()});
         member.create_record(&space, &collection, Some("r"), rec).await.ok();
         Fixture { auth, member, space, collection, http: reqwest::Client::new() }
@@ -137,7 +137,7 @@ async fn a_revocation_on_one_node_is_refused_on_every_node_within_a_second() {
     let sent = Instant::now();
     fx.revoke(&n3, &[&revoked]).await.ok();
     let acked = Instant::now();
-    eprintln!("notifyCredentialRevoked took {:?}", acked - sent);
+    eprintln!("notifyCredentialsRevoked took {:?}", acked - sent);
     for n in nodes {
         let id = &cluster(n).cfg.node_id;
         let took = refused_within(&fx, n, &revoked, acked, id).await;

@@ -4,7 +4,7 @@
 // the bare `space:dev.example.boards.board` grant resolves) stands in for real
 // PDSes, the local PLC for plc.directory, and the server runs as a
 // confidential OAuth client at http://boards.localhost:2889 (PORT_BASE + 29)
-// with its notify target did:web:127.0.0.1%3A2889. It seeds a board (alice
+// with that URL as its notify endpoint. It seeds a board (alice
 // owns it, bob writes, carol and dave aren't in it yet), writes the server's
 // env and the accounts to boards/.local/prod-seed.json (LOCAL_DIR; git
 // ignored, test-only values), and waits. With START_SERVER=1 it runs the server too (until Ctrl-C);

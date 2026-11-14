@@ -36,4 +36,5 @@ mod ref_space_records;
 mod ref_space_scope;
 mod ref_space_sync;
 mod space_deleted;
+mod stored_legacy;
 mod takedowns;

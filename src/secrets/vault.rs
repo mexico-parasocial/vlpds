@@ -492,10 +492,10 @@ impl VaultClient {
 
     fn can_reauth(&self) -> bool {
         #[cfg(test)]
-        if matches!(self.auth, VaultAuth::Static(_)) {
-            return false;
-        }
-        true
+        let is_static = matches!(self.auth, VaultAuth::Static(_));
+        #[cfg(not(test))]
+        let is_static = false;
+        !is_static
     }
 }
 

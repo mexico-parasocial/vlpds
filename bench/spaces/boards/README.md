@@ -48,8 +48,8 @@ stack can't reach, so the client asks for explicit `collection=` scopes. When th
 reports not impl.
 
 `packages/boards/src/appview.mjs` is the indexer and API. The owner adds the appview's account as a read-only member and
-calls `indexBoard`. The appview registers for notifies and syncs every member repo with the
-app's `SpaceSyncer` (listRepos from a spaceRev checkpoint, listRepoOps with a running LtHash checked
+calls `indexBoard`. The appview registers its notify endpoint with each authorization and syncs every member repo with the
+app's `SpaceSyncer` (listWriters from a spaceRev checkpoint, listRepoOps with a running LtHash checked
 against the commit once its MAC verifies, a verified STAR getRepo on a mismatch). It holds nothing it didn't get that
 way. A poll every 2 s catches what nothing pushes, which today is a record takedown. `src/model.mjs`
 turns the synced repos into the board, and the scenario runner runs the same function over the
@@ -59,14 +59,14 @@ The API is XRPC-style: `dev.example.boards.getBoard`, `getPosts?sort=hot|new|top
 `getKarma`, `getImage` (the appview fetches the blob with its own credential) and `getIndexState`.
 Every call needs a space credential the board's owner issued, signed for the appview's DID. So a
 non-member can't read a board through the appview either, and the appview honours the owner's
-`notifyCredentialRevoked`.
+`notifyCredentialsRevoked`.
 
 The board rules, as `model.mjs` has them:
 
 - A removed member's posts, comments and votes are hidden. Removal takes the member out of the
-  writer set, so listRepos stops naming them, but it isn't announced: a syncer that already holds
-  their repo keeps it, and one that starts later never pulls it. Hiding by `settings.removed` gives
-  every appview the same board.
+  writer set: listWriters lists them as removed, and syncers get a `repoRemoved` update and let
+  their repo go. Hiding by `settings.removed` as well gives every appview the same board, whatever
+  it has synced.
 - A comment whose post is gone isn't shown. A reply whose parent is gone hangs under a `[removed]`
   placeholder.
 - Score is ups minus downs over each member's latest vote. Karma is the score of a member's posts and
@@ -85,8 +85,8 @@ The board rules, as `model.mjs` has them:
 | 6.takedown | an operator takes bob's post down (vlpds only). It's gone from every read, its image answers `BlobNotFound`, and the appview converges without it. `vlpds.admin.getSpaceRecord` reads it flagged `takendown` and the read is audited. A reversal brings it all back |
 | 8.revoke | alice revokes a stolen credential on every member host and the appview. Reads with it fail with `CredentialRevoked` |
 | 10.scale | 20 members, 200 posts, 1,000 comments and 3,000 votes, 16 in flight. Nothing acked is lost, and the appview matches the model on every post, thread and karma. Reports throughput, appview catch-up and vlpds bucket ops per write |
-| 11.fault | `CLUSTER=1` only. vlpds node 1 gets `kill -9` 30% into story 10 and stays down 20 s. The board keeps taking writes, no acked write is lost and listRepos ends at every writer's head |
-| 9.delete-board | `SpaceDeleted` for credentials, `notifySpaceDeleted` to the appview, which drops the board. Members keep their own repos (the reference sweeps only the authority's rows) |
+| 11.fault | `CLUSTER=1` only. vlpds node 1 gets `kill -9` 30% into story 10 and stays down 20 s. The board keeps taking writes, no acked write is lost and listWriters ends at every writer's head |
+| 9.delete-board | `SpaceDeleted` for credentials, a `spaceDeleted` notice to the appview, which drops the board. Members keep their own repos (the reference sweeps only the authority's rows) |
 | 7.privacy | runs last. Every board write carries the run's sentinel. No firehose frame (live or a cursor-0 backfill), `getRepo`, `listBlobs` or `getBlob` shows it, and no member's public repo rev moved |
 
 The configs place people on hosts. all-vlpds puts everyone on vlpds. vlpds-owner has alice and bob on
@@ -121,7 +121,7 @@ grant resolves. It seeds a board (alice owns it, bob writes, carol and dave aren
 writes the server's env and the accounts to `.local/prod-seed.json`. The server is a confidential
 OAuth client at `http://boards.localhost:2889` (Chromium and macOS resolve `*.localhost` to
 loopback, and vlpds in dev mode takes an http client_id that isn't a loopback client), resolves DIDs
-from the local PLC and handles through vlpds, and its notify target is `did:web:127.0.0.1%3A2889`.
+from the local PLC and handles through vlpds, and its notify endpoint is `http://boards.localhost:2889`.
 
 `packages/boards/e2e/prod.mjs` checks it in headless Chromium: the public documents, sign-in,
 posting with an image, bob opening the board by its link, comments and votes each way (notify

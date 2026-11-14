@@ -863,7 +863,7 @@ All 20 cases snapshot AppView views fetched through the PDS (`app.bsky.*` GETs).
 
 ## Spaces (permissioned data)
 
-The reference's space suites at `bluesky-social/atproto` 5b95b2f2 (PR #5187, permissioned-data; `policy.test.ts` and the clearRecords and writer-set cases at 98ef3a6b), mapped case by case to
+The reference's space suites at `bluesky-social/atproto` 16bfeba7 (PR #5187, permissioned-data, the November 13 alpha), mapped case by case to
 `tests/all/spaces_side/ref_*.rs`. The harness is `spaces_side::ref_net`, the reference's `tests/_space.ts` over XRPC: a `Net` of
 `--spaces` PDSes on one in-process PLC directory, OAuth accounts, signed credential reads, a did:web `MockService` (managing app,
 syncer, remote space host, or a party whose key a test holds) and a `MockClientApp` serving client metadata and a JWKS. Run them
@@ -873,10 +873,10 @@ is the core slice that made it pass.
 Two things change how a case is ported, so they aren't repeated on every row:
 
 - The reference adds members to most spaces even where a test never reads with a credential. A member's PDS never consults the
-  member list on a write (only the authority does, on notifyWrite), so the ports add members only where a credential is minted.
+  member list on a write (only the authority does, on notifyRepoUpdate), so the ports add members only where a credential is minted.
 - The reference reads its stores directly (`repoState`, `writerDids`, `blobExists`, revocation rows). The ports read the same
   facts over XRPC (the owner's getLatestCommit and listRecords, space.getBlob), except `writerDids`, which reads the authority's
-  `sW` rows as the reference does. A credential for listRepos would have to clear an allowList space's app check, and the
+  `sW` rows as the reference does. A credential for listWriters would have to clear an allowList space's app check, and the
   reference's own read never does.
 
 Divergences, also in DESIGN.md's Spaces section:
@@ -901,10 +901,10 @@ Divergences, also in DESIGN.md's Spaces section:
   reference never prunes.
 - **Bounded revocations and registrations.** Revocations are one cluster-wide object every node reads, so `jti`s are capped at
   128 characters (a longer credential is refused), live entries per authority and in all are capped, and one that can't be
-  stored blocks its space's credentials. A space holds at most 256 notify registrations. The reference bounds neither.
+  stored blocks its space's credentials. A space holds at most 256 registrations and an authority 1,024, lapsed ones counted. The reference bounds neither.
 - **Account takedowns revoke OAuth sessions for good.** As for every vlpds account, a takedown revokes the account's OAuth
   sessions and a reversal doesn't bring them back, so an app signs in again. The reference's sessions work again.
-- **Takedowns reach space data.** A taken-down account mints no delegation token, and getSpaceCredential refuses a taken-down
+- **Takedowns reach space data.** A taken-down account mints no delegation token, and authorizeSpaceSync refuses a taken-down
   member (`AccountTakedown`) or authority (`RepoTakendown`). Record takedowns (a takedown-adjusted, consistently MACed view)
   and space takedowns are vlpds extensions. The reference has neither, so its suites have no cases for them. They're tested in
   `spaces_admin`, `spaces_sync::record_takedown_serves_a_consistent_view` and `spaces_blobs`.
@@ -919,24 +919,26 @@ Divergences, also in DESIGN.md's Spaces section:
 - **1,000,000-byte space records.** A space record's encoding is capped at 1,000,000 bytes, as a public repo record's is.
   The reference caps it at 1 MiB, its STAR value limit, which an import still allows.
 
-The notification retry rows and the registration expiry row run through test hooks: `Outbox::set_retry_base` shortens the
-1 min retry pause, and `xrpc::space::set_registration_expiry` expires a registration through the authority's worker (the
-tests no longer age `sN` rows with a direct `db.put`, which the worker's cached expiry would hide). The rows that still need
-minutes-to-hours timing or a mocked clock stay N/A and are covered by the outbox's own unit tests.
+The notification retry rows and registration lapses run through test hooks: `Outbox::set_retry_base` shortens the 1 min
+retry pause, `xrpc::space::set_registration_expiry` lapses a registration through the authority's worker (a direct `db.put`
+would be hidden by the worker's cached row), and `space::notices::retry_due` runs syncer-notice retries with a clock ahead of
+the backoff. The rows that still need minutes-to-hours timing or a mocked clock stay N/A and are covered by the outbox's and
+the notices' own unit tests. Rows the previous release stored that can't carry over (its `sN` registrations and `sD`
+retries) are `spaces_side::stored_legacy`, and `just spaces-migrate` runs an older vlpds binary's spaces through this one.
 
 | | Cases |
 |---|---:|
-| ported | 245 |
+| ported | 271 |
 | ported + divergent | 7 |
 | divergent | 1 |
-| covered | 1 |
+| covered | 2 |
 | N/A | 8 |
 | GAP | 2 |
-| **total** | **264** |
+| **total** | **291** |
 
 Counted per `it()` case, with each `it.each` row counted once per value. Three more rows (marked "(vlpds)") are vlpds-only
-tests (the 300 s cap, the old credential scheme) and aren't counted. The sync, records and auth rows follow the reference at
-98ef3a6b (the October 22 wire: MACs, STAR, credentials in the request body).
+tests (the 300 s cap, the old credential scheme) and aren't counted. Every row follows the reference at 16bfeba7 (MACs as
+RFC 9421 signatures, `authorizeSpaceSync` with webhook registrations, `listWriters` with removals).
 
 ### space/records.test.ts
 
@@ -962,14 +964,13 @@ tests (the 300 s cap, the old credential scheme) and aren't counted. The sync, r
 | refuses a record over the size limit | ported + divergent | `..::refuses_a_record_over_the_size_limit`: vlpds caps the encoding at 1,000,000 bytes (1 MiB in the reference). As in the reference the request body limit comes first (413), so the port writes one just under the cap and one at it, where the reference calls `prepareCreate` |
 | listRecords paginates across collections | ported | `..::list_records_paginates_across_collections` (C2) |
 | listRecords filters to one collection | ported | `..::list_records_filters_to_one_collection` (C2) |
-| listRecords reverses the listing order | ported | `..::list_records_reverses_the_listing_order` (C2) |
 | listRecords scopes a listing to one space | ported | `..::list_records_scopes_a_listing_to_one_space` (C1) |
 | getRecord returns the record and its current cid | ported | `..::get_record_returns_the_record_and_its_current_cid` (C1) |
 | getRecord reports RecordNotFound for a record that never existed | ported | `..::get_record_reports_record_not_found` (C1) |
 | tracks a blob on a space record and serves it to a member | ported | `..::blobs_tracks_a_blob_and_serves_it_to_a_member` (C5). The "untethered until referenced" store read isn't observable |
 | does not serve a space-only blob through public sync | ported + divergent | `..::blobs_does_not_serve_a_space_only_blob_through_public_sync` (C5, flag on). Flag off: `..::flag_off_serves_an_unreferenced_upload` (runs now) |
 | keeps a blob shared with a public record | ported | `..::blobs_keeps_a_blob_shared_with_a_public_record` (C5). Bytes held = space.getBlob serves them |
-| filters listBlobs by revision | ported | `..::blobs_filters_list_blobs_by_revision` (C5) |
+| lists the blobs of a repo to a syncer | ported | `..::blobs_lists_the_blobs_of_a_repo_to_a_syncer` (C5) |
 | scopes listBlobs to one space | ported | `..::blobs_scopes_list_blobs_to_one_space` (C5) |
 | refuses a blob to a credential for another space | ported | `..::blobs_refuses_a_blob_to_a_credential_for_another_space` (C5) |
 | refuses a blob that the authorized space does not reference | ported | `..::blobs_refuses_a_blob_the_authorized_space_does_not_reference` (C5) |
@@ -998,8 +999,8 @@ tests (the 300 s cap, the old credential scheme) and aren't counted. The sync, r
 | responds 200 to repeated signature-input fields | ported | same |
 | responds 200 to repeated signature fields | ported | same |
 | refuses a credential presented with a key of the holder own | ported | `..::refuses_a_credential_presented_with_another_key` (C3) |
-| refuses a signature addressed to another repo owner (remote) | ported | `..::refuses_a_signature_addressed_to_another_repo_owner` (C3) |
-| refuses a signature addressed to another repo owner (co-located) | ported | same |
+| refuses a signature addressed to another account (remote) | ported | `..::refuses_a_signature_addressed_to_another_repo_owner` (C3) |
+| refuses a signature addressed to another account (co-located) | ported | same |
 | requires the space authority as audience for space-host requests | ported | `..::requires_the_authority_as_audience_for_space_host_requests` (C3) |
 | reuses a signature for the same audience across requests | ported | `..::reuses_a_signature_for_the_same_audience_across_requests` (C3) |
 | reuses one credential across many hosts, each with its own audience signature | ported | `..::reuses_one_credential_across_many_hosts` (C3) |
@@ -1012,7 +1013,7 @@ tests (the 300 s cap, the old credential scheme) and aren't counted. The sync, r
 | persists revocations for an hour including clock skew, and prunes expired entries | N/A | mocks `Date.now` over the account DB. vlpds keeps `until = now + 3610 s` in `spaces/revocations` (core unit tests) |
 | keeps the revocation when background cleanup fails | N/A | the reference's background queue. vlpds prunes in the CAS write |
 | delegation tokens are useless at a host that does not govern the space | ported | `..::delegation_tokens_are_useless_at_a_host_that_does_not_govern_the_space` (C3) |
-| binds the credential to the requested key | ported | `..::binds_the_credential_to_the_requested_key` (`credentialKid` in the body) |
+| binds the credential to the requested key | ported | `..::binds_the_credential_to_the_requested_key` (`credentialKey` in the body) |
 | refuses to bind the credential to a key that is not P-256 | ported | `..::refuses_to_bind_the_credential_to_a_key_that_is_not_p256` |
 | are refused when the audience names another authority | ported | `..::delegation_tokens_are_refused_when_the_audience_names_another_authority` (C1). The user is a did:web |
 | are single-use — a replayed jti is refused | ported | `..::delegation_tokens_are_single_use` (C3) |
@@ -1020,6 +1021,7 @@ tests (the 300 s cap, the old credential scheme) and aren't counted. The sync, r
 | (vlpds) 300 s single-use token cap | divergent | `..::delegation_tokens_live_at_most_300_seconds` (C1) |
 | stops serving permissioned records for a taken-down account | ported | `..::stops_serving_space_records_of_a_taken_down_account` (C3) |
 | stops accepting permissioned writes from a taken-down account | ported | `..::stops_accepting_space_writes_from_a_taken_down_account` (C1) |
+| stops minting credentials and listing writers for a taken-down authority | covered | `spaces_side::takedowns::taken_down_authority_issues_no_credentials` |
 | OAuth: enforces the collection a grant names on a write | ported | `..::oauth_enforces_the_collection_a_grant_names` (C1). Real grants, not a stubbed verifier |
 | OAuth: enforces the action a grant names | ported | `..::oauth_enforces_the_action_a_grant_names` (C1) |
 | OAuth: resolves putRecord to update rather than demanding create too | ported | `..::oauth_resolves_put_record_to_update` (C2) |
@@ -1041,21 +1043,26 @@ Was `simplespace.test.ts`.
 | refuses a duplicate space | ported | `..::refuses_a_duplicate_space` |
 | refuses a space key that is not a valid record key | ported | `..::refuses_a_space_key_that_is_not_a_record_key` |
 | filters spaces by spaceType | ported | `..::filters_spaces_by_space_type` |
-| refuses an owner write until createSpace | ported | `..::refuses_an_owner_write_until_create_space` |
-| memberspace members: adds and removes members, and the owner is not one of them | ported | `..::adds_and_removes_members` |
-| memberspace members: refuses membership changes from a non-owner member | ported | `..::refuses_membership_changes_from_a_non_owner` |
-| memberspace members: refuses listMembers to a space credential and to a non-owner member | ported | `..::refuses_list_members_to_a_credential_and_a_non_owner` |
-| memberspace members: putMember replaces both access values | ported | `..::put_member_replaces_both_access_values` |
+| lists the state of the caller's repo in each space | ported | `..::lists_the_state_of_the_callers_repo` |
+| refuses an authority write until createSpace | ported | `..::refuses_an_owner_write_until_create_space` |
+| memberspace members: adds and removes members, and the authority is not one of them | ported | `..::adds_and_removes_members` |
+| memberspace members: refuses membership changes from a member other than the authority | ported | `..::refuses_membership_changes_from_a_non_owner` |
+| memberspace members: refuses listMembers to a space credential and to a member other than the authority | ported | `..::refuses_list_members_to_a_credential_and_a_non_owner` |
+| memberspace members: putMembers replaces both access values | ported | `..::put_member_replaces_both_access_values` |
 | memberspace members: refuses member methods on a space under another policy | ported | `..::refuses_member_methods_under_another_policy` |
-| memberspace members: removeMember drops the member from the writer set | ported | `..::remove_member_drops_the_writer` |
-| memberspace members: putMember drops the member from the writer set when it revokes write | ported | `..::put_member_without_write_drops_the_writer` |
+| memberspace members: removeMembers drops the member from the writer set | ported | `..::remove_member_drops_the_writer` |
+| memberspace members: putMembers drops the member from the writer set when it revokes write | ported | `..::put_member_without_write_drops_the_writer` |
+| memberspace members: tells registered syncers of the writers a member change removes | ported | `..::tells_registered_syncers_of_removed_writers` |
+| memberspace members: applies a batch of member changes in a single commit | ported | `..::applies_a_batch_of_member_changes_in_one_commit` |
+| memberspace members: takes the last entry for a member listed twice | ported | `..::takes_the_last_entry_for_a_member_listed_twice` |
+| memberspace members: ignores a DID that is not a member, leaving it in the writer set | ported | `..::ignores_a_did_that_is_not_a_member` |
 | policy: persists what createSpace was given | ported | `..::persists_what_create_space_was_given` |
 | policy: fills in the defaults of an omitted configuration | ported | `..::fills_in_the_defaults` |
 | policy: replaces the policy wholesale on update | ported | `..::replaces_the_policy_wholesale` |
 | policy: keeps the member list across a configuration change | ported | `..::keeps_the_member_list_across_a_configuration_change` |
-| policy: refuses an update from a non-owner | ported | `..::refuses_an_update_from_a_non_owner` |
+| policy: refuses an update from an account other than the authority | ported | `..::refuses_an_update_from_a_non_owner` |
 | policy: refuses an unrecognized policy | ported | `..::refuses_an_unrecognized_policy` |
-| policy: refuses a managingApp that does not name a service | ported | `..::refuses_a_managing_app_that_is_not_a_did` |
+| policy: refuses a managingApp that does not name a service (2) | ported | `..::refuses_a_managing_app_that_is_not_a_did` |
 | policy: refuses the policy to a member with a space credential | ported | `..::refuses_the_policy_to_a_member_credential` |
 | policy: refuses the policy to another account on an account credential | ported | `..::refuses_the_policy_to_another_account` |
 | policy: refuses to answer for a space this host does not govern | ported | `..::refuses_to_answer_for_a_space_this_host_does_not_govern` |
@@ -1091,16 +1098,27 @@ Was `simplespace.test.ts`.
 | client attestation: refuses an expired attestation | ported | `ref_client_attestation::refuses_an_expired_attestation` |
 | managedspace: admits a user the managing app authorizes | ported | `ref_space_policy::managing_app_admits_a_user_it_authorizes` |
 | managedspace: refuses a user the managing app declines | ported | `..::managing_app_refuses_a_user_it_declines` |
-| managedspace: denies when the managing app errors | ported | `..::managing_app_denies_when_it_errors` |
-| managedspace: denies when the managing app cannot be resolved | ported | `..::managing_app_denies_when_unresolvable` |
-| managedspace: records a writer the managing app admits | ported | `..::managing_app_admits_a_writer`, which also checks the write check carries no `clientId` |
-| registers, forwards writes, and stops once withdrawn | ported | `..::registers_forwards_writes_and_stops_once_withdrawn` |
-| stops delivering to a registration past its expiry, and resumes on renewal | ported | `..::stops_past_expiry_and_resumes_on_renewal`. The row is expired through the authority's worker (`xrpc::space::set_registration_expiry`), and vlpds prunes it where the reference withholds it, so the renewal registers it again |
-| refuses a service that cannot be resolved | ported | `..::refuses_a_service_that_cannot_be_resolved` |
+| managedspace: asks the managing app about a request with no delegation token | ported | `..::managing_app_is_asked_without_a_delegation_token` |
+| managedspace: fails without a credential when the managing app errors | ported | `..::managing_app_errors_fail_upstream` (502 `UpstreamFailure`) |
+| managedspace: fails without a credential when the managing app cannot be resolved | ported | same |
+| managedspace: keeps a registration through a managing app outage, and withdraws it on refusal | ported | `..::managing_app_outage_keeps_a_registration` |
+| managedspace: retries a write notification through a managing app outage | ported | `..::managing_app_outage_retries_a_write_notification` |
+| managedspace: records a writer the managing app admits, even one it does not let read | ported | `..::managing_app_admits_a_writer_it_does_not_let_read`, which also checks the write check carries no `clientId` |
+| registrations: confirms a new registration, and forwards writes with its token | ported | `..::confirms_a_registration_and_forwards_with_its_token` |
+| registrations: treats a different token as a separate registration | ported | `..::a_different_token_is_a_separate_registration` |
+| registrations: refuses an authorization whose registration is not confirmed | ported | `..::refuses_an_unconfirmed_registration` |
+| registrations: sends a lapsed registration an expiry notice in place of the next update, then nothing more | ported | `..::a_lapsed_registration_gets_one_expiry_notice`, `spaces_side::space_deleted::expiry_notices`. The lapse runs through `xrpc::space::set_registration_expiry` |
+| registrations: unregisters a syncer that rejects its expiry notice | ported | `..::unregisters_a_syncer_that_rejects_its_expiry_notice` |
+| registrations: retries an expiry notice through a transient failure | ported | `..::retries_an_expiry_notice_through_a_transient_failure` |
+| registrations: keeps an active registration through a rejected update | ported | `..::keeps_an_active_registration_through_a_rejected_update` |
+| registrations: withdraws the registration carried by a refused authorization | ported | `..::withdraws_the_registration_a_refused_authorization_carries` |
+| registrations: delivers to each registration without waiting on a slow one | ported | `..::delivers_to_each_registration_without_waiting_on_a_slow_one` (one lane per registration) |
 | purges the authority own repo and keeps a tombstone | ported | `..::delete_purges_the_authority_repo_and_keeps_a_tombstone`. Blob gone = space.getBlob refuses it |
-| answers SpaceDeleted on credential renewal | ported | `..::answers_space_deleted_on_credential_renewal` |
+| answers SpaceDeleted on reauthorization | ported | `..::answers_space_deleted_on_credential_renewal` |
 | answers SpaceDeleted to a request without a delegation token | ported | `..::answers_space_deleted_without_a_delegation_token` |
-| notifies registered syncers | ported | `..::delete_notifies_registered_syncers` |
+| answers SpaceDeleted regardless of the request authorization | ported | `..::answers_space_deleted_regardless_of_authorization` |
+| refuses a registration made as the space is deleted | ported | `space::repo::tests::delete_and_recreate`: the worker refuses a registration on a tombstone, so an authorization that read the space before `deleteSpace` registers nothing (the reference's spy on the key fetch has no XRPC equivalent) |
+| notifies registered syncers, including lapsed registrations | ported | `..::delete_notifies_registered_syncers`, `spaces_side::space_deleted::deliveries_and_retries` |
 | leaves a member repo untouched | ported | `..::delete_leaves_a_member_repo_untouched` |
 | allows re-creating a deleted space, with a fresh policy | ported | `..::allows_re_creating_a_deleted_space_with_a_fresh_policy` |
 
@@ -1119,7 +1137,7 @@ A unit test of `assertSpaceRead`, ported over XRPC with real grants.
 
 ### client-attestation.test.ts
 
-A unit test of the verifier against an injected fetch. vlpds verifies inside getSpaceCredential, so each case mints a
+A unit test of the verifier against an injected fetch. vlpds verifies inside authorizeSpaceSync, so each case mints a
 credential for an allow-listed `MockClientApp` served over loopback HTTP.
 
 | case | status | vlpds |
@@ -1144,7 +1162,7 @@ The oplog cases have the authority write and read with its own credential (a co-
 | case | status | vlpds |
 |---|---|---|
 | pages through a single rev without dropping ops | ported | `ref_space_sync::pages_through_a_single_rev_without_dropping_ops` (C1) |
-| withholds the commit until the oplog is drained to head | ported | `..::withholds_the_commit_until_drained_to_head` (C1) |
+| carries the current commit on every page | ported | `..::carries_the_current_commit_on_every_page` |
 | pages with since and cursor together | ported | `..::pages_with_since_and_cursor_together` (C1) |
 | inlines only a record current value | ported | `..::inlines_only_a_record_current_value` (C1) |
 | omits values entirely with excludeValues | ported | `..::omits_values_with_exclude_values` (C1) |
@@ -1158,17 +1176,17 @@ The oplog cases have the authority write and read with its own credential (a co-
 | reports RepoNotFound for an unwritten repo | ported | `..::reports_repo_not_found_for_an_unwritten_repo` (C3) |
 | MACs: publishes a KEM key for each account | ported | `..::publishes_a_kem_key_for_each_account` (the held key, the DID document's `#atproto_kem` and getRecommendedDidCredentials agree) |
 | MACs: macs a record served to a syncer | ported | `..::macs_a_record_served_to_a_syncer` |
-| MACs: omits the MAC from an oplog page without a commit | ported | `..::omits_the_mac_from_an_oplog_page_without_a_commit`, and that page still needs the request header |
+| MACs: macs every oplog page | ported | `..::macs_every_oplog_page` |
 | MACs: requires a MAC request with a space credential | ported | `..::requires_a_mac_request_with_a_space_credential` |
 | MACs: macs an account its own data only when asked | ported | `..::macs_an_account_its_own_data_only_when_asked` (Vary, Access-Control-Expose-Headers) |
 | records a co-located writer without resolving its public PDS endpoint | ported | `..::records_a_co_located_writer_without_resolving_it` (C3). The PLC directory is down during the write instead of a mocked resolver |
-| records a writer from notifyWrite, and it is not the member list | ported | `..::records_a_writer_from_notify_write` (C3) |
+| records a writer from notifyRepoUpdate, and it is not the member list | ported | `..::records_a_writer_from_notify_write` (C3) |
 | records a writer admitted by public write policy, who was never a member | ported | `..::records_a_public_policy_writer_who_was_never_a_member` (C3) |
 | records a writer into an allowList space, whose PDS presents no attestation | ported | `..::records_a_writer_into_an_allow_list_space` (C3) |
-| migrates existing writer state | N/A | a SQLite migration. vlpds is unshipped and has no migrations |
+| migrates existing writer state | N/A | a SQLite migration. vlpds keeps its writer rows as they were; what it stored before is `spaces_side::stored_legacy` and `just spaces-migrate` |
 | recovers missed notifications with a space checkpoint | ported | `..::recovers_missed_notifications_with_a_space_checkpoint` (C3) |
 | resumes after an empty page using the last processed repo revision | ported | `..::resumes_after_an_empty_page` (C3) |
-| accepts arbitrary string listRepos cursors | ported | `..::accepts_arbitrary_string_list_repos_cursors` (C3) |
+| accepts arbitrary string listWriters cursors | ported | `..::accepts_arbitrary_string_list_repos_cursors` (C3) |
 | chains forwarded notifications across local and remote writers | ported | `..::chains_forwarded_notifications` (C4). vlpds also sends them in spaceRev order per registration |
 | resolves a space host through the authority's #atproto_pds entry | ported | `..::notify_resolves_the_space_host_through_atproto_pds`, observed at the hosts instead of calling the resolver: the notify's audience is `#atproto_pds`, and an authority naming only `#atproto_space_host` hears nothing. The syncer-entry half is the resolver's unit, with no wire effect |
 | retries the latest state after delivery failure and worker restart | ported | `..::retries_the_latest_state_after_failure_and_restart` (C1): the outbox row is resent at the newest rev after a restart |
@@ -1179,8 +1197,12 @@ The oplog cases have the authority write and read with its own credential (a co-
 | rejects one addressed to another authority | ported | `..::notify_write_rejects_one_addressed_to_another_authority` (C3) |
 | rejects one from a non-member | ported | `..::notify_write_rejects_a_non_member` (C3) |
 | rejects a member without write access | ported | `..::notify_write_rejects_a_member_without_write_access` (C3) |
-| rejects a repoRev that is not a TID before any auth check | ported | `..::notify_write_rejects_a_rev_that_is_not_a_tid` (C3) |
+| rejects a member without write access even when writes are public | ported | `..::notify_write_rejects_a_member_without_write_even_when_public` |
+| rejects a rev that is not a TID before any auth check | ported | `..::notify_write_rejects_a_rev_that_is_not_a_tid` (C3) |
 | writer set: drops a writer on removeWriter, and tracks it again once it writes | ported | `..::remove_writer_drops_it_until_it_writes_again` |
+| writer set: ignores removeWriter for a repo outside the writer set | ported | `..::remove_writer_ignores_a_repo_outside_the_set` |
+| writer set: returns the space's current revision on each authorization | ported | `..::authorization_returns_the_current_space_rev` |
+| writer set: forwards a removal from the writer set, in the space sequence | ported | `..::forwards_a_removal_in_the_space_sequence` |
 | writer set: refuses removeWriter from anyone but the authority | ported | `..::remove_writer_is_the_authoritys_alone` |
 | writer set: keeps a cleared repo in the writer set, at the empty digest | ported | `..::a_cleared_repo_stays_a_writer_at_the_empty_digest` |
 
@@ -1209,26 +1231,32 @@ outbox, so these are outbox cases against a remote space host in `ref_space_sync
 | stops at the deadline and allows a later write to start a new retry window | N/A | the 24 h deadline. The outbox's own unit tests |
 | elects one retry worker and allows takeover after its lease expires | ported + divergent | no lease worker: the shard owner sends, and a takeover rescans `sP` (`spaces_side::durability`, and the restart cases above) |
 | defers retries for inactive accounts and resumes after activation | ported | `..::outbox_defers_inactive_accounts_and_resumes_on_activation` (C2) |
-| **space deleted** | | |
+| **syncer notices** | | |
 | sends immediately without queueing a successful notification | ported | `spaces_side::space_deleted::deliveries_and_retries` |
-| retries a transient failure until delivered | ported | same, the retry run through `space::deleted::retry_due` with a clock past the backoff |
+| retries a transient failure until delivered | ported | same, the retry run through `space::notices::retry_due` with a clock past the backoff |
 | does not retry a permanent failure | ported | same |
-| stops retrying once the registration expires | ported | `..::retries_end_with_the_registration_or_a_new_space` |
-| drops retries once the authority account is gone | covered | account deletion sweeps every space family, `sD` included (`xrpc::space::delete_account_rows`) |
-| defers retries while the authority is inactive | GAP | the code defers (`space::deleted::retry_one`); no test |
-| drops retries once the space is recreated | ported | `..::retries_end_with_the_registration_or_a_new_space` |
-| keeps a newer deletion retry when an older delivery finishes | GAP | a retry clears its row only if it's still the one it read (`clear_if_same`); no test races two deletions |
+| backs off from a minute to twelve hours | ported | `space::notices::tests::backoff_follows_the_schedule` |
+| stops retrying after a final retry past 72 hours | ported | `spaces_side::space_deleted::retries_end_with_the_window_or_a_new_space` |
+| drops retries once the authority account is gone | covered | account deletion sweeps every space family, `sE` included (`xrpc::space::delete_account_rows`) |
+| defers retries while the authority is inactive | GAP | the code defers (`space::notices::retry_one`); no test |
+| drops a deletion notice once the space is recreated | ported | `spaces_side::space_deleted::retries_end_with_the_window_or_a_new_space` |
+| keeps a newer retry when an older delivery finishes | GAP | a retry clears its row only if it's still the one it read (`clear_if_same`); no test races two notices |
+| drops a lapsed registration that rejects its expiry notice | ported | `spaces_side::space_deleted::expiry_notices` |
+| drops a lapsed registration once its expiry notice stops being retried | ported | same |
+| drops an expiry notice once the registration is renewed | ported | same |
+| lets a deletion notice supersede a pending expiry notice, but not the reverse | ported | `spaces_side::space_deleted::a_deletion_notice_supersedes_a_pending_expiry_notice` (a deletion over a pending expiry notice; the reverse, an expiry notice never replacing a deletion notice, is `notices::queue`'s rule, untested) |
 
 ### space/migration.test.ts
 
 | case | status | vlpds |
 |---|---|---|
 | moves the spaces an account is the authority of, and its repos | ported | `spaces_side::ref_space_migration::the_space_meta_archive_round_trips` (one host), `spaces_side::import_repo` (the repo), and the harness's migrate e2e (reference to vlpds, both hosts) |
+| leaves a removed writer out of the archive | ported | `..::leaves_a_removed_writer_out_of_the_archive` |
 | requires the space before the authority's own repo in it | ported | `spaces_side::import_repo` (SpaceNotFound before the space) |
 | replaces what the new host holds when imported again | ported | `..::the_space_meta_archive_round_trips` (a second import over a changed list), `spaces_side::import_repo` (replace and retry) |
 | keeps the percent-encoded port of a did:web member's DID | ported | `xrpc::space_meta::tests::did_web_ports_round_trip` |
 | rejects a repo with a record that is not canonical DRISL | ported | `spaces_side::import_repo`, `xrpc::space_import::tests::records_must_be_canonical` |
-| imports only the account's own spaces and repos | ported | `..::rejects_an_archive` (NotSpaceOwner), `spaces_side::import_repo` (the commit must name the account) |
+| imports only the account's own spaces and repos | ported | `..::rejects_an_archive` (NotAuthorized), `spaces_side::import_repo` (the commit must name the account) |
 | rejects an archive: with a policy the host does not implement | ported | `..::rejects_an_archive` |
 | rejects an archive: with policy state the policy does not define | ported | same |
 | rejects an archive: with a member list for a policy that keeps none | ported | same |

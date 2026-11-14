@@ -1,0 +1,4 @@
+{
+  "row": "{\"uri\":\"at://did:plc:fixture0000000000000000/space/com.example.group/main\",\"endpoint\":\"https://syncer.example\",\"token\":\"fixture-token\",\"notice\":{\"type\":\"registrationExpired\",\"spaceRev\":\"2222malfblapy\"},\"attempts\":2,\"retryAt\":1790000000000000,\"expires\":1790259200000000}",
+  "space notice sE/": "01f5d573452f6469643a706c633a66697874757265303030303030303030303030303030300046c1333c3f3e21f1c76a54497077866278a2b96351b84e523002ba37e16b742d5335ce1c9673273a3aefac1168979138"
+}

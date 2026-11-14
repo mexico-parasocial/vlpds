@@ -1,24 +1,30 @@
 //! The RFC 9421 HTTP Message Signatures subset Spaces uses
-//! (@atproto/space `http-signature.ts`). One signature, labelled
-//! `atproto-space-credential`, by the P-256 did:key a space credential is
-//! bound to (its `cnf.kid`), covering exactly
-//! `("authorization" "atproto-space-audience")` with
-//! `tag="atproto-space-credential"`.
+//! (@atproto/space `http-signature.ts`). A request with a space credential
+//! carries one signature tagged `tag="atproto-space-credential"`, under any
+//! label, by the P-256 did:key the credential is bound to (its `cnf.kid`),
+//! covering exactly `("authorization" "atproto-space-audience")`.
 //!
 //! No method, target or time is covered, so a signature may be replayed
 //! with the same headers: the credential's expiry bounds that, and the
 //! audience header pins it to one repo. The optional `alg` must be
-//! `ecdsa-p256-sha256` and an optional `keyid` must be `cnf.kid`.
-//! Signatures are raw r‖s (64 bytes); high-S is accepted, DER is not.
+//! `ecdsa-p256-sha256` and an optional `keyid` must be `cnf.kid`; other
+//! parameters are signed but not read. Signatures are raw r‖s (64 bytes);
+//! high-S is accepted, DER is not.
+//!
+//! [`find_signature`] and [`signature_base`] are shared with the response
+//! MACs ([`super::mac`]), which are signatures of the same shape.
 
-use super::sfv::{self, Bare, Member};
+use super::sfv::{self, Bare, Member, Params};
 use axum::http::HeaderMap;
 use base64::Engine;
 
-pub const LABEL: &str = "atproto-space-credential";
+/// The label this host's own requests sign under. Verifiers find a
+/// signature by its tag, never its label.
+pub const LABEL: &str = "sig";
 pub const TAG: &str = "atproto-space-credential";
 pub const ALG: &str = "ecdsa-p256-sha256";
 pub const AUDIENCE_HEADER: &str = "atproto-space-audience";
+const COMPONENTS: &str = "(\"authorization\" \"atproto-space-audience\")";
 
 /// The reference's `SpaceSignatureError`; its XRPC error is
 /// `BadSpaceSignature`.
@@ -36,24 +42,105 @@ impl std::fmt::Display for SigError {
 }
 
 /// Far over what this subset needs (a did:key is ~57 bytes).
-const MAX_FIELD: usize = 8 << 10;
+pub(crate) const MAX_FIELD: usize = 8 << 10;
 
 const INVALID: SigError = SigError("invalid HTTP message signature");
-const MALFORMED: SigError = SigError("missing or malformed atproto-space-credential signature");
 
-/// What a request's signature covers, joined into lines.
-pub fn signature_base(authorization: &str, signature_params: &str, audience: &str) -> Vec<u8> {
-    format!(
-        "\"authorization\": {}\n\"{AUDIENCE_HEADER}\": {}\n\"@signature-params\": {signature_params}",
-        authorization.trim(),
-        audience.trim()
-    )
-    .into_bytes()
+/// Why [`find_signature`] found no usable signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FindError {
+    /// A field missing, too long or not a dictionary.
+    Headers,
+    /// More than one member carries the tag.
+    Several,
+    /// No member carries the tag, or its signature value is missing or
+    /// malformed.
+    Missing,
+    Components,
+    Alg,
+    KeyId,
+}
+
+/// What a verifier requires of the signature it looks for (RFC 9421
+/// §3.2.1): its tag, exactly these components in order (an inner list
+/// without parameters, serialized), and its `alg` and `keyid` if it names
+/// them.
+pub(crate) struct Required<'a> {
+    pub tag: &'a str,
+    pub components: &'a str,
+    pub alg: &'a str,
+    pub key_id: &'a str,
+}
+
+/// The one member of `Signature-Input` tagged `req.tag`, checked against
+/// `req`, and its value in `Signature` under the same label: (its
+/// serialized covered components and parameters, the signature bytes). The
+/// reference's `findSignature`.
+pub(crate) fn find_signature(
+    input_field: Option<&str>,
+    signature_field: Option<&str>,
+    req: &Required,
+) -> Result<(Vec<(Bare, Params)>, String, Vec<u8>), FindError> {
+    let (Some(input_field), Some(signature_field)) = (input_field, signature_field) else {
+        return Err(FindError::Headers);
+    };
+    // the parser's duplicate-key handling is a linear scan per key
+    if input_field.len() > MAX_FIELD || signature_field.len() > MAX_FIELD {
+        return Err(FindError::Headers);
+    }
+    let inputs = sfv::parse_dictionary(input_field).map_err(|_| FindError::Headers)?;
+    let sigs = sfv::parse_dictionary(signature_field).map_err(|_| FindError::Headers)?;
+    let mut tagged = inputs.iter().filter_map(|(label, m)| match m {
+        Member::InnerList(items, params) if sfv::get(params, "tag") == Some(&Bare::String(req.tag.into())) => {
+            Some((label, items, params))
+        }
+        _ => None,
+    });
+    let first = tagged.next();
+    if tagged.next().is_some() {
+        return Err(FindError::Several);
+    }
+    let (label, items, params) = first.ok_or(FindError::Missing)?;
+    let sig = match sfv::get(&sigs, label) {
+        Some(Member::Item(Bare::Bytes(b64), p)) if p.is_empty() => B64.decode(b64).map_err(|_| FindError::Missing)?,
+        _ => return Err(FindError::Missing),
+    };
+    if sfv::serialize_inner_list(items, &Vec::new()) != req.components {
+        return Err(FindError::Components);
+    }
+    if sfv::get(params, "alg").is_some_and(|a| *a != Bare::String(req.alg.into())) {
+        return Err(FindError::Alg);
+    }
+    if sfv::get(params, "keyid").is_some_and(|k| *k != Bare::String(req.key_id.into())) {
+        return Err(FindError::KeyId);
+    }
+    Ok((items.clone(), sfv::serialize_inner_list(items, params), sig))
+}
+
+/// The signature base (RFC 9421 §2.5) over `components` with their
+/// `values` in order, under the serialized `signature_params`.
+pub(crate) fn signature_base(components: &[(Bare, Params)], values: &[&str], signature_params: &str) -> Vec<u8> {
+    let mut lines: Vec<String> = components
+        .iter()
+        .zip(values)
+        .map(|((b, p), v)| format!("{}: {}", sfv::serialize_item(b, p), v.trim()))
+        .collect();
+    lines.push(format!("\"@signature-params\": {signature_params}"));
+    lines.join("\n").into_bytes()
+}
+
+fn credential_components() -> Vec<(Bare, Params)> {
+    vec![(Bare::String("authorization".into()), Vec::new()), (Bare::String(AUDIENCE_HEADER.into()), Vec::new())]
+}
+
+/// The base a request's credential signature covers.
+pub fn credential_base(authorization: &str, signature_params: &str, audience: &str) -> Vec<u8> {
+    signature_base(&credential_components(), &[authorization, audience], signature_params)
 }
 
 /// The `Signature-Input` member the reference's client writes.
 pub fn signature_input() -> String {
-    format!("(\"authorization\" \"{AUDIENCE_HEADER}\");tag=\"{TAG}\"")
+    format!("{COMPONENTS};tag=\"{TAG}\"")
 }
 
 /// The four headers of a request with a space credential, signed by
@@ -61,7 +148,7 @@ pub fn signature_input() -> String {
 pub fn headers(credential: &str, audience: &str, sign: impl FnOnce(&[u8]) -> [u8; 64]) -> [(&'static str, String); 4] {
     let authorization = format!("Atproto-Space-Credential {credential}");
     let input = signature_input();
-    let sig = sign(&signature_base(&authorization, &input, audience));
+    let sig = sign(&signature_base(&credential_components(), &[&authorization, audience], &input));
     [
         ("authorization", authorization),
         (AUDIENCE_HEADER, audience.to_string()),
@@ -79,41 +166,23 @@ pub fn verify(headers: &HeaderMap, credential_key: &str) -> Result<(), SigError>
     let audience = single(headers, AUDIENCE_HEADER)
         .filter(|a| !a.is_empty())
         .ok_or(SigError("missing or malformed \"atproto-space-audience\" field"))?;
-    let input_header = joined(headers, "signature-input").ok_or(SigError("missing or malformed signature headers"))?;
-    let sig_header = joined(headers, "signature").ok_or(SigError("missing or malformed signature headers"))?;
-    // the parser's duplicate-key handling is a linear scan per key
-    if input_header.len() > MAX_FIELD || sig_header.len() > MAX_FIELD {
-        return Err(INVALID);
-    }
-    let inputs =
-        sfv::parse_dictionary(&input_header).map_err(|_| SigError("missing or malformed signature headers"))?;
-    let sigs = sfv::parse_dictionary(&sig_header).map_err(|_| SigError("missing or malformed signature headers"))?;
-    let (Some(Member::InnerList(components, params)), Some(Member::Item(Bare::Bytes(sig_b64), sig_params))) =
-        (sfv::get(&inputs, LABEL), sfv::get(&sigs, LABEL))
-    else {
-        return Err(MALFORMED);
-    };
-    if !sig_params.is_empty() {
-        return Err(MALFORMED);
-    }
-    let covered: Vec<String> = components.iter().map(|(b, p)| sfv::serialize_item(b, p)).collect();
-    if covered != ["\"authorization\"", "\"atproto-space-audience\""] {
-        return Err(SigError("signature must cover exactly (\"authorization\" \"atproto-space-audience\"), in order"));
-    }
-    if sfv::get(params, "tag") != Some(&Bare::String(TAG.into())) {
-        return Err(SigError("signature tag must be \"atproto-space-credential\""));
-    }
-    if sfv::get(params, "alg").is_some_and(|a| *a != Bare::String(ALG.into())) {
-        return Err(SigError("signature algorithm must be ecdsa-p256-sha256"));
-    }
-    if sfv::get(params, "keyid").is_some_and(|k| *k != Bare::String(credential_key.to_string())) {
-        return Err(SigError("signature keyid does not match the credential key"));
-    }
+    let req = Required { tag: TAG, components: COMPONENTS, alg: ALG, key_id: credential_key };
+    let (components, params, sig) =
+        find_signature(joined(headers, "signature-input").as_deref(), joined(headers, "signature").as_deref(), &req)
+            .map_err(|e| match e {
+                FindError::Headers => SigError("missing or malformed signature headers"),
+                FindError::Several => SigError("more than one signature with tag \"atproto-space-credential\""),
+                FindError::Missing => SigError("missing or malformed signature with tag \"atproto-space-credential\""),
+                FindError::Components => {
+                    SigError("signature must cover exactly (\"authorization\" \"atproto-space-audience\"), in order")
+                }
+                FindError::Alg => SigError("signature algorithm must be ecdsa-p256-sha256"),
+                FindError::KeyId => SigError("signature keyid does not match the expected key"),
+            })?;
     if super::did_key_alg(credential_key) != Some("ES256") {
         return Err(SigError("signature key must be a P-256 did:key"));
     }
-    let base = signature_base(authorization, &sfv::serialize_inner_list(components, params), audience);
-    let sig = B64.decode(sig_b64).map_err(|_| INVALID)?;
+    let base = signature_base(&components, &[authorization, audience], &params);
     if sig.len() != 64 {
         return Err(INVALID);
     }
@@ -125,7 +194,7 @@ pub fn verify(headers: &HeaderMap, credential_key: &str) -> Result<(), SigError>
 
 /// Standard base64, `=` padding optional and unused bits ignored, as the
 /// reference decodes a byte sequence (`Uint8Array.fromBase64`, "loose").
-const B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+pub(crate) const B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
     &base64::alphabet::STANDARD,
     base64::engine::GeneralPurposeConfig::new()
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
@@ -141,7 +210,7 @@ fn single<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// Every field line, combined with ", " (RFC 9110 §5.3, as Node joins a
 /// repeated header).
-fn joined(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn joined(headers: &HeaderMap, name: &str) -> Option<String> {
     let lines: Vec<&str> = headers.get_all(name).iter().map(|v| v.to_str().ok()).collect::<Option<_>>()?;
     (!lines.is_empty()).then(|| lines.join(", "))
 }
@@ -178,7 +247,7 @@ mod tests {
 
     /// The reference client's headers (`createSpaceSigHeaders`).
     fn signed(sk: &p256::ecdsa::SigningKey) -> Vec<(String, String)> {
-        let sig = sign(sk, &signature_base(AUTHORIZATION, INPUT, AUDIENCE));
+        let sig = sign(sk, &signature_base(&credential_components(), &[AUTHORIZATION, AUDIENCE], INPUT));
         vec![
             ("authorization".into(), AUTHORIZATION.into()),
             (AUDIENCE_HEADER.into(), AUDIENCE.into()),
@@ -241,7 +310,7 @@ mod tests {
         let base = format!(
             "\"authorization\": {AUTHORIZATION}\n\"atproto-space-audience\": {AUDIENCE}\n\"@signature-params\": {INPUT}"
         );
-        assert_eq!(signature_base(AUTHORIZATION, INPUT, AUDIENCE), base.as_bytes());
+        assert_eq!(signature_base(&credential_components(), &[AUTHORIZATION, AUDIENCE], INPUT), base.as_bytes());
         assert_eq!(verify(&to_map(&h), &did), Ok(()));
     }
 
@@ -255,18 +324,23 @@ mod tests {
                 "signature-input",
                 format!("{LABEL}={}", INPUT.replace(";tag=\"atproto-space-credential\"", tag)),
             );
-            assert!(verify(&to_map(&h), &did).unwrap_err().0.contains("tag must be"), "{tag}");
+            assert!(verify(&to_map(&h), &did).unwrap_err().0.contains("with tag"), "{tag}");
         }
     }
 
+    /// Found by its tag: the label is the signer's, and an intermediary may
+    /// change it. Two signatures with the tag are refused.
     #[test]
-    fn old_label_refused() {
+    fn any_label_one_tag() {
         let (sk, did) = key();
         let mut h = signed(&sk);
-        set(&mut h, "signature-input", format!("atproto-space={INPUT}"));
-        let sig = get(&h, "signature").replacen(LABEL, "atproto-space", 1);
-        set(&mut h, "signature", sig);
-        assert_eq!(verify(&to_map(&h), &did), Err(MALFORMED));
+        set(&mut h, "signature-input", format!("atproto-space-credential={INPUT}"));
+        let sig = get(&h, "signature").replacen(LABEL, "atproto-space-credential", 1);
+        set(&mut h, "signature", sig.clone());
+        assert_eq!(verify(&to_map(&h), &did), Ok(()));
+        set(&mut h, "signature-input", format!("atproto-space-credential={INPUT}, b={INPUT}"));
+        set(&mut h, "signature", format!("{sig}, b=:YWJj:"));
+        assert!(verify(&to_map(&h), &did).unwrap_err().0.contains("more than one"));
     }
 
     #[test]
@@ -413,13 +487,13 @@ mod tests {
         let mut h = signed(&sk);
         let v = get(&h, "signature");
         set(&mut h, "signature", format!("{v};x=1"));
-        assert_eq!(verify(&to_map(&h), &did), Err(MALFORMED));
+        assert!(verify(&to_map(&h), &did).unwrap_err().0.contains("missing or malformed signature with tag"));
         // oversized fields are refused before parsing
         let mut h = signed(&sk);
         let input = get(&h, "signature-input");
         let pad: String = (0..2000).map(|i| format!("k{i}=1, ")).collect();
         set(&mut h, "signature-input", format!("{pad}{input}"));
-        assert_eq!(verify(&to_map(&h), &did), Err(INVALID));
+        assert_eq!(verify(&to_map(&h), &did), Err(SigError("missing or malformed signature headers")));
         // a later member with the same label replaces the first
         let mut h = signed(&sk);
         set(&mut h, "signature", format!("{v}, {LABEL}=:YWJj:"));

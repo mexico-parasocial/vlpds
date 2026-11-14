@@ -3,10 +3,10 @@ from the reference implementation:
 
   repo:   https://github.com/bluesky-social/atproto
   branch: permissioned-data (PR #5187)
-  commit: 98ef3a6b9d1364f0543f137dd024de9651b21c4c
+  commit: 16bfeba760aede46f0b87bf94febef9e6ea84b95
   paths:  lexicons/com/atproto/space/*.json          (methods, defs, the policy record)
-          lexicons/com/atproto/memberspace/*.json    (policy, member record, member methods)
-          lexicons/com/atproto/managedspace/*.json   (policy, checkUserAccess)
+          lexicons/com/atproto/memberspace/*.json    (policy, member record, member methods, defs)
+          lexicons/com/atproto/managedspace/*.json   (policy, checkAccess)
           lexicons/com/atproto/personalspace/*.json  (policy)
 
 License: MIT (bluesky-social/atproto). Upstream changes weekly; to update,

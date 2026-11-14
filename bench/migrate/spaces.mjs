@@ -153,7 +153,7 @@ async function account(base, name, domain, { oauth }) {
 
 async function createSpace(a, skey) {
   const out = await a.call('com.atproto.space.createSpace', { body: { spaceType: TYPE, skey, policy: MEMBERS } })
-  return out.uri
+  return out.space
 }
 
 async function writeRecords(a, space, n, withBlob) {
@@ -194,7 +194,7 @@ async function seed() {
   ]) {
     member.blobs = {}
     const club = await createSpace(gov, 'club')
-    await gov.call('com.atproto.memberspace.putMember', { body: { space: club, did: member.did, read: true, write: true } })
+    await gov.call('com.atproto.memberspace.putMembers', { body: { space: club, members: [{ did: member.did, read: true, write: true }] } })
     const notes = await createSpace(member, 'notes')
     await writeRecords(member, club, 3, false)
     await writeRecords(member, notes, 4, true)

@@ -16,7 +16,7 @@ async fn export(actor: &SpaceClient, space: &str) -> Vec<u8> {
 }
 
 async fn import(actor: &SpaceClient, archive: Vec<u8>) -> Resp {
-    actor.post_bytes("com.atproto.space.importSpaceMeta", &[], archive, "application/octet-stream").await
+    actor.post_bytes("com.atproto.space.importSpaceMeta", &[], archive, "application/vnd.dasl.star").await
 }
 
 async fn members(actor: &SpaceClient, space: &str) -> Vec<J> {
@@ -53,13 +53,26 @@ async fn the_space_meta_archive_round_trips() {
     want.sort();
     assert_eq!(got, want);
     assert_eq!(net.writer_dids(&alice, &space).await, writers, "the writer set, in spaceRev order");
-    // the spaceRevs survive, so a listRepos cursor still works
+    // the spaceRevs survive, so a listWriters cursor still works
     assert_eq!(meta::read(&export(&alice, &space).await).unwrap().writers, read.writers);
 
     // again, after a member left: the archive replaces the list
-    alice.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": dan.did})).await.ok();
+    alice.post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [dan.did]})).await.ok();
     import(&alice, archive).await.ok();
     assert_eq!(members(&alice, &space).await.len(), 2);
+}
+
+/// "leaves a removed writer out of the archive".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaves_a_removed_writer_out_of_the_archive() {
+    let net = Net::new(1).await;
+    let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 0).await);
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
+    write(&bob, &space, W::new()).await.ok();
+    retry("bob in the writer set", || async { net.writer_dids(&alice, &space).await.contains(&bob.did).then_some(()) })
+        .await;
+    alice.post("com.atproto.space.removeWriter", json!({"space": space, "repo": bob.did})).await.ok();
+    assert!(meta::read(&export(&alice, &space).await).unwrap().writers.is_empty());
 }
 
 /// "rejects an archive": with a policy the host doesn't implement, policy
@@ -80,8 +93,8 @@ async fn rejects_an_archive() {
     import(&alice, with(json!({"$type": "com.example.policy"}), vec![])).await.err(400, "UnsupportedPolicy");
     import(&alice, with(memberspace(json!({})), vec![("com.example.thing/x".into(), member.clone())]))
         .await
-        .err(400, "InvalidRequest");
-    import(&alice, with(personalspace(), vec![(key, member)])).await.err(400, "InvalidRequest");
-    import(&alice, b"not a star archive".to_vec()).await.err(400, "InvalidRequest");
-    import(&bob, meta::write(&base)).await.err(400, "NotSpaceOwner");
+        .err(400, "InvalidSpaceMeta");
+    import(&alice, with(personalspace(), vec![(key, member)])).await.err(400, "InvalidSpaceMeta");
+    import(&alice, b"not a star archive".to_vec()).await.err(400, "InvalidSpaceMeta");
+    import(&bob, meta::write(&base)).await.err(400, "NotAuthorized");
 }

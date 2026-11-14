@@ -60,6 +60,11 @@ fn invalid(m: impl Into<String>) -> XrpcError {
     XrpcError::bad("InvalidRequest", m)
 }
 
+/// An archive that doesn't parse, or isn't the repo it claims to be.
+fn invalid_file(m: impl Into<String>) -> XrpcError {
+    XrpcError::bad("InvalidRepoFile", m)
+}
+
 /// A STAR archive read item by item as the body arrives.
 /// Where a [`StarBody`] reads: the request body (kept for a second pass,
 /// in memory up to [`KEEP_IN_MEMORY`], then in a temporary file), or that
@@ -152,7 +157,7 @@ impl StarBody {
     /// The next item, None once the archive has ended cleanly.
     async fn next(&mut self) -> XResult<Option<star::Item>> {
         loop {
-            let bad = |e: star::StarError| invalid(format!("Invalid STAR: {e}"));
+            let bad = |e: star::StarError| invalid_file(format!("Invalid STAR: {e}"));
             if let Some((item, n)) = self.reader.step(&self.buf[self.pos..], self.eof).map_err(bad)? {
                 self.pos += n;
                 if item == star::Item::End {
@@ -211,14 +216,14 @@ impl StarBody {
 /// stored as is, so another encoding of it would match neither its CID nor
 /// the commit.
 fn record_blobs(path: &str, bytes: &[u8]) -> XResult<Vec<Cid>> {
-    let v =
-        vlatproto::cbor::Value::decode(bytes).map_err(|_| invalid(format!("Could not parse record at '{path}'")))?;
+    let v = vlatproto::cbor::Value::decode(bytes)
+        .map_err(|_| invalid_file(format!("Could not parse record at '{path}'")))?;
     let mut again = Vec::with_capacity(bytes.len());
     v.encode(&mut again);
     if again != bytes {
-        return Err(invalid(format!("Invalid STAR: record is not canonical DRISL at {path}")));
+        return Err(invalid_file(format!("Invalid STAR: record is not canonical DRISL at {path}")));
     }
-    vlatproto::cbor::scan_blob_refs(bytes).map_err(|_| invalid(format!("Could not parse record at '{path}'")))
+    vlatproto::cbor::scan_blob_refs(bytes).map_err(|_| invalid_file(format!("Could not parse record at '{path}'")))
 }
 
 /// Releases the import's claim however it ends.
@@ -276,11 +281,11 @@ async fn import(app: &Arc<App>, creds: &Credentials, headers: &HeaderMap, body: 
     let mut star = StarBody::new(body, max);
     let meta = match star.next().await? {
         Some(star::Item::Meta(m)) => m,
-        _ => return Err(invalid("Invalid STAR: missing metadata")),
+        _ => return Err(invalid_file("Invalid STAR: missing metadata")),
     };
-    let c = star::parse_repo_meta(&meta).map_err(|e| invalid(format!("Invalid STAR: {e}")))?;
+    let c = star::parse_repo_meta(&meta).map_err(|e| invalid_file(format!("Invalid STAR: {e}")))?;
     if c.repo != did {
-        return Err(invalid("Repo does not match the authenticated account"));
+        return Err(XrpcError::bad("RepoMismatch", "Repo does not match the authenticated account"));
     }
     let space = Space::parse(&c.space)?;
     creds.need_space(&space.target(), SpaceAccess::WriteAny("create"))?;
@@ -302,7 +307,7 @@ async fn import(app: &Arc<App>, creds: &Credentials, headers: &HeaderMap, body: 
     // touched, so a refused import leaves it as it was
     let (set, _) = stage(None, creds, &did, &space, &mut star, sp.limits.max_records).await?;
     if !commit::matches(&set, &c) {
-        return Err(invalid("Invalid STAR: the records do not match the commit's data"));
+        return Err(invalid_file("Invalid STAR: the records do not match the commit's data"));
     }
     let mut star = star.replay().await?;
     if !matches!(star.next().await?, Some(star::Item::Meta(_))) {
@@ -354,12 +359,13 @@ async fn stage(
     let mut prev: Option<Vec<u8>> = None;
     let mut granted: std::collections::BTreeSet<String> = Default::default();
     while let Some(item) = star.next().await? {
-        let star::Item::Pair { key, value } = item else { return Err(invalid("Invalid STAR: a second metadata")) };
+        let star::Item::Pair { key, value } = item else { return Err(invalid_file("Invalid STAR: a second metadata")) };
         if prev.as_ref().is_some_and(|p| key <= *p) {
-            return Err(invalid("Invalid STAR: duplicate or out-of-order key"));
+            return Err(invalid_file("Invalid STAR: duplicate or out-of-order key"));
         }
-        let path = std::str::from_utf8(&key).map_err(|_| invalid("Invalid STAR: a record path is not UTF-8"))?;
-        let (collection, rkey) = path.split_once('/').ok_or_else(|| invalid(format!("invalid record path {path}")))?;
+        let path = std::str::from_utf8(&key).map_err(|_| invalid_file("Invalid STAR: a record path is not UTF-8"))?;
+        let (collection, rkey) =
+            path.split_once('/').ok_or_else(|| invalid_file(format!("invalid record path {path}")))?;
         check_path(collection, Some(rkey))?;
         if !granted.contains(collection) {
             creds.need_space(&space.target(), SpaceAccess::Write("create", collection))?;

@@ -7,6 +7,7 @@
 #   bench/spaces/run.sh sim [seed] [scale]      (just spaces-sim)
 #   bench/spaces/run.sh fault [seed]            (just spaces-fault)
 #   bench/spaces/run.sh cost                    (just spaces-cost)
+#   bench/spaces/run.sh migrate                 (just spaces-migrate; OLD_VLPDS_BIN, an older build, writes first)
 #   bench/spaces/run.sh boards [config ...]     (just spaces-boards; boards/README.md)
 #   bench/spaces/run.sh boards-ui               (just spaces-boards-ui; UI_E2E=1 runs the headless check and exits)
 #   bench/spaces/run.sh boards-prod             (just spaces-boards-prod; the production server; UI_E2E=1 likewise)
@@ -151,6 +152,7 @@ case "$mode" in
   sim) node sim.mjs "$@" ;;
   fault) FAULTS=1 node sim.mjs "$@" ;;
   cost) node cost.mjs "$@" ;;
+  migrate) node migrate.mjs "$@" ;;
   boards) node boards/scenarios.mjs "$@" ;;
   boards-ui | boards-prod)
     if [ "$mode" = boards-ui ]; then runner=boards/ui.mjs seed="${LOCAL_DIR}seed-accounts.json" check=ui.mjs shots="${OUT}boards-ui/"
@@ -166,5 +168,5 @@ case "$mode" in
     fi
     START_SERVER=1 node "$runner"
     ;;
-  *) echo "unknown mode $mode (e2e | sim | fault | cost | boards | boards-ui | boards-prod)" >&2; exit 2 ;;
+  *) echo "unknown mode $mode (e2e | sim | fault | cost | migrate | boards | boards-ui | boards-prod)" >&2; exit 2 ;;
 esac
