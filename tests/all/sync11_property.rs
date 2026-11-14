@@ -559,9 +559,9 @@ async fn sync11_random_writes_firehose_invariants() {
     // phase 3: concurrent bursts across all repos at once
     for round in 0..(2 * scale()) {
         let mut ops = Vec::new();
-        for i in 0..n_accounts {
+        for (i, model) in run.models.iter().enumerate().take(n_accounts) {
             let mut busy = Default::default();
-            ops.extend((0..40).map(|_| (i, g.op(&run.models[i], &mut busy, false))));
+            ops.extend((0..40).map(|_| (i, g.op(model, &mut busy, false))));
         }
         for (i, r) in concurrently(&s.xrpc, &accts, ops).await {
             run.record(i, r, &format!("cross-repo round {round}"));

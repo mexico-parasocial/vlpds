@@ -36,7 +36,7 @@ RUN npm run build
 # Runs on the build machine and cross-compiles for the target platform:
 # emulating the whole compile (an amd64 image built on an arm64 Mac) is many
 # times slower than compiling natively for another target.
-FROM --platform=$BUILDPLATFORM rust:1.99.0-bookworm AS build
+FROM --platform=$BUILDPLATFORM rust:1.100.0-bookworm AS build
 ARG TARGETARCH
 ARG BUILDARCH
 
