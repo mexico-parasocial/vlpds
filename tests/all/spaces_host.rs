@@ -1,9 +1,9 @@
 //! The space host role (`--spaces`; src/xrpc/space_policy.rs, the host
 //! methods of src/xrpc/space.rs, src/space/host.rs): space management and
-//! its policies, the gates of getSpaceCredential (member lists, public
+//! its policies, the gates of authorizeSpaceSync (member lists, public
 //! spaces, managing apps, app allow lists with client attestations),
-//! deleteSpace's tombstone, inbound notifyWrite from another vlpds with
-//! listRepos, and registrations that get writes forwarded.
+//! deleteSpace's tombstone, inbound notifyRepoUpdate from another vlpds
+//! with listWriters, and registrations that get updates forwarded.
 
 use crate::common::spaces::{resp, SpaceClient};
 use crate::common::*;
@@ -64,7 +64,10 @@ async fn create(owner: &SpaceClient, skey: &str, policy: J) -> Resp {
 
 async fn put_member(owner: &SpaceClient, space: &str, did: &str, read: bool, write: bool) -> Resp {
     owner
-        .post("com.atproto.memberspace.putMember", json!({"space": space, "did": did, "read": read, "write": write}))
+        .post(
+            "com.atproto.memberspace.putMembers",
+            json!({"space": space, "members": [{"did": did, "read": read, "write": write}]}),
+        )
         .await
 }
 
@@ -115,22 +118,37 @@ struct Seen {
 
 #[derive(Clone, Copy)]
 enum Answer {
-    Authorized(bool),
+    /// checkAccess's (read, write).
+    Access(bool, bool),
     Status(u16),
 }
 
-/// A did:web service on loopback (a managing app, a syncer) whose document
-/// names it under `#{fragment}`, recording every call. checkUserAccess
-/// answers as told; anything else 200.
+/// A did:web service on loopback (a managing app, a syncer's endpoint)
+/// whose document names it under `#{fragment}`, recording every call.
+/// checkAccess answers as told, confirmRegistration echoes its challenge,
+/// anything else 200.
 struct Stub {
     did: String,
+    url: String,
     seen: Arc<Mutex<Vec<Seen>>>,
     answer: Arc<Mutex<Answer>>,
 }
 
+const UPDATE: &str = "/xrpc/com.atproto.space.notifySpaceUpdate";
+const CHECK: &str = "/xrpc/com.atproto.managedspace.checkAccess";
+
 impl Stub {
     fn service(&self, fragment: &str) -> String {
         format!("{}#{fragment}", self.did)
+    }
+
+    fn notify(&self, token: &str) -> J {
+        json!({"endpoint": self.url, "token": token})
+    }
+
+    /// The `update` of each notifySpaceUpdate.
+    fn updates(&self) -> Vec<J> {
+        self.calls(UPDATE).into_iter().map(|c| c.body["update"].clone()).collect()
     }
 
     fn calls(&self, path: &str) -> Vec<Seen> {
@@ -143,8 +161,8 @@ async fn stub(fragment: &str) -> Stub {
     let addr = l.local_addr().unwrap();
     let (base, did) = (format!("http://{addr}"), format!("did:web:127.0.0.1%3A{}", addr.port()));
     let seen: Arc<Mutex<Vec<Seen>>> = Default::default();
-    let answer = Arc::new(Mutex::new(Answer::Authorized(true)));
-    let (s, a, d, f) = (seen.clone(), answer.clone(), did.clone(), fragment.to_string());
+    let answer = Arc::new(Mutex::new(Answer::Access(true, true)));
+    let (s, a, d, f, url) = (seen.clone(), answer.clone(), did.clone(), fragment.to_string(), base.clone());
     let router = axum::Router::new().fallback(move |req: Request| {
         let (s, a, d, f, b) = (s.clone(), a.clone(), d.clone(), f.clone(), base.clone());
         async move {
@@ -166,20 +184,18 @@ async fn stub(fragment: &str) -> Stub {
             let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
             let body = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap();
             let body = serde_json::from_slice(&body).unwrap_or(J::Null);
+            let challenge = body["challenge"].clone();
             s.lock().push(Seen { path: path.clone(), query, body, auth });
             match (path.as_str(), *a.lock()) {
-                ("/xrpc/com.atproto.managedspace.checkUserAccess", Answer::Authorized(ok)) => {
-                    json(200, json!({"authorized": ok}))
-                }
-                ("/xrpc/com.atproto.managedspace.checkUserAccess", Answer::Status(st)) => {
-                    json(st, json!({"error": "InternalServerError"}))
-                }
+                (CHECK, Answer::Access(read, write)) => json(200, json!({"read": read, "write": write})),
+                (CHECK, Answer::Status(st)) => json(st, json!({"error": "InternalServerError"})),
+                ("/xrpc/com.atproto.space.confirmRegistration", _) => json(200, json!({"challenge": challenge})),
                 _ => json(200, json!({})),
             }
         }
     });
     tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
-    Stub { did, seen, answer }
+    Stub { did, url, seen, answer }
 }
 
 /// A did:web nobody answers.
@@ -196,7 +212,7 @@ async fn space_lifecycle_and_config() {
     let owner = SpaceClient::new(&s, "shl1", OWNER).await;
     let other = SpaceClient::new(&s, "shl2", MANAGER).await;
     let r = create(&owner, "main", ms(json!({}))).await;
-    let space = r.ok()["uri"].as_str().unwrap().to_string();
+    let space = r.ok()["space"].as_str().unwrap().to_string();
     assert_eq!(space, format!("at://{}/space/{TYPE}/main", owner.did));
     create(&owner, "main", ms(json!({}))).await.err(400, "SpaceAlreadyExists");
     // an auto-generated skey is a TID
@@ -207,7 +223,7 @@ async fn space_lifecycle_and_config() {
         )
         .await
         .ok();
-    let skey = auto["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let skey = auto["space"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
     assert!(Tid::parse(&skey).is_some(), "{auto}");
     for bad in ["a b", "..", "a/b", ""] {
         create(&owner, bad, ms(json!({}))).await.err(400, "InvalidRequest");
@@ -225,11 +241,11 @@ async fn space_lifecycle_and_config() {
 
     // stored normalized: defaults filled in, unknown fields dropped
     let got = get_space(&owner, &space).await.ok();
-    assert_eq!(got, json!({"uri": space, "policy": ms_stored(json!({}))}));
-    get_space(&other, &space).await.err(400, "NotSpaceOwner");
+    assert_eq!(got, json!({"space": space, "policy": ms_stored(json!({}))}));
+    get_space(&other, &space).await.err(400, "NotAuthorized");
     let app = "https://app.example/client-metadata.json";
     let odd = create(&owner, "odd", ms(json!({"publicRead": true, "allowedApps": [app], "somethingNew": 1}))).await;
-    let odd = odd.ok()["uri"].as_str().unwrap().to_string();
+    let odd = odd.ok()["space"].as_str().unwrap().to_string();
     let got = get_space(&owner, &odd).await.ok();
     assert_eq!(got["policy"], ms_stored(json!({"publicRead": true, "allowedApps": [app]})));
 
@@ -251,7 +267,7 @@ async fn space_lifecycle_and_config() {
         .await
         .err(400, "SpaceNotFound");
     let r = other.post("com.atproto.space.updateSpace", json!({"space": space, "policy": ms(json!({}))})).await;
-    r.err(400, "NotSpaceOwner");
+    r.err(400, "NotAuthorized");
     // a grant without manage=update is refused for its scope
     let reader = SpaceClient::new(&s, "shl3", "space:com.example.group?action=read").await;
     let r = reader
@@ -263,14 +279,15 @@ async fn space_lifecycle_and_config() {
     assert_eq!(r.status, 403, "{r:?}");
 
     // listSpaces by type and authority, a deleted space left out
-    let second = create(&owner, "second", ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string();
+    let second = create(&owner, "second", ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string();
     owner.post("com.atproto.space.deleteSpace", json!({"space": second})).await.ok();
-    let listed = owner.get("com.atproto.space.listSpaces", &[("spaceType", TYPE), ("did", &owner.did)]).await.ok();
-    let uris: Vec<&str> = listed["spaces"].as_array().unwrap().iter().map(|s| s["uri"].as_str().unwrap()).collect();
+    let listed = owner.get("com.atproto.space.listSpaces", &[("spaceType", TYPE), ("spaceDid", &owner.did)]).await.ok();
+    let uris: Vec<&str> = listed["spaces"].as_array().unwrap().iter().map(|s| s["space"].as_str().unwrap()).collect();
     assert_eq!(uris.len(), 3, "{listed}");
     assert!(uris.contains(&space.as_str()) && !uris.contains(&second.as_str()), "{listed}");
-    let other_type =
-        owner.get("com.atproto.space.listSpaces", &[("spaceType", "com.example.other"), ("did", &owner.did)]).await;
+    let other_type = owner
+        .get("com.atproto.space.listSpaces", &[("spaceType", "com.example.other"), ("spaceDid", &owner.did)])
+        .await;
     assert_eq!(other_type.status, 403, "no grant for another type: {other_type:?}");
 }
 
@@ -280,7 +297,7 @@ async fn member_list() {
     let owner = SpaceClient::new(&s, "shm1", OWNER).await;
     let other = SpaceClient::new(&s, "shm2", MANAGER).await;
     let member = SpaceClient::new(&s, "shm3", ANY).await;
-    let space = create(&owner, "m", ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string();
+    let space = create(&owner, "m", ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string();
     assert_eq!(members(&owner, &space, &[]).await.ok(), json!({"members": []}));
     put_member(&owner, &space, &member.did, true, false).await.ok();
     let m = members(&owner, &space, &[]).await.ok();
@@ -290,13 +307,17 @@ async fn member_list() {
     let m = members(&owner, &space, &[]).await.ok();
     assert_eq!(m["members"], json!([{"did": member.did, "read": false, "write": true}]));
     // the owner only
-    put_member(&other, &space, &other.did, true, true).await.err(400, "NotSpaceOwner");
-    let r = other.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": member.did})).await;
-    r.err(400, "NotSpaceOwner");
-    members(&other, &space, &[]).await.err(400, "NotSpaceOwner");
+    put_member(&other, &space, &other.did, true, true).await.err(400, "NotAuthorized");
+    let r = other.post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [member.did]})).await;
+    r.err(400, "NotAuthorized");
+    members(&other, &space, &[]).await.err(400, "NotAuthorized");
     put_member(&owner, &space, "not-a-did", true, true).await.err(400, "InvalidRequest");
-    let r =
-        owner.post("com.atproto.memberspace.putMember", json!({"space": space, "did": member.did, "read": true})).await;
+    let r = owner
+        .post(
+            "com.atproto.memberspace.putMembers",
+            json!({"space": space, "members": [{"did": member.did, "read": true}]}),
+        )
+        .await;
     r.err(400, "InvalidRequest");
     let none = format!("at://{}/space/{TYPE}/none", owner.did);
     put_member(&owner, &none, &member.did, true, true).await.err(400, "SpaceNotFound");
@@ -329,12 +350,12 @@ async fn member_list() {
     let r = member.signed_get(&s.url, "com.atproto.space.getSpace", &[("space", &space)], &cred, &owner.did).await;
     assert_eq!(r.status, 401, "{r:?}");
 
-    owner.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": member.did})).await.ok();
+    owner.post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [member.did]})).await.ok();
     let m = members(&owner, &space, &[]).await.ok();
     assert!(m["members"].as_array().unwrap().iter().all(|x| x["did"] != json!(member.did)), "{m}");
     member.try_credential_at(&s.url, &space, None).await.err(400, "SpaceNotFound");
     // removing a non-member is fine
-    owner.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": member.did})).await.ok();
+    owner.post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [member.did]})).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -344,7 +365,7 @@ async fn credential_gates() {
     let reader = SpaceClient::new(&s, "shg2", ANY).await;
     let writer_only = SpaceClient::new(&s, "shg3", ANY).await;
     let stranger = SpaceClient::new(&s, "shg4", ANY).await;
-    let listed = create(&owner, "listed", ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string();
+    let listed = create(&owner, "listed", ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string();
     put_member(&owner, &listed, &reader.did, true, false).await.ok();
     put_member(&owner, &listed, &writer_only.did, false, true).await.ok();
     reader.try_credential_at(&s.url, &listed, None).await.ok();
@@ -353,7 +374,7 @@ async fn credential_gates() {
     // the authority is always admitted, listed or not
     owner.try_credential_at(&s.url, &listed, None).await.ok();
     let public =
-        create(&owner, "public", ms(json!({"publicRead": true}))).await.ok()["uri"].as_str().unwrap().to_string();
+        create(&owner, "public", ms(json!({"publicRead": true}))).await.ok()["space"].as_str().unwrap().to_string();
     stranger.try_credential_at(&s.url, &public, None).await.ok();
     // a space this host doesn't govern, or that was never created
     let elsewhere = format!("at://{}/space/{TYPE}/x", dead_did().await);
@@ -387,7 +408,7 @@ async fn allow_list_takes_client_attestations() {
             .await;
     let space = create(&owner, "apps", ms(json!({"publicRead": true, "publicWrite": true, "allowedApps": [client]})))
         .await
-        .ok()["uri"]
+        .ok()["space"]
         .as_str()
         .unwrap()
         .to_string();
@@ -417,12 +438,17 @@ async fn allow_list_takes_client_attestations() {
     // not a JWT at all
     user.try_credential_at(&s.url, &space, Some("nope")).await.err(400, "InvalidClientAttestation");
     // an open space takes an attestation too, and ignores the client
-    let open = create(&owner, "open", ms(json!({"publicRead": true, "publicWrite": true}))).await.ok()["uri"]
+    let open = create(&owner, "open", ms(json!({"publicRead": true, "publicWrite": true}))).await.ok()["space"]
         .as_str()
         .unwrap()
         .to_string();
     let fresh = attestation(&other_sk, &unlisted, &aud, now, now + 60);
     user.try_credential_at(&s.url, &open, Some(&fresh)).await.ok();
+}
+
+/// Writers in a listWriters page (its repoWrite entries).
+fn writes(repos: &[J]) -> Vec<J> {
+    repos.iter().filter(|r| r["$type"] == "com.atproto.space.defs#repoWrite").cloned().collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -432,55 +458,52 @@ async fn managing_app_decides() {
     let user = SpaceClient::new(&s, "shp2", ANY).await;
     let app = stub("forum").await;
     let managed = managing(&app.service("forum"));
-    let space = create(&owner, "managed", managed.clone()).await.ok()["uri"].as_str().unwrap().to_string();
+    let space = create(&owner, "managed", managed.clone()).await.ok()["space"].as_str().unwrap().to_string();
     user.try_credential_at(&s.url, &space, None).await.ok();
-    let calls = app.calls("/xrpc/com.atproto.managedspace.checkUserAccess");
+    let calls = app.calls(CHECK);
     assert_eq!(calls.len(), 1);
     let q: std::collections::HashMap<String, String> =
         reqwest::Url::parse(&format!("http://x/?{}", calls[0].query)).unwrap().query_pairs().into_owned().collect();
-    assert_eq!(
-        (q["space"].as_str(), q["user"].as_str(), q["access"].as_str()),
-        (space.as_str(), user.did.as_str(), "read")
-    );
+    assert_eq!(q.len(), 2, "{q:?}");
+    assert_eq!((q["space"].as_str(), q["repo"].as_str()), (space.as_str(), user.did.as_str()));
     let p = jwt_payload(&calls[0].auth);
     assert_eq!(p["iss"], json!(owner.did));
     assert_eq!(p["aud"], json!(app.service("forum")));
-    assert_eq!(p["lxm"], json!("com.atproto.managedspace.checkUserAccess"));
-    *app.answer.lock() = Answer::Authorized(false);
+    assert_eq!(p["lxm"], json!("com.atproto.managedspace.checkAccess"));
+    *app.answer.lock() = Answer::Access(false, true);
     user.try_credential_at(&s.url, &space, None).await.err(400, "SpaceNotFound");
+    // no answer is a failure to retry, not a refusal
     *app.answer.lock() = Answer::Status(500);
-    user.try_credential_at(&s.url, &space, None).await.err(400, "SpaceNotFound");
+    user.try_credential_at(&s.url, &space, None).await.err(502, "UpstreamFailure");
     // the authority isn't asked about
-    let before = app.calls("/xrpc/com.atproto.managedspace.checkUserAccess").len();
+    let before = app.calls(CHECK).len();
     owner.try_credential_at(&s.url, &space, None).await.ok();
-    assert_eq!(app.calls("/xrpc/com.atproto.managedspace.checkUserAccess").len(), before);
-    // an app that can't be resolved denies
+    assert_eq!(app.calls(CHECK).len(), before);
+    // an app that can't be resolved, or names no such service
     let gone = managing(&format!("{}#forum", dead_did().await));
     owner.post("com.atproto.space.updateSpace", json!({"space": space, "policy": gone})).await.ok();
-    user.try_credential_at(&s.url, &space, None).await.err(400, "SpaceNotFound");
+    user.try_credential_at(&s.url, &space, None).await.err(502, "UpstreamFailure");
     let nameless = managing(&app.service("other"));
     owner.post("com.atproto.space.updateSpace", json!({"space": space, "policy": nameless})).await.ok();
-    user.try_credential_at(&s.url, &space, None).await.err(400, "SpaceNotFound");
+    user.try_credential_at(&s.url, &space, None).await.err(502, "UpstreamFailure");
 
     // writes: a local writer's notify asks the app too, with no client
     owner.post("com.atproto.space.updateSpace", json!({"space": space, "policy": managed})).await.ok();
     let cred = owner.credential(&space).await;
     let repos = || async {
-        let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
-        r.ok()["repos"].as_array().unwrap().iter().map(|r| r["did"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        let r =
+            owner.signed_get(&s.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await;
+        let all = r.ok()["repos"].as_array().unwrap().clone();
+        writes(&all).iter().map(|r| r["repo"].as_str().unwrap().to_string()).collect::<Vec<_>>()
     };
-    *app.answer.lock() = Answer::Authorized(false);
+    *app.answer.lock() = Answer::Access(true, false);
+    let asked = app.calls(CHECK).len();
     user.create_record(&space, COLL, Some("1"), rec("refused")).await.ok();
-    assert!(
-        eventually(Duration::from_secs(10), || async {
-            app.calls("/xrpc/com.atproto.managedspace.checkUserAccess").iter().any(|c| c.query.contains("access=write"))
-        })
-        .await
-    );
-    let calls = app.calls("/xrpc/com.atproto.managedspace.checkUserAccess");
-    assert!(calls.iter().filter(|c| c.query.contains("access=write")).all(|c| !c.query.contains("clientId")));
+    assert!(eventually(Duration::from_secs(10), || async { app.calls(CHECK).len() > asked }).await);
+    assert!(app.calls(CHECK)[asked..].iter().all(|c| !c.query.contains("clientId")));
     assert!(repos().await.is_empty());
-    *app.answer.lock() = Answer::Authorized(true);
+    // a writer the app doesn't let read is still a writer
+    *app.answer.lock() = Answer::Access(false, true);
     user.create_record(&space, COLL, Some("2"), rec("admitted")).await.ok();
     assert!(eventually(Duration::from_secs(10), || async { repos().await == vec![user.did.clone()] }).await);
 }
@@ -491,27 +514,18 @@ async fn delete_space_tombstones_and_recreates_fresh() {
     let owner = SpaceClient::new(&s, "shd1", OWNER).await;
     let member = SpaceClient::new(&s, "shd2", ANY).await;
     let syncer = stub("atproto_space_syncer").await;
-    let space = create(&owner, "d", ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string();
+    let space = create(&owner, "d", ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string();
     put_member(&owner, &space, &member.did, true, true).await.ok();
     owner.create_record(&space, COLL, Some("own"), rec("owner's")).await.ok();
     member.create_record(&space, COLL, Some("mine"), rec("member's")).await.ok();
     let cred = owner.credential(&space).await;
     let listed = || async {
-        let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
+        let r =
+            owner.signed_get(&s.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await;
         r.ok()["repos"].as_array().unwrap().len()
     };
     assert!(eventually(Duration::from_secs(10), || async { listed().await == 2 }).await);
-    let service = syncer.service("atproto_space_syncer");
-    owner
-        .signed_post(
-            &s.url,
-            "com.atproto.space.registerNotify",
-            json!({"space": space, "service": service}),
-            &cred,
-            &owner.did,
-        )
-        .await
-        .ok();
+    owner.authorize_notify(&s.url, &space, syncer.notify("d-token")).await.ok();
 
     // only the owner deletes
     let r = member.post("com.atproto.space.deleteSpace", json!({"space": space})).await;
@@ -521,17 +535,16 @@ async fn delete_space_tombstones_and_recreates_fresh() {
     members(&owner, &space, &[]).await.err(400, "SpaceNotFound");
     member.try_credential_at(&s.url, &space, None).await.err(400, "SpaceDeleted");
     owner.try_credential_at(&s.url, &space, None).await.err(400, "SpaceDeleted");
-    let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
+    let r = owner.signed_get(&s.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await;
     r.err(400, "SpaceNotFound");
+    let deleted = json!({"$type": "com.atproto.space.notifySpaceUpdate#spaceDeleted"});
     assert!(
-        eventually(Duration::from_secs(10), || async {
-            syncer.calls("/xrpc/com.atproto.space.notifySpaceDeleted").iter().any(|c| c.body["space"] == json!(space))
-        })
-        .await,
+        eventually(Duration::from_secs(10), || async { syncer.updates().contains(&deleted) }).await,
         "registrations are told"
     );
-    let told = &syncer.calls("/xrpc/com.atproto.space.notifySpaceDeleted")[0];
-    assert_eq!(jwt_payload(&told.auth)["aud"], json!(service));
+    let told = syncer.calls(UPDATE).into_iter().find(|c| c.body["update"] == deleted).unwrap();
+    assert_eq!(told.body, json!({"space": space, "token": "d-token", "update": deleted}));
+    assert_eq!(told.auth, "", "no service auth: the token is the proof");
     // the authority's own repo goes; the member's stays its own
     let own = owner
         .get(
@@ -560,19 +573,19 @@ async fn delete_space_tombstones_and_recreates_fresh() {
     assert_eq!(members(&owner, &space, &[]).await.ok(), json!({"members": []}));
     member.try_credential_at(&s.url, &space, None).await.err(400, "SpaceNotFound");
     let cred = owner.credential(&space).await;
-    let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
+    let r = owner.signed_get(&s.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await;
     assert_eq!(r.ok(), json!({"repos": []}));
     let r = owner.get("com.atproto.space.listRecords", &[("space", &space), ("repo", &owner.did)]).await;
     assert_eq!(r.ok()["records"], json!([]));
-    let before = syncer.calls("/xrpc/com.atproto.space.notifyWrite").len();
+    let before = syncer.calls(UPDATE).len();
     owner.create_record(&space, COLL, Some("new"), rec("new")).await.ok();
     assert!(eventually(Duration::from_secs(10), || async { listed().await == 1 }).await);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(syncer.calls("/xrpc/com.atproto.space.notifyWrite").len(), before, "the old registration is gone");
+    assert_eq!(syncer.calls(UPDATE).len(), before, "the old registration is gone");
 }
 
 /// The authority's own repo needs its space: a write before createSpace is
-/// refused, and one after it is in listRepos at once.
+/// refused, and one after it is in listWriters at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_writes_need_the_space() {
     let s = spawn().await;
@@ -582,8 +595,8 @@ async fn owner_writes_need_the_space() {
     create(&owner, "early", ms(json!({}))).await.ok();
     owner.create_record(&space, COLL, Some("1"), rec("on time")).await.ok();
     let cred = owner.credential(&space).await;
-    let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
-    assert_eq!(r.ok()["repos"][0]["did"], json!(owner.did), "{:?}", r.json);
+    let r = owner.signed_get(&s.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await;
+    assert_eq!(r.ok()["repos"][0]["repo"], json!(owner.did), "{:?}", r.json);
 }
 
 /// Two vlpds on separate stores sharing a PLC directory.
@@ -598,14 +611,14 @@ async fn pair(plc: &vlpds::plc::mock::MockPlc) -> (TestServer, TestServer) {
     (spawn().await, spawn().await)
 }
 
-/// notifyWrite to `host` with service auth minted by `iss` (an account of
-/// `signer`) for `aud`.
+/// notifyRepoUpdate to `host` with service auth minted by `iss` (an
+/// account of `signer`) for `aud`.
 async fn notify(host: &TestServer, signer: &TestServer, iss: &str, aud: &str, body: J) -> Resp {
     let acct = signer.app.account(iss).await.ok().unwrap();
     let key = signer.app.secrets.account_signing_key(&acct).await.unwrap();
-    let jwt = vlpds::auth::service_auth_jwt(&key, iss, aud, Some("com.atproto.space.notifyWrite"), 60).unwrap();
+    let jwt = vlpds::auth::service_auth_jwt(&key, iss, aud, Some("com.atproto.space.notifyRepoUpdate"), 60).unwrap();
     let r = reqwest::Client::new()
-        .post(format!("{}/xrpc/com.atproto.space.notifyWrite", host.url))
+        .post(format!("{}/xrpc/com.atproto.space.notifyRepoUpdate", host.url))
         .bearer_auth(jwt)
         .json(&body)
         .send()
@@ -632,48 +645,36 @@ async fn notify_write_from_another_vlpds() {
     let stranger = SpaceClient::new(&a, "shs1", ANY).await;
     let reader = SpaceClient::new(&a, "shr1", ANY).await;
     let syncer = stub("atproto_space_syncer").await;
-    let space = create(&owner, "pair", ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string();
+    let space = create(&owner, "pair", ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string();
     put_member(&owner, &space, &member.did, true, true).await.ok();
     put_member(&owner, &space, &reader.did, true, false).await.ok();
     let cred = owner.credential(&space).await;
     let repos = || async {
-        let r = owner.signed_get(&b.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
+        let r =
+            owner.signed_get(&b.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await;
         r.ok()["repos"].as_array().unwrap().clone()
     };
 
-    // a syncer registered by a member's credential, addressed to the authority
-    let mcred = member.credential_at(&b.url, &space).await;
-    let service = syncer.service("atproto_space_syncer");
-    let reg = member
-        .signed_post(
-            &b.url,
-            "com.atproto.space.registerNotify",
-            json!({"space": space, "service": service}),
-            &mcred,
-            &owner.did,
-        )
-        .await
-        .ok();
-    let expires = chrono::DateTime::parse_from_rfc3339(reg["expiresAt"].as_str().unwrap()).unwrap();
-    let ttl = expires.timestamp() - chrono::Utc::now().timestamp();
-    assert!((24 * 3600 - 60..=24 * 3600).contains(&ttl), "{reg}");
-    let r = member
-        .signed_post(
-            &b.url,
-            "com.atproto.space.registerNotify",
-            json!({"space": space, "service": format!("{}#x", dead_did().await)}),
-            &mcred,
-            &owner.did,
-        )
-        .await;
-    r.err(400, "ServiceNotResolvable");
+    // a syncer registered through a member's authorization, until its
+    // credential expires; an endpoint that doesn't confirm isn't registered
+    let reg = member.authorize_notify(&b.url, &space, syncer.notify("pair-token")).await.ok();
+    let claims = jwt_payload(&format!("Bearer {}", reg["credential"].as_str().unwrap()));
+    let p = b.app.partition(&owner.did).ok().unwrap();
+    let id = vlpds::state::registration_id(&syncer.url, "pair-token");
+    let row = p.db.get(vlpds::state::space_registration_key(&owner.did, &vlpds::state::space_id(&space), &id)).await;
+    let row = vlpds::space::rows::RegRow::decode(&row.unwrap().unwrap()).unwrap();
+    assert_eq!(row.expires, claims["exp"].as_u64().unwrap() * 1_000_000, "the credential's expiry");
+    assert!(reg.get("spaceRev").is_none(), "nothing sequenced yet: {reg}");
+    let dead = format!("http://127.0.0.1:{}", dead_did().await.rsplit("%3A").next().unwrap());
+    let r = member.authorize_notify(&b.url, &space, json!({"endpoint": dead, "token": "t"})).await;
+    r.err(400, "RegistrationNotConfirmed");
 
     // A's outbox notifies B, which sequences the write
     member.create_record(&space, COLL, Some("1"), rec("one")).await.ok();
     let rev1 = head(&member, &space).await;
     assert!(
         eventually(Duration::from_secs(10), || async {
-            repos().await.iter().any(|r| r["did"] == json!(member.did) && r["repoRev"] == json!(rev1))
+            repos().await.iter().any(|r| r["repo"] == json!(member.did) && r["repoRev"] == json!(rev1))
         })
         .await
     );
@@ -693,21 +694,21 @@ async fn notify_write_from_another_vlpds() {
     let space_rev2 = second[0]["spaceRev"].as_str().unwrap().to_string();
     assert!(space_rev2 > space_rev1);
 
-    // the syncer got both, in order, each naming the one before
-    assert!(
-        eventually(Duration::from_secs(10), || async {
-            syncer.calls("/xrpc/com.atproto.space.notifyWrite").len() >= 2
-        })
-        .await
+    // the syncer got both, in order, each naming the one before, with its
+    // token and no service auth
+    assert!(eventually(Duration::from_secs(10), || async { syncer.updates().len() >= 2 }).await);
+    let fwd = syncer.updates();
+    assert_eq!(fwd[0]["spaceRev"], json!(space_rev1));
+    assert!(fwd[0].get("prevSpaceRev").is_none(), "{:?}", fwd[0]);
+    assert_eq!(fwd[1]["spaceRev"], json!(space_rev2));
+    assert_eq!(fwd[1]["prevSpaceRev"], json!(space_rev1));
+    assert_eq!((fwd[1]["repo"].clone(), fwd[1]["repoRev"].clone()), (json!(member.did), json!(rev2)));
+    assert_eq!(fwd[1]["$type"], json!("com.atproto.space.defs#repoWrite"));
+    let call = &syncer.calls(UPDATE)[1];
+    assert_eq!(
+        (&call.body["space"], &call.body["token"], call.auth.as_str()),
+        (&json!(space), &json!("pair-token"), "")
     );
-    let fwd = syncer.calls("/xrpc/com.atproto.space.notifyWrite");
-    assert_eq!(fwd[0].body["spaceRev"], json!(space_rev1));
-    assert!(fwd[0].body.get("prevSpaceRev").is_none(), "{:?}", fwd[0].body);
-    assert_eq!(fwd[1].body["spaceRev"], json!(space_rev2));
-    assert_eq!(fwd[1].body["prevSpaceRev"], json!(space_rev1));
-    assert_eq!((fwd[1].body["repo"].clone(), fwd[1].body["repoRev"].clone()), (json!(member.did), json!(rev2)));
-    let p = jwt_payload(&fwd[1].auth);
-    assert_eq!((p["iss"].clone(), p["aud"].clone()), (json!(owner.did), json!(service)));
 
     // inbound notifies, one wrong thing at a time
     let aud = format!("{}#atproto_pds", owner.did);
@@ -747,7 +748,7 @@ async fn notify_write_from_another_vlpds() {
     // the repoRev is checked before auth
     let r = resp(
         reqwest::Client::new()
-            .post(format!("{}/xrpc/com.atproto.space.notifyWrite", b.url))
+            .post(format!("{}/xrpc/com.atproto.space.notifyRepoUpdate", b.url))
             .json(&body(&member.did, "not-a-tid"))
             .send()
             .await
@@ -757,7 +758,7 @@ async fn notify_write_from_another_vlpds() {
     r.err(400, "InvalidRequest");
     let r = resp(
         reqwest::Client::new()
-            .post(format!("{}/xrpc/com.atproto.space.notifyWrite", b.url))
+            .post(format!("{}/xrpc/com.atproto.space.notifyRepoUpdate", b.url))
             .json(&body(&member.did, &now))
             .send()
             .await
@@ -772,96 +773,86 @@ async fn notify_write_from_another_vlpds() {
     let listed = repos().await;
     assert_eq!(listed.len(), 1, "{listed:?}");
 
-    // a removed member leaves the writer set
-    owner.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": member.did})).await.ok();
-    assert_eq!(repos().await, Vec::<J>::new());
-
-    // unregistered: forwards stop
-    put_member(&owner, &space, &member.did, true, true).await.ok();
-    member
-        .signed_post(
-            &b.url,
-            "com.atproto.space.unregisterNotify",
-            json!({"space": space, "service": service}),
-            &mcred,
-            &owner.did,
-        )
+    // a removed member leaves the writer set: listed as removed, at a new
+    // spaceRev, and the syncer is told
+    owner.post("com.atproto.memberspace.removeMembers", json!({"space": space, "dids": [member.did]})).await.ok();
+    let gone = repos().await;
+    assert_eq!(writes(&gone), Vec::<J>::new());
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert_eq!(
+        (&gone[0]["$type"], &gone[0]["repo"]),
+        (&json!("com.atproto.space.defs#repoRemoved"), &json!(member.did))
+    );
+    assert!(gone[0]["spaceRev"].as_str() > Some(space_rev2.as_str()));
+    assert!(gone[0].get("repoRev").is_none());
+    assert!(
+        eventually(Duration::from_secs(10), || async {
+            syncer.updates().last().is_some_and(|u| u["$type"] == "com.atproto.space.defs#repoRemoved")
+        })
         .await
-        .ok();
-    let before = syncer.calls("/xrpc/com.atproto.space.notifyWrite").len();
+    );
+    assert_eq!(syncer.updates().last().unwrap()["prevSpaceRev"], json!(space_rev2));
+
+    // lapsed: the next update is an expiry notice, and nothing after it
+    put_member(&owner, &space, &member.did, true, true).await.ok();
+    let before = syncer.updates().len();
+    vlpds::xrpc::space::set_registration_expiry(
+        &b.app,
+        &space,
+        &syncer.url,
+        "pair-token",
+        vlatproto::tid::now_micros() - 1,
+    )
+    .await
+    .unwrap();
     member.create_record(&space, COLL, Some("3"), rec("three")).await.ok();
     let rev3 = head(&member, &space).await;
     assert!(
         eventually(Duration::from_secs(10), || async {
-            repos().await.first().is_some_and(|r| r["repoRev"] == json!(rev3))
+            writes(&repos().await).first().is_some_and(|r| r["repoRev"] == json!(rev3))
         })
         .await
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(syncer.calls("/xrpc/com.atproto.space.notifyWrite").len(), before);
-    // an expired registration gets nothing either
-    member
-        .signed_post(
-            &b.url,
-            "com.atproto.space.registerNotify",
-            json!({"space": space, "service": service}),
-            &mcred,
-            &owner.did,
-        )
-        .await
-        .ok();
-    vlpds::xrpc::space::set_registration_expiry(&b.app, &space, &service, vlatproto::tid::now_micros() - 1)
-        .await
-        .unwrap();
+    assert!(eventually(Duration::from_secs(10), || async { syncer.updates().len() > before }).await);
     member.create_record(&space, COLL, Some("4"), rec("four")).await.ok();
     let rev4 = head(&member, &space).await;
     assert!(
         eventually(Duration::from_secs(10), || async {
-            repos().await.first().is_some_and(|r| r["repoRev"] == json!(rev4))
+            writes(&repos().await).first().is_some_and(|r| r["repoRev"] == json!(rev4))
         })
         .await
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(syncer.calls("/xrpc/com.atproto.space.notifyWrite").len(), before);
-    // unregistering what isn't registered is fine
-    member
-        .signed_post(
-            &b.url,
-            "com.atproto.space.unregisterNotify",
-            json!({"space": space, "service": service}),
-            &mcred,
-            &owner.did,
-        )
-        .await
-        .ok();
+    let late: Vec<J> = syncer.updates()[before..].iter().map(|u| u["$type"].clone()).collect();
+    assert_eq!(late, [json!("com.atproto.space.notifySpaceUpdate#registrationExpired")]);
 
-    // listRepos pages by spaceRev; the cursor is a plain string
+    // listWriters pages by spaceRev; the cursor is a plain string
     let p1 = owner
-        .signed_get(&b.url, "com.atproto.space.listRepos", &[("space", &space), ("limit", "1")], &cred, &owner.did)
+        .signed_get(&b.url, "com.atproto.space.listWriters", &[("space", &space), ("limit", "1")], &cred, &owner.did)
         .await
         .ok();
     assert_eq!(p1["repos"].as_array().unwrap().len(), 1);
     let c = p1["cursor"].as_str().unwrap().to_string();
     let p2 = owner
-        .signed_get(&b.url, "com.atproto.space.listRepos", &[("space", &space), ("cursor", &c)], &cred, &owner.did)
+        .signed_get(&b.url, "com.atproto.space.listWriters", &[("space", &space), ("cursor", &c)], &cred, &owner.did)
         .await
         .ok();
     assert_eq!(p2, json!({"repos": []}), "an empty page has no cursor");
     let p3 = owner
-        .signed_get(&b.url, "com.atproto.space.listRepos", &[("space", &space), ("cursor", "0")], &cred, &owner.did)
+        .signed_get(&b.url, "com.atproto.space.listWriters", &[("space", &space), ("cursor", "0")], &cred, &owner.did)
         .await
         .ok();
     assert_eq!(p3["repos"].as_array().unwrap().len(), 1, "{p3}");
     let p4 = owner
-        .signed_get(&b.url, "com.atproto.space.listRepos", &[("space", &space), ("cursor", "zzz")], &cred, &owner.did)
+        .signed_get(&b.url, "com.atproto.space.listWriters", &[("space", &space), ("cursor", "zzz")], &cred, &owner.did)
         .await
         .ok();
     assert_eq!(p4, json!({"repos": []}));
     // a credential addressed to a member, not the authority
-    let r = owner.signed_get(&b.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &member.did).await;
+    let r = owner.signed_get(&b.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &member.did).await;
     r.err(401, "BadSpaceAudience");
     // OAuth doesn't list repos
-    owner.get("com.atproto.space.listRepos", &[("space", &space)]).await.err_status(401);
+    owner.get("com.atproto.space.listWriters", &[("space", &space)]).await.err_status(401);
 }
 
 /// getRepo: a STAR archive, its metadata the commit getLatestCommit
@@ -870,14 +861,14 @@ async fn notify_write_from_another_vlpds() {
 async fn get_repo_star() {
     let s = spawn().await;
     let owner = SpaceClient::new(&s, "shc1", OWNER).await;
-    let space = create(&owner, "car", ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string();
+    let space = create(&owner, "car", ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string();
     for rkey in ["b", "aa", "a", "c"] {
         owner.create_record(&space, COLL, Some(rkey), rec(rkey)).await.ok();
     }
     owner.delete_record(&space, COLL, "c").await.ok();
     let q = [("space", space.as_str()), ("repo", owner.did.as_str())];
     let (status, ctype, star) = owner.get_raw("com.atproto.space.getRepo", &q).await;
-    assert_eq!((status, ctype.as_str()), (200, "application/octet-stream"));
+    assert_eq!((status, ctype.as_str()), (200, "application/vnd.dasl.star"));
     let got = crate::common::spaces::verify_star(&star, &space, &owner.did);
     assert_eq!(got.paths, vec![format!("{COLL}/a"), format!("{COLL}/aa"), format!("{COLL}/b")]);
     let latest = owner.get("com.atproto.space.getLatestCommit", &q).await.ok();
@@ -904,20 +895,18 @@ async fn shard_open_sends_registrations_a_catch_up() {
     put_member(&owner, &space, &member.did, true, true).await.ok();
     let syncer = stub("atproto_space_syncer").await;
     let cred = owner.credential(&space).await;
-    let reg = json!({"space": space, "service": syncer.service("atproto_space_syncer")});
-    owner.signed_post(&s.url, "com.atproto.space.registerNotify", reg, &cred, &owner.did).await.ok();
-    let notifies = || syncer.calls("/xrpc/com.atproto.space.notifyWrite");
+    owner.authorize_notify(&s.url, &space, syncer.notify("t")).await.ok();
+    let notifies = || syncer.updates();
     owner.create_record(&space, COLL, Some("0"), rec("zero")).await.ok();
     member.create_record(&space, COLL, Some("1"), rec("one")).await.ok();
     let rev1 = head(&member, &space).await;
     let heard = |rev: String| async move {
-        eventually(Duration::from_secs(10), || async { notifies().iter().any(|n| n.body["repoRev"] == json!(rev)) })
-            .await
+        eventually(Duration::from_secs(10), || async { notifies().iter().any(|n| n["repoRev"] == json!(rev)) }).await
     };
     assert!(heard(rev1).await);
     let list = || async {
         let q = [("space", space.as_str())];
-        let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &q, &cred, &owner.did).await.ok();
+        let r = owner.signed_get(&s.url, "com.atproto.space.listWriters", &q, &cred, &owner.did).await.ok();
         r["repos"].as_array().unwrap().clone()
     };
     let first = list().await.last().unwrap().clone();
@@ -936,10 +925,10 @@ async fn shard_open_sends_registrations_a_catch_up() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let all = notifies();
     assert_eq!(all.len(), sent + 1, "one per registered space");
-    let catch_up = &all[sent].body;
+    let catch_up = &all[sent];
     assert_eq!((catch_up["repo"].clone(), catch_up["repoRev"].clone()), (json!(member.did), json!(rev2)));
     assert_eq!(catch_up["spaceRev"], newest["spaceRev"]);
-    // the spaceRev sequenced just before, not the row before it in listRepos
+    // the spaceRev sequenced just before, not the row before it in listWriters
     // (the member's first write, whose row its second replaced): naming
     // that one would fork the chain the syncer heard
     assert_eq!(catch_up["prevSpaceRev"], first["spaceRev"], "{catch_up}");
@@ -958,14 +947,12 @@ async fn a_catch_up_behind_a_newer_write_is_not_sent() {
     let space = owner.create_space(TYPE, "main").await;
     put_member(&owner, &space, &member.did, true, true).await.ok();
     let syncer = stub("atproto_space_syncer").await;
-    let cred = owner.credential(&space).await;
-    let reg = json!({"space": space, "service": syncer.service("atproto_space_syncer")});
-    owner.signed_post(&s.url, "com.atproto.space.registerNotify", reg, &cred, &owner.did).await.ok();
-    let notifies = || syncer.calls("/xrpc/com.atproto.space.notifyWrite");
+    owner.authorize_notify(&s.url, &space, syncer.notify("t")).await.ok();
+    let notifies = || syncer.updates();
     let heard = |rev: String| async move {
-        let hit = || notifies().into_iter().find(|n| n.body["repoRev"] == json!(rev));
+        let hit = || notifies().into_iter().find(|n| n["repoRev"] == json!(rev));
         assert!(eventually(Duration::from_secs(10), || async { hit().is_some() }).await, "not forwarded");
-        hit().unwrap().body
+        hit().unwrap()
     };
     member.create_record(&space, COLL, Some("1"), rec("one")).await.ok();
     let old = heard(head(&member, &space).await).await;
@@ -982,8 +969,7 @@ async fn a_catch_up_behind_a_newer_write_is_not_sent() {
         uri: space.as_str().into(),
         sid: vlpds::state::space_id(&space),
         writer: member.did.clone(),
-        repo_rev: tid(&old["repoRev"]).unwrap(),
-        hash: [7; 32],
+        update: vlpds::space::host::Update::Write { repo_rev: tid(&old["repoRev"]).unwrap(), hash: [7; 32] },
         seq: vlpds::space::repo::Sequenced {
             space_rev: tid(&old["spaceRev"]).unwrap(),
             prev: tid(&old["prevSpaceRev"]),
@@ -998,14 +984,15 @@ async fn a_catch_up_behind_a_newer_write_is_not_sent() {
     s.app.spaces.clone().unwrap().spawn_outbox_rescan(table, vec![(p.id, p.db.clone())], false);
     assert!(eventually(Duration::from_secs(10), || async { notifies().len() > sent }).await, "no catch-up");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let late: Vec<J> = notifies()[sent..].iter().map(|n| n.body.clone()).collect();
+    let late: Vec<J> = notifies()[sent..].to_vec();
     assert_eq!(late.len(), 1, "only the current catch-up: {late:?}");
     assert_eq!(late[0]["spaceRev"], new["spaceRev"], "{late:?}");
 }
 
 /// What one authority account can make its writes fan out to is bounded:
-/// its live spaces, its registrations across them, and how fast it makes
-/// spaces and a credential registers (each over its own bucket).
+/// its live spaces, its registrations across them (a lapsed one making
+/// room), and how fast it makes spaces and a space takes new
+/// registrations (each over its own bucket).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spaces_and_registrations_are_capped_per_authority() {
     let s = TestServer::spawn_with(|c| {
@@ -1014,12 +1001,12 @@ async fn spaces_and_registrations_are_capped_per_authority() {
     })
     .await;
     s.app.spaces.as_deref().unwrap().set_account_caps(2, 3);
-    let limits = json!({"config": {"limiters": {"space-create": {"points": 4}, "space-register": {"points": 3}}}, "ifVersion": 0, "actor": "it-test"});
+    let limits = json!({"config": {"limiters": {"space-create": {"points": 4}, "space-register": {"points": 4}}}, "ifVersion": 0, "actor": "it-test"});
     s.xrpc.post("vlpds.admin.updateRateLimits", &limits, &Auth::Admin).await.ok();
     let owner = SpaceClient::new(&s, "shc1", OWNER).await;
     let mut spaces = vec![];
     for k in ["a", "b"] {
-        spaces.push(create(&owner, k, ms(json!({}))).await.ok()["uri"].as_str().unwrap().to_string());
+        spaces.push(create(&owner, k, ms(json!({}))).await.ok()["space"].as_str().unwrap().to_string());
     }
     let r = create(&owner, "c", ms(json!({}))).await;
     assert!(r.status == 400 && r.text().contains("governs 2 spaces"), "{r:?}");
@@ -1029,30 +1016,32 @@ async fn spaces_and_registrations_are_capped_per_authority() {
         .await
         .ok();
 
-    let mut syncers = vec![];
-    for _ in 0..4 {
-        syncers.push(stub("atproto_space_syncer").await);
-    }
-    let register = |space: String, service: String, cred: String| {
-        let owner = &owner;
-        let url = s.url.clone();
-        async move {
-            let body = json!({"space": space, "service": service});
-            owner.signed_post(&url, "com.atproto.space.registerNotify", body, &cred, &owner.did).await
-        }
+    let syncer = stub("atproto_space_syncer").await;
+    let register = |space: String, token: &str| {
+        let (owner, url, notify) = (&owner, s.url.clone(), syncer.notify(token));
+        async move { owner.authorize_notify(&url, &space, notify).await }
     };
-    let (c0, c1) = (owner.credential(&spaces[0]).await, owner.credential(&spaces[1]).await);
-    let svc = |i: usize| syncers[i].service("atproto_space_syncer");
-    register(spaces[0].clone(), svc(0), c0.clone()).await.ok();
-    register(spaces[0].clone(), svc(1), c0.clone()).await.ok();
-    register(spaces[1].clone(), svc(2), c1.clone()).await.ok();
-    let r = register(spaces[1].clone(), svc(3), c1.clone()).await;
+    register(spaces[0].clone(), "t0").await.ok();
+    register(spaces[0].clone(), "t1").await.ok();
+    register(spaces[1].clone(), "t2").await.ok();
+    let r = register(spaces[1].clone(), "t3").await;
     assert!(r.status == 400 && r.text().contains("3 notify registrations across its spaces"), "{r:?}");
     // a renewal isn't a new registration
-    register(spaces[1].clone(), svc(2), c1.clone()).await.ok();
-    // space-register: 3 a credential; c0's third
-    register(spaces[0].clone(), svc(0), c0.clone()).await.ok();
-    register(spaces[0].clone(), svc(0), c0.clone()).await.err(429, "RateLimitExceeded");
+    register(spaces[1].clone(), "t2").await.ok();
+    // a lapsed registration in the space makes room
+    let lapsed = vlatproto::tid::now_micros() - 1;
+    vlpds::xrpc::space::set_registration_expiry(&s.app, &spaces[0], &syncer.url, "t1", lapsed).await.unwrap();
+    register(spaces[0].clone(), "t4").await.ok();
+    let p = s.app.partition(&owner.did).ok().unwrap();
+    let sid = vlpds::state::space_id(&spaces[0]);
+    let gone =
+        vlpds::state::space_registration_key(&owner.did, &sid, &vlpds::state::registration_id(&syncer.url, "t1"));
+    assert!(p.db.get(gone).await.unwrap().is_none(), "the lapsed one was evicted");
+    // space-register: 4 new registrations a space an hour; spaces[0] has
+    // made 3 (t0, t1, t4), the fourth is refused at the cap, the fifth here
+    let r = register(spaces[0].clone(), "t5").await;
+    assert!(r.status == 400 && r.text().contains("across its spaces"), "{r:?}");
+    register(spaces[0].clone(), "t6").await.err(429, "RateLimitExceeded");
 
     // space-create: 4 a day; 3 spent (2 made, 1 refused at the cap)
     owner.post("com.atproto.space.deleteSpace", json!({"space": spaces[1]})).await.ok();

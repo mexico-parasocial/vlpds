@@ -34,7 +34,7 @@ const RKEYS: usize = 10;
 const CHECK_EVERY: usize = 25;
 /// Every s* family, C5's blob refs included; all keyed `{fam}{did}\0...`.
 const SPACE_FAMILIES: &[&[u8]] =
-    &[b"sH/", b"sR/", b"sO/", b"sP/", b"sS/", b"sM/", b"sW/", b"sQ/", b"sN/", b"sb/", b"sc/"];
+    &[b"sH/", b"sR/", b"sO/", b"sP/", b"sS/", b"sM/", b"sW/", b"sQ/", b"sN/", b"sX/", b"sG/", b"sE/", b"sb/", b"sc/"];
 
 #[derive(Clone, Copy, Default)]
 struct Checks {
@@ -338,11 +338,11 @@ async fn pull(a: &mut Account, space: &str, since: Option<&str>, limit: usize, c
         assert_eq!(r.status, 200, "{ctx}: listRepoOps {q:?}: {}", r.text());
         let page_ops = r.json["ops"].as_array().cloned().unwrap_or_default();
         ops.extend(page_ops);
-        if !r.json["commit"].is_null() {
-            assert!(r.json["cursor"].is_null(), "{ctx}: a cursor with the commit: {}", r.text());
-            return (ops, r.json["commit"].clone());
+        assert!(r.json["commit"].is_object(), "{ctx}: every page carries the commit: {}", r.text());
+        match r.json["cursor"].as_str() {
+            None => return (ops, r.json["commit"].clone()),
+            Some(c) => cursor = Some(c.into()),
         }
-        cursor = Some(r.json["cursor"].as_str().unwrap_or_else(|| panic!("{ctx}: no commit, no cursor")).into());
     }
     unreachable!()
 }

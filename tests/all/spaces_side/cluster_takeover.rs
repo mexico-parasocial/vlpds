@@ -7,7 +7,7 @@
 //!
 //! - every acked write is there and each repo folds and replays to its head;
 //! - the vlpds authority sequenced each (repo, repoRev) once, and each
-//!   repo's spaceRev only moved forward across every listRepos poll;
+//!   repo's spaceRev only moved forward across every listWriters poll;
 //! - the remote authority hears each writer's newest rev, the revs it hears
 //!   per writer never go back, and the syncer gets the local space's
 //!   updates in spaceRev order.
@@ -18,7 +18,7 @@
 //! syncer whose queued forward died with the old owner hears within seconds.
 
 use super::cluster::{client_on, settle_front, Plc};
-use super::durability::{burst, by_did, consistent, create, latest, list_repos, scope, signed_post, Burst};
+use super::durability::{burst, by_did, consistent, create, latest, list_writers, scope, Burst};
 use super::fuzz::bytes_field;
 use super::hooks::*;
 use crate::common::spaces::{space_uri, SpaceClient};
@@ -59,13 +59,12 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     let local = auth.create_space(&st, "tx").await;
     for w in &writers {
         let m = json!({"space": local, "did": w.did, "read": true, "write": true});
-        auth.post("com.atproto.memberspace.putMember", m).await.ok();
+        auth.post("com.atproto.memberspace.putMembers", crate::common::spaces::one_member(&m)).await.ok();
     }
     let (remote_auth, syncer) = (StubDid::spawn().await, StubDid::spawn().await);
     let remote = space_uri(&remote_auth.did, &st, "tx");
     let cred = auth.credential(&local).await;
-    let reg = json!({"space": local, "service": format!("{}#atproto_space_syncer", syncer.did)});
-    signed_post(&auth, "com.atproto.space.registerNotify", reg, &cred, &auth.did).await.ok();
+    auth.authorize_notify(&auth.srv.base, &local, syncer.notify("t")).await.ok();
     let spaces = [local.as_str(), remote.as_str()];
 
     let stop = AtomicBool::new(false);
@@ -94,7 +93,7 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         async {
             while !stop.load(Ordering::SeqCst) {
                 if let Ok(Ok(repos)) =
-                    tokio::time::timeout(Duration::from_secs(5), list_repos(&auth, &local, &cred)).await
+                    tokio::time::timeout(Duration::from_secs(5), list_writers(&auth, &local, &cred)).await
                 {
                     polls.lock().push(repos);
                 }
@@ -135,7 +134,7 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     // the vlpds authority catches up with every writer's head
     let t0 = Instant::now();
     eventually(CATCH_UP, || async {
-        let repos = list_repos(&auth, &local, &cred).await.ok()?;
+        let repos = list_writers(&auth, &local, &cred).await.ok()?;
         let rows = by_did(&repos);
         writers
             .iter()
@@ -149,9 +148,9 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     .await
     .expect("the vlpds authority never caught up");
     eprintln!("the vlpds authority caught up {:?} after the burst", t0.elapsed());
-    // listRepos pages by spaceRev, so a listing that raced a late write's
+    // listWriters pages by spaceRev, so a listing that raced a late write's
     // sequencing shows that repo twice; once caught up nothing moves
-    let fin = list_repos(&auth, &local, &cred).await.expect("listRepos once caught up");
+    let fin = list_writers(&auth, &local, &cred).await.expect("listWriters once caught up");
     let mut sequenced: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut last: BTreeMap<String, (String, String)> = BTreeMap::new();
     let polls = std::mem::take(&mut *polls.lock());
@@ -227,7 +226,7 @@ async fn three_node_takeover_mid_burst_with_the_authority_on_the_victim() {
 /// have heard every write. With nothing written after it, a kill -9 moves
 /// the shard and the new owner sends each registration exactly one forward
 /// within a few seconds, carrying the newest sequenced (repo, repoRev,
-/// spaceRev) as listRepos shows it.
+/// spaceRev) as listWriters shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn takeover_sends_each_registration_one_catch_up_forward() {
     let (bucket, front, plc) = (Default::default(), Front::new().await, Plc::start().await);
@@ -249,14 +248,13 @@ async fn takeover_sends_each_registration_one_catch_up_forward() {
     let local = auth.create_space(&st, "tc").await;
     for w in &writers {
         let m = json!({"space": local, "did": w.did, "read": true, "write": true});
-        auth.post("com.atproto.memberspace.putMember", m).await.ok();
+        auth.post("com.atproto.memberspace.putMembers", crate::common::spaces::one_member(&m)).await.ok();
     }
     let cred = auth.credential(&local).await;
     let mut syncers = Vec::new();
     for _ in 0..3 {
         let s = StubDid::spawn().await;
-        let reg = json!({"space": local, "service": format!("{}#atproto_space_syncer", s.did)});
-        signed_post(&auth, "com.atproto.space.registerNotify", reg, &cred, &auth.did).await.ok();
+        auth.authorize_notify(&auth.srv.base, &local, s.notify("t")).await.ok();
         syncers.push(s);
     }
     for (i, w) in writers.iter().enumerate() {
@@ -272,7 +270,7 @@ async fn takeover_sends_each_registration_one_catch_up_forward() {
         heads.push((w.did.clone(), latest(w, &local, "a writer's head before the kill").await.rev));
     }
     let before = eventually(Duration::from_secs(20), || async {
-        let repos = list_repos(&auth, &local, &cred).await.ok()?;
+        let repos = list_writers(&auth, &local, &cred).await.ok()?;
         let rows = by_did(&repos);
         heads.iter().all(|(did, rev)| rows.get(did).is_some_and(|r| r["repoRev"] == json!(rev))).then_some(repos)
     })
@@ -295,7 +293,7 @@ async fn takeover_sends_each_registration_one_catch_up_forward() {
     })
     .await;
     let took = killed_at.elapsed();
-    let after = list_repos(&auth, &local, &cred).await.unwrap();
+    let after = list_writers(&auth, &local, &cred).await.unwrap();
     assert_eq!(newest(&after), Some(head.clone()), "nothing was written after the kill");
     let row = after.iter().find(|r| r["spaceRev"].as_str() == Some(head.as_str())).unwrap().clone();
 
@@ -310,11 +308,11 @@ async fn takeover_sends_each_registration_one_catch_up_forward() {
         let late: Vec<Notified> = s.accepted().into_iter().filter(|n| n.at > killed_at).collect();
         assert_eq!(late.len(), 1, "syncer {i}: one catch-up forward per takeover: {late:?}");
         let b = &late[0].body;
-        assert_eq!(b["space"], json!(local), "syncer {i}: {b}");
+        assert_eq!(late[0].space, json!(local), "syncer {i}: {b}");
         assert_eq!(b["spaceRev"], json!(head), "syncer {i}: the current spaceRev: {b}");
         assert_eq!(
             (b["repo"].clone(), b["repoRev"].clone()),
-            (row["did"].clone(), row["repoRev"].clone()),
+            (row["repo"].clone(), row["repoRev"].clone()),
             "syncer {i}: the head's repo and rev: {b}"
         );
     }

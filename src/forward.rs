@@ -473,16 +473,14 @@ async fn named_account(router: &dyn Router, app: Option<&crate::xrpc::App>, path
 }
 
 /// Space host methods run at the space authority's owner, whatever DIDs
-/// their other fields name (notifyWrite's `repo` is the writer, putMember's
-/// `did` the member, getSpaceCredential's token the user).
+/// their other fields name (notifyRepoUpdate's `repo` is the writer,
+/// putMembers' DIDs the members, authorizeSpaceSync's token the account).
 fn space_host_method(nsid: &str) -> bool {
     matches!(
         nsid,
-        "com.atproto.space.getSpaceCredential"
-            | "com.atproto.space.notifyWrite"
-            | "com.atproto.space.listRepos"
-            | "com.atproto.space.registerNotify"
-            | "com.atproto.space.unregisterNotify"
+        "com.atproto.space.authorizeSpaceSync"
+            | "com.atproto.space.notifyRepoUpdate"
+            | "com.atproto.space.listWriters"
             | "com.atproto.space.createSpace"
             | "com.atproto.space.getSpace"
             | "com.atproto.space.updateSpace"

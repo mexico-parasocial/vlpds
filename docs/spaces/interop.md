@@ -11,16 +11,17 @@ diagram:
   caption: "vlpds speaks the reference's wire in every role, and the interop harness runs it both ways: ref-ref, vlpds-authority, ref-authority and vlpds-only, plus a three-node vlpds cluster on MinIO."
   nodes:
     - { id: v, label: vlpds, sub: "repo host · space host", at: [0, 3], size: [12, 3], tone: accent }
-    - { id: r, label: Reference PDS, sub: "atproto `98ef3a6b`", at: [26, 3], size: [12, 3], tone: muted }
+    - { id: r, label: Reference PDS, sub: "atproto `16bfeba7`", at: [26, 3], size: [12, 3], tone: muted }
     - { id: s, label: Syncer, sub: "`@atproto/space` consumer", at: [13, 10], size: [12, 3], tone: blue }
   edges:
-    - "v <-> r: notifyWrite · credential reads"
+    - "v <-> r: notifyRepoUpdate · credential reads"
     - { from: s.t25, to: v.b, label: "listRepoOps · MAC", tone: blue }
     - { from: s.t75, to: r.b, label: "listRepoOps · MAC", tone: blue }
+    - { from: v.b, to: s.l, label: "notifySpaceUpdate", tone: accent }
 facts:
-  - { value: "98ef3a6b", label: reference pin, note: "bluesky-social/atproto PR #5187, the Nov 5 alpha" }
-  - { value: MAC, label: per response, note: "DHKEM(P-256) to the author's #atproto_kem key; no commit signatures", tone: accent }
-  - { value: STAR, label: getRepo and importRepo, note: "one pass, bytewise path order, control bytes", tone: violet }
+  - { value: "16bfeba7", label: reference pin, note: "bluesky-social/atproto PR #5187, the Nov 13 alpha" }
+  - { value: MAC, label: per response, note: "an RFC 9421 hmac-sha256 signature under an HPKE-exported key to the author's #atproto_kem key", tone: accent }
+  - { value: Webhooks, label: to syncers, note: "notifySpaceUpdate to the endpoint and token a syncer registers when it authorizes", tone: violet }
   - { value: OAuth, label: only, note: "the biggest divergence", tone: rust }
 ```
 
@@ -30,32 +31,47 @@ purpose, and `tests/REFERENCE_COVERAGE.md` lists each case.
 
 ## The pin
 
-The pin is bluesky-social/atproto PR #5187 (branch `permissioned-data`) at `98ef3a6b`, the
-November 5 alpha (`0.0.0-spaces-alpha-20261105160032` on npm) plus internal refactors with no wire
-change. The lexicons are vendored unmodified in `lexicons/spaces-alpha` and the test vectors in
-`testdata/spaces-alpha`, both generated from that commit by running the reference.
+The pin is bluesky-social/atproto PR #5187 (branch `permissioned-data`) at `16bfeba7`, the
+November 13 alpha (`0.0.0-spaces-alpha-20261113224550` on npm), with bluesky-social/proposals 0016
+at `2755e73a`. The lexicons are vendored unmodified in `lexicons/spaces-alpha` and the test vectors
+in `testdata/spaces-alpha`, both generated from that commit by running the reference.
 
-## What the alpha changed, and where it lands
+## What this alpha changed, and where it lands
+
+The Stored data column says what happens to rows the previous release wrote. Every new family is
+one the previous release never reads, so rolling back leaves it in place, unread.
 
 | Upstream | vlpds | Breaking | Stored data |
 |---|---|---|---|
-| getSpaceCredential takes `space`, `credentialKid`, and an optional `delegationToken` and `clientAttestation` in its body; a bad token is `InvalidDelegationToken` (proposals #120) | `xrpc/space.rs`, `xrpc/authn.rs` | yes | none |
-| `Atproto-Space-Credential` scheme and a `tag="atproto-space-credential"` signature; the old scheme is `InvalidToken` | `space/httpsig.rs` | yes | none |
-| No `#atproto_space` key or `#atproto_space_host` entry: tokens are addressed to `<authority>#atproto_pds` and their `kid` is exactly `#atproto` (#123) | `space/token.rs`, `space/host.rs` | yes | none |
-| Commits are `{ver, repo, space, rev, data}` with no signature. The repo host MACs each response for one syncer with a DHKEM(P-256) secret against the author's `#atproto_kem` key (`Atproto-Space-Want-Mac` / `Atproto-Space-Mac`); `hash` is `data` (#122) | `space/commit.rs`, `space/mac.rs`, the four read handlers | yes | none: vlpds never stored commit signatures, and the digests are unchanged |
-| A `#atproto_kem` key per account: in the genesis op, backfilled once for existing accounts, in getRecommendedDidCredentials, checked by submitPlcOperation | `kem_backfill.rs`, `secrets.rs`, identity endpoints | yes | a wrapped key per account, and one PLC operation per account the backfill can publish for |
-| getRepo serves a STAR archive, with control bytes and limits (#114, #131) | `space/star.rs` | yes | none |
-| notifySpaceDeleted is retried until delivered or the registration expires (#124) | `space/deleted.rs` | no | `sD` rows for sends that failed |
-| Space policies replace simplespace: `com.atproto.space.{create,update,get,delete}Space`, `personalspace`, `memberspace`, `managedspace`, published policy and member records (#119) | the space host methods | yes | Oct 1 configurations convert to policies when read |
-| `removeWriter` and `clearRecords` (#128, #127) | the space host and repo methods | no | none |
-| Account migration: `com.atproto.space.importRepo`, `exportSpaceMeta`, `importSpaceMeta` (#129) | `xrpc/space_import.rs`, `space/meta.rs` | yes (`vlpds.space.importRepo` is gone) | none |
-| A taken-down or deactivated authority suspends its spaces: `RepoTakendown` / `RepoDeactivated` on getSpaceCredential and listRepos (#134) | `xrpc/space.rs` | no | none |
-| An authority's own repo needs its live space (`SpaceNotFound`) | `space/repo.rs` | no | none |
+| `getSpaceCredential` becomes `authorizeSpaceSync`: `credentialKey` (the did:key) for `credentialKid`, an optional `notify` `{endpoint, token}`, and the space's `spaceRev` in the output | `xrpc/space.rs` | yes | none |
+| Registrations are webhooks: `registerNotify` and `unregisterNotify` are gone. A `notify` is confirmed once (`confirmRegistration` echoes a challenge), renewed by each authorization that carries it, and lapses at the credential's `exp`. A refused authorization withdraws the registration it carries (proposals #138, #140) | `xrpc/space.rs`, `space/host.rs` | yes | new `sG` rows. The previous release's `sN` registrations name a service DID, with no endpoint or token, so they can't become registrations: they stay inert, nothing is sent to them, and they're dropped once expired (24 h at most) at the space's next fan-out, or with the space |
+| The host tells syncers with `notifySpaceUpdate`: the token in the body and no service auth, the update a `repoWrite`, `repoRemoved`, `spaceDeleted` or `registrationExpired` (#140) | `space/fanout.rs`, `space/host.rs` | yes | none |
+| `notifySpaceDeleted` is gone. `spaceDeleted` goes to every registration, lapsed ones included. A lapsed registration gets one `registrationExpired` notice in place of its next update, then nothing; one that refuses it, or whose notice stops being retried, is dropped unless it was renewed. Failed notices are retried after 1 m, 10 m, 1 h, 6 h, then every 12 h, with 50–100% jitter, for 72 h, and a deletion notice replaces a pending expiry notice, never the reverse (#138, #140) | `space/notices.rs` | yes | new `sE` rows for notices that failed. The previous release's pending `notifySpaceDeleted` retries (`sD`) are for a method that's gone and a registration that can't carry over: they're dropped unsent at their expiry |
+| `notifyWrite` becomes `notifyRepoUpdate` (repo host to authority, service auth with that `lxm`) (#137) | `xrpc/space.rs`, `worker.rs` | yes | the `sP` outbox rows carry over: a notify the previous release still owed goes out under the new name |
+| `listRepos` becomes `listWriters`, a union: `repoWrite` `{repo, repoRev, data, spaceRev}` or `repoRemoved` `{repo, spaceRev}`. A writer taken out of the set stays listed as removed, and the removal is sequenced and sent to syncers (`removeWriter`, `removeMembers`, a `putMembers` without write) (#144) | `space/repo.rs`, `xrpc/space.rs` | yes | new `sX` rows for removed writers. A writer the previous release removed has no row, so it isn't listed as removed |
+| MACs are RFC 9421 signatures. `Accept-Signature: mac=("atproto-space-commit";sf);keyid="<key share>";tag="atproto-space-commit"` asks for one, and the response carries an `Atproto-Space-Commit` (or `Atproto-Space-Record`) header with an `hmac-sha256` `Signature` over it under the requested label. `listRepoOps` carries the commit and its MAC on every page (#141) | `space/mac.rs`, `space/sfv.rs`, the four read handlers | yes | none |
+| The MAC key is an HPKE export (DHKEM(P-256), HKDF-SHA256, export-only AEAD, info `atproto-mac`) to the author's `#atproto_kem` key (#142) | `space/mac.rs` | yes | none: the KEM keys are unchanged |
+| A credential request's signature is the one tagged `atproto-space-credential`, under any label, and there must be exactly one; clients sign as `sig` (#141) | `space/httpsig.rs` | yes | none |
+| `putMember` and `removeMember` become `putMembers` and `removeMembers`: up to 100 DIDs, one commit, the last entry for a repeated DID wins, a non-member is ignored | `xrpc/space_policy.rs` | yes | none: members are stored as before |
+| `managedspace`: `checkUserAccess` becomes `checkAccess` `{space, repo?, clientId?}` answering `{read, write}`. The app is asked even without a delegation token (no `repo`), and one that can't answer is `UpstreamFailure` (502) (#130, #139) | `space/host.rs`, `xrpc/space_policy.rs` | yes | none |
+| A `memberspace` member with write off stays out of the writer set under `publicWrite` (#139) | `space/repo.rs` | no | none: it applies from that member's next write |
+| Renames: `createSpace` and `getSpace` return `space`; `removeWriter` takes `repo`; `listSpaces` takes `spaceDid` and `spaceType` and lists `{space, repoRev?, data?, spaceRev?}`; `notifyCredentialRevoked` is `notifyCredentialsRevoked`; errors `NotSpaceOwner` → `NotAuthorized`, `BadSpaceMac` → `InvalidSpaceMac`, and new `InvalidCursor`, `InvalidRepoFile`, `RepoMismatch` (`importRepo`) and `InvalidSpaceMeta` (#137) | the space methods | yes | none |
+| Space repos and meta archives are `application/vnd.dasl.star`; a meta archive's writer values are `{repoRev, data, spaceRev}` (#137) | `space/star.rs`, `space/meta.rs` | yes | none stored. An archive exported by the previous release (`rev`) doesn't import: export it again |
+| `listRecords` loses `reverse` (newest URI first, always) and `listBlobs` loses `since`; `listRepoOps` of a repo with no head is `RepoNotFound` (#137) | `xrpc/space.rs` | yes | none |
 
 Where the spec is silent and vlpds copies the reference: `updateSpace` leaves the writer set as it is
-(only `removeWriter`, `removeMember` and a `putMember` without write take a writer out),
-`listRepoOps` leaves out values for superseded ops, and `listSpaces` treats its
-filters as the scope target, so an unfiltered listing needs a wildcard grant.
+(only `removeWriter`, `removeMembers` and a `putMembers` without write take a writer out),
+`listRepoOps` leaves out values for superseded ops, `listSpaces` treats its filters as the scope
+target, so an unfiltered listing needs a wildcard grant, and an export of space meta leaves removed
+writers out. Where this alpha was loose and vlpds follows the reference:
+
+- A MAC request for the other profile's tag counts as no request, so the credential read gets
+  `InvalidSpaceMac`.
+- `notifyRepoUpdate` with the bare authority DID as `aud` is accepted, as `<authority>#atproto_pds` is.
+- A refused authorization is refused even when its `notify` couldn't be confirmed: the policy's
+  `SpaceNotFound` comes first, and no confirmation is sent.
+- A `managedspace` app that says no to an authorization without a delegation token gets
+  `SpaceNotFound`, as a refused member does.
 
 ## Where vlpds differs
 
@@ -64,8 +80,8 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 | Auth | legacy app passwords and password sessions can read and write the account's own space records | OAuth only (final). App passwords (scoped or not) and password sessions get no space reads, writes or delegation tokens, `getServiceAuth` tokens for space methods go only to OAuth apps whose `space:` grant covers the action (the reference checks only `rpc:`), and `importRepo` is OAuth too |
 | Admin token on space reads | accepted on the space read methods, a taken-down repo's included | not accepted. Operators read through the audited `vlpds.admin` space methods ([Operating](operating.md)) |
 | Exports by a taken-down account | its `allowTakendown` password session may export its spaces | none: space data is OAuth-only, and OAuth signs no taken-down account in |
-| Fan-out to syncers | each forward goes out as it's sequenced, unordered | one lane per (space, service), in spaceRev order, a writer's waiting forward replaced by its newer one |
-| notifyWrite delivery | a retry row written only after a send fails, so an acked write's notify can be lost in a crash | the `sP` row is in the write's own log entry |
+| Fan-out to syncers | each update goes out as it's sequenced, unordered | one lane per (space, registration), in spaceRev order, a writer's waiting update replaced by its newer one |
+| notifyRepoUpdate delivery | a retry row written only after a send fails, so an acked write's notify can be lost in a crash | the `sP` row is in the write's own log entry |
 | Delegation tokens and client attestations | any lifetime (it mints 60 s) | refused past 300 s, since their `jti`s are held until `exp` |
 | Request signatures | no size cap, and header values decoded as latin1 | `Signature-Input` and `Signature` over 8 KiB refused, and header values must be visible ASCII |
 | did:keys | refuses hybrid (0x06/0x07) points | the same, checked explicitly, since libsecp256k1 alone would parse them |
@@ -74,7 +90,9 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 | Account takedown | the app's session works again after a reversal (what the harness expects) | revokes the account's OAuth sessions, and they stay revoked after a reversal. The app has to sign in again |
 | Credentials for taken-down members | issued | refused |
 | Record takedown | none for space records: `updateSubjectStatus` refuses a space record | hidden from every space read, and every commit and MAC is over the set without it (a vlpds extension, see [Takedowns](privacy.md#takedowns)) |
-| Space takedown | none | a vlpds extension: no credentials, no `listRepos` or registrations, notifies dropped |
+| Space takedown | none | a vlpds extension: no credentials, no `listWriters` or registrations, notifies dropped |
+| Registrations | no cap | 256 per space and 1,024 per authority, lapsed ones counted. A new one past a cap takes the place of the space's longest-lapsed registration, and is refused if none has lapsed. New registrations are rate-limited per space |
+| Registration confirmation | waits on the endpoint for as long as it takes | one `confirmRegistration` per new registration, with the outbound HTTP client's timeout, and only to an `https` URL (`http` too in dev mode) with no credentials in it |
 | Oplog | keeps every op | keeps 7 days. A `since` past that gets the window's start, and the syncer falls back to `getRepo` |
 | Revocations | stored for any audience the host has, unbounded, one row each | stored only when the audience account holds a repo in the space or its authority is here (else 200, dropped), capped per authority, space and account, and one past a cap blocks the space's credentials ([Revocation](reading.md#revocation)) |
 | Space repo size | no cap | 100k records (`--space-repo-max-records`) |

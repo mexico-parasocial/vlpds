@@ -11,10 +11,8 @@ name: vlpds-spaces
 
 x-ref-pds: &ref-pds
   # The reference PDS at the pin, built natively by run.sh (refpds.sh) from
-  # .scratch/atproto. The published ghcr.io/bluesky-social/atproto:pds-spaces-alpha
-  # (79d6307e, the same packages as the pin) is amd64 only; REF_PDS_IMAGE
-  # points at it on a host that can run it.
-  image: ${REF_PDS_IMAGE:-vlpds-spaces-refpds:98ef3a6b}
+  # .scratch/atproto. REF_PDS_IMAGE points at another build of the pin.
+  image: ${REF_PDS_IMAGE:-vlpds-spaces-refpds:16bfeba7}
   pull_policy: never
   depends_on:
     plc:

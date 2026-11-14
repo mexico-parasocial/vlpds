@@ -245,6 +245,19 @@ impl Parser<'_> {
     }
 }
 
+/// As `structured-headers`' `serializeDictionary`: a member whose value is
+/// boolean true is written as its bare key.
+pub fn serialize_dictionary(d: &Dictionary) -> String {
+    d.iter()
+        .map(|(k, m)| match m {
+            Member::Item(Bare::Bool(true), p) => format!("{k}{}", serialize_params(p)),
+            Member::Item(b, p) => format!("{k}={}", serialize_item(b, p)),
+            Member::InnerList(items, p) => format!("{k}={}", serialize_inner_list(items, p)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn serialize_inner_list(items: &[(Bare, Params)], params: &Params) -> String {
     let items: Vec<String> = items.iter().map(|(b, p)| serialize_item(b, p)).collect();
     format!("({}){}", items.join(" "), serialize_params(params))

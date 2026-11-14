@@ -25,6 +25,8 @@ const MAX_VARINT_BYTES: usize = 9;
 
 pub const REPO_TYPE: &str = "atproto-space-repo";
 pub const META_TYPE: &str = "atproto-space-meta";
+/// getRepo, exportSpaceMeta, and their imports.
+pub const CONTENT_TYPE: &str = "application/vnd.dasl.star";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -342,7 +344,7 @@ mod tests {
     }
 
     /// testdata/spaces-alpha/vectors.json `star`: archives the reference
-    /// wrote (serializeRepo, serializeSpaceMeta).
+    /// wrote (writeRepoStar, writeSpaceMetaStar).
     #[test]
     fn generated_vectors() {
         for s in VECTORS["star"].as_array().unwrap() {

@@ -13,7 +13,7 @@ const TYPE: &str = "com.example.group";
 const COLL: &str = "com.example.post";
 const OWNER: &str = "space:com.example.group?collection=com.example.post&action=read&action=create&action=update&action=delete&manage=create&manage=update&manage=delete";
 const MEMBER: &str = "space:com.example.group?authority=*&collection=com.example.post&action=read&action=create";
-const STAR: &str = "application/octet-stream";
+const STAR: &str = "application/vnd.dasl.star";
 const IMPORT: &str = "com.atproto.space.importRepo";
 
 fn rec(text: &str) -> J {
@@ -48,7 +48,7 @@ async fn eventually(within: Duration, mut f: impl AsyncFnMut() -> bool) -> bool 
 
 async fn put_member(owner: &SpaceClient, space: &str, did: &str) {
     let body = json!({"space": space, "did": did, "read": true, "write": true});
-    owner.post("com.atproto.memberspace.putMember", body).await.ok();
+    owner.post("com.atproto.memberspace.putMembers", crate::common::spaces::one_member(&body)).await.ok();
 }
 
 /// A moderator reads space records; every read is in the audit log first,
@@ -157,7 +157,7 @@ async fn console_lookup_takes_space_uris() {
     s.xrpc.post("vlpds.admin.moderate", &body, &Auth::Admin).await.err(400, "InvalidRequest");
 }
 
-/// A space takedown: no credentials, no listRepos or registrations, and
+/// A space takedown: no credentials, no listWriters or registrations, and
 /// members' notifies dropped; a restore brings all of it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn space_takedown_is_enforced() {
@@ -167,15 +167,16 @@ async fn space_takedown_is_enforced() {
     let space = owner.create_space(TYPE, "main").await;
     put_member(&owner, &space, &m.did).await;
     let cred = owner.credential(&space).await;
-    let list_repos =
-        async || owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await;
+    let list_writers = async || {
+        owner.signed_get(&s.url, "com.atproto.space.listWriters", &[("space", &space)], &cred, &owner.did).await
+    };
     let rev_of = async |c: &SpaceClient| {
         let q = [("space", space.as_str()), ("repo", c.did.as_str())];
         c.get("com.atproto.space.getLatestCommit", &q).await.ok()["commit"]["rev"].as_str().unwrap().to_string()
     };
     let listed_rev = async || {
-        let r = list_repos().await.ok();
-        r["repos"].as_array().unwrap().iter().find(|w| w["did"] == json!(m.did)).map(|w| w["repoRev"].clone())
+        let r = list_writers().await.ok();
+        r["repos"].as_array().unwrap().iter().find(|w| w["repo"] == json!(m.did)).map(|w| w["repoRev"].clone())
     };
     m.create_record(&space, COLL, Some("a"), rec("one")).await.ok();
     let rev1 = rev_of(&m).await;
@@ -183,12 +184,9 @@ async fn space_takedown_is_enforced() {
 
     set_status(&s, strong_ref(&space), true).await;
     m.try_credential_at(&s.url, &space, None).await.err(400, "NotAuthorized");
-    list_repos().await.err(400, "SpaceNotFound");
-    let reg = json!({"space": space, "service": "did:web:syncer.example.com"});
-    owner
-        .signed_post(&s.url, "com.atproto.space.registerNotify", reg.clone(), &cred, &owner.did)
-        .await
-        .err(400, "SpaceNotFound");
+    list_writers().await.err(400, "SpaceNotFound");
+    let notify = json!({"endpoint": "https://syncer.example.com", "token": "t"});
+    owner.authorize_notify(&s.url, &space, notify).await.err(400, "NotAuthorized");
     // the member's write lands in its repo; its notify is dropped
     m.create_record(&space, COLL, Some("b"), rec("two")).await.ok();
     let sp = s.app.spaces.as_deref().unwrap();
@@ -393,12 +391,12 @@ async fn import_repo_round_trip_and_refusals() {
     // data that isn't the records'
     let mut bad = commit.clone();
     bad.data[0] ^= 1;
-    import(archive(&bad, &pairs)).await.err(400, "InvalidRequest");
+    import(archive(&bad, &pairs)).await.err(400, "InvalidRepoFile");
     // a record left out
-    import(archive(&commit, &pairs[1..])).await.err(400, "InvalidRequest");
+    import(archive(&commit, &pairs[1..])).await.err(400, "InvalidRepoFile");
     // another account's repo
     let theirs = vlpds::space::commit::Commit { repo: "did:plc:someoneelse2345abcdefgh".into(), ..commit.clone() };
-    import(archive(&theirs, &pairs)).await.err(400, "InvalidRequest");
+    import(archive(&theirs, &pairs)).await.err(400, "RepoMismatch");
     // an active account's password session is no space access
     let r = x.xrpc.post_bytes(IMPORT, exported.clone(), STAR, &Auth::Bearer(a.session_jwt.clone())).await;
     r.err(403, "InsufficientScope");

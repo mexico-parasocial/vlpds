@@ -1,12 +1,13 @@
-//! The space host's calls out (reference `space-policy/manager.ts` and
-//! `api/com/atproto/space/util.ts`): resolving a service identifier,
-//! asking a managing app whether a user may read or write, forwarding a
-//! sequenced write to a registered service, and telling registered services
-//! a space is gone. Every call goes through the SSRF-guarded client with
-//! service auth from the authority (`aud` = the service identifier as
-//! published), a 10 s timeout and a small response cap.
+//! The space host's calls out (reference `space-policy/manager.ts`,
+//! `space-notifications.ts` and `api/com/atproto/space/util.ts`): asking a
+//! managing app for an account's access (service auth from the authority,
+//! `aud` the `did#serviceId` reference as published), and the calls to a
+//! syncer's registered endpoint: confirming a registration, and
+//! notifySpaceUpdate (no auth: the registration's token is in the body).
+//! Every call goes through the SSRF-guarded client with a 10 s timeout and
+//! a small response cap.
 
-use super::rows::NotifyRow;
+use super::rows::{LegacyNotifyRow, RegRow};
 use crate::state::{self, SpaceId};
 use crate::xrpc::App;
 use serde_json::{json, Value as J};
@@ -15,21 +16,16 @@ use vlatproto::tid::Tid;
 
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE: usize = 64 << 10;
-/// Endpoints are kept in `sN` rows (u16-length strings).
-const MAX_ENDPOINT: usize = 2048;
+/// A registered endpoint (`sG` rows hold u16-length strings).
+pub const MAX_ENDPOINT: usize = 2048;
+/// A registration's token (the lexicon's maxLength).
+pub const MAX_TOKEN: usize = 512;
 
-/// How long a notify registration lasts (the reference's
-/// `REGISTRATION_TTL_MS`).
-pub const REGISTRATION_TTL: Duration = Duration::from_secs(24 * 3600);
-
-/// Reference `resolveServiceEndpoint`: `did#fragment` names that service
-/// entry; a bare DID its PDS.
+/// Reference `resolveServiceEndpoint`: a `did#serviceId` reference's
+/// service entry.
 pub async fn resolve_service_endpoint(app: &App, service: &str) -> Option<String> {
-    let (did, fragment) = match service.split_once('#') {
-        Some((d, f)) => (d, Some(f)),
-        None => (service, None),
-    };
-    if !vlatproto::syntax::valid_did(did) {
+    let (did, id) = service.split_once('#')?;
+    if !vlatproto::syntax::valid_did(did) || id.is_empty() {
         return None;
     }
     let doc = match app.did_resolver.resolve(did).await {
@@ -39,11 +35,7 @@ pub async fn resolve_service_endpoint(app: &App, service: &str) -> Option<String
             return None;
         }
     };
-    let ep = match fragment {
-        Some(f) => vlatproto::did_resolver::service_endpoint(&doc, f),
-        None => vlatproto::did_resolver::service_endpoint(&doc, "atproto_pds"),
-    };
-    ep.filter(|e| e.len() <= MAX_ENDPOINT)
+    vlatproto::did_resolver::service_endpoint(&doc, id).filter(|e| e.len() <= MAX_ENDPOINT)
 }
 
 /// A send's error for the logs, without its URL: a query names the space
@@ -88,103 +80,142 @@ pub(crate) async fn call(
     Ok((status, serde_json::from_slice(&buf).unwrap_or(J::Null)))
 }
 
-/// Reference `checkManagingApp`: the managing app's answer, and a denial
-/// whenever it can't be had (unresolvable, unreachable, any error), since
-/// failing open would hand credentials out for the spaces that asked for
-/// the strictest gate.
-pub async fn check_user_access(
+/// Reference `checkAccess`: the managing app's (read, write) for `repo`
+/// (None: a read without a delegation token) and the attested client.
+/// Err when it can't be had (unresolvable, unreachable, any error or a
+/// malformed answer): failing open would hand credentials out for the
+/// spaces that asked for the strictest gate, and denying would be taken as
+/// a loss of access (a registration withdrawn, a repo host's notify
+/// dropped rather than retried).
+pub async fn check_access(
     app: &App,
     space: &str,
     authority: &str,
     managing_app: &str,
-    user: &str,
-    access: &str,
+    repo: Option<&str>,
     client_id: Option<&str>,
-) -> bool {
-    let lxm = "com.atproto.managedspace.checkUserAccess";
+) -> Result<(bool, bool), String> {
+    let lxm = "com.atproto.managedspace.checkAccess";
+    let log_id = crate::state::space_log_id(space);
     let Some(endpoint) = resolve_service_endpoint(app, managing_app).await else {
-        tracing::info!(space = %crate::state::space_log_id(space), managing_app, "could not resolve managing app");
-        return false;
+        tracing::info!(space = %log_id, managing_app, "could not resolve managing app");
+        return Err("could not resolve the managing app".into());
     };
-    let mut q = vec![("space", space), ("user", user), ("access", access)];
-    // the attested client is the managing app's to judge, on reads only
-    if let Some(c) = client_id.filter(|_| access == "read") {
+    let mut q = vec![("space", space)];
+    if let Some(r) = repo {
+        q.push(("repo", r));
+    }
+    if let Some(c) = client_id {
         q.push(("clientId", c));
     }
     let client = vlatproto::http::guarded(app.config.dev_mode);
     match call(app, client, authority, managing_app, &endpoint, lxm, reqwest::Method::GET, &q, None).await {
-        Ok((200, body)) => body["authorized"] == J::Bool(true),
+        Ok((200, body)) => match (body["read"].as_bool(), body["write"].as_bool()) {
+            (Some(read), Some(write)) => Ok((read, write)),
+            _ => {
+                tracing::info!(space = %log_id, managing_app, "managing app check: malformed answer");
+                Err("the managing app's answer is malformed".into())
+            }
+        },
         Ok((status, _)) => {
-            tracing::info!(space = %crate::state::space_log_id(space), managing_app, status, "managing app check failed");
-            false
+            tracing::info!(space = %log_id, managing_app, status, "managing app check failed");
+            Err(format!("the managing app answered {status}"))
         }
         Err(e) => {
-            tracing::info!(space = %crate::state::space_log_id(space), managing_app, "managing app check failed: {e}");
-            false
+            tracing::info!(space = %log_id, managing_app, "managing app check failed: {e}");
+            Err("the managing app did not answer".into())
         }
     }
 }
 
-/// Live notify registrations a space may hold.
+/// Registrations (live or lapsed) a space may hold.
 pub const MAX_REGISTRATIONS: usize = 256;
-/// A registered service identifier (a DID and an optional fragment).
-pub const MAX_SERVICE_LEN: usize = 512;
 
-/// Live notify registrations across one authority's spaces: each space's
-/// cap alone would let one account's spaces register without end.
+/// Registrations across one authority's spaces: each space's cap alone
+/// would let one account's spaces register without end.
 pub const MAX_REGISTRATIONS_PER_AUTHORITY: usize = 1024;
 
-/// Live registrations across `authority`'s spaces, counted up to `stop_at`.
+/// Registrations across `authority`'s spaces, counted up to `stop_at`.
 pub async fn authority_registrations(app: &App, authority: &str, stop_at: usize) -> anyhow::Result<usize> {
     let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let prefix = state::space_did_prefix(state::SPACE_NOTIFY_FAMILY, authority);
+    let prefix = state::space_did_prefix(state::SPACE_REG_FAMILY, authority);
     let mut it = p.db.scan(prefix.clone()..vlsync_store::keys::prefix_end(&prefix)).await?;
-    let now = vlatproto::tid::now_micros();
     let mut n = 0;
-    while let Some(kv) = it.next().await? {
-        if NotifyRow::decode(&kv.value)?.expires > now {
-            n += 1;
-            if n >= stop_at {
-                break;
-            }
+    while it.next().await?.is_some() {
+        n += 1;
+        if n >= stop_at {
+            break;
         }
     }
     Ok(n)
 }
 
-/// A space's registrations (`sN`) from the authority's shard: the live
-/// ones, and the services of expired ones.
-pub async fn registrations(
-    app: &App,
-    authority: &str,
-    sid: &SpaceId,
-) -> anyhow::Result<(Vec<(String, NotifyRow)>, Vec<String>)> {
-    let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let prefix = state::space_prefix(state::SPACE_NOTIFY_FAMILY, authority, sid);
-    let opts = slatedb::config::ScanOptions::default();
-    let mut it = p.db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &opts).await?;
-    let now = vlatproto::tid::now_micros();
-    let (mut live, mut expired) = (Vec::new(), Vec::new());
-    while let Some(kv) = it.next().await? {
-        let service = std::str::from_utf8(&kv.key[prefix.len()..])?.to_string();
-        let row = NotifyRow::decode(&kv.value)?;
-        match row.expires > now {
-            true => live.push((service, row)),
-            false => expired.push(service),
-        }
-    }
-    Ok((live, expired))
+/// One registration of a space.
+#[derive(Clone, Debug)]
+pub struct Registration {
+    pub id: [u8; 32],
+    pub row: RegRow,
 }
 
-/// One forward of a sequenced write to a registered service.
+/// A space's registrations (`sG`) from the authority's shard, active and
+/// lapsed, and the keys of its registerNotify rows (`sN`) that have
+/// expired.
+#[derive(Default, Debug)]
+pub struct Registrations {
+    pub active: Vec<Registration>,
+    pub lapsed: Vec<Registration>,
+    pub legacy_expired: Vec<Vec<u8>>,
+}
+
+impl Registrations {
+    pub fn all(&self) -> impl Iterator<Item = &Registration> {
+        self.active.iter().chain(&self.lapsed)
+    }
+}
+
+pub async fn registrations(app: &App, authority: &str, sid: &SpaceId) -> anyhow::Result<Registrations> {
+    let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let opts = slatedb::config::ScanOptions::default();
+    let now = vlatproto::tid::now_micros();
+    let mut out = Registrations::default();
+    let prefix = state::space_prefix(state::SPACE_REG_FAMILY, authority, sid);
+    let mut it = p.db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &opts).await?;
+    while let Some(kv) = it.next().await? {
+        let id: [u8; 32] = kv.key[prefix.len()..].try_into().map_err(|_| anyhow::anyhow!("bad registration key"))?;
+        let row = RegRow::decode(&kv.value)?;
+        match row.lapsed(now) {
+            false => out.active.push(Registration { id, row }),
+            true => out.lapsed.push(Registration { id, row }),
+        }
+    }
+    let prefix = state::space_prefix(state::SPACE_NOTIFY_FAMILY, authority, sid);
+    let mut it = p.db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &opts).await?;
+    while let Some(kv) = it.next().await? {
+        if LegacyNotifyRow::decode(&kv.value).map_or(true, |r| r.expires <= now) {
+            out.legacy_expired.push(kv.key.to_vec());
+        }
+    }
+    Ok(out)
+}
+
+/// What a forward tells a syncer of: a writer's new state, or its removal
+/// from the writer set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Update {
+    Write { repo_rev: Tid, hash: [u8; 32] },
+    Removed,
+}
+
+/// One forward of a sequenced change to a registered endpoint.
+#[derive(Clone, Debug)]
 pub struct Forward {
     pub authority: std::sync::Arc<str>,
     pub uri: std::sync::Arc<str>,
-    pub service: String,
+    pub reg: [u8; 32],
     pub endpoint: String,
+    pub token: String,
     pub writer: String,
-    pub repo_rev: Tid,
-    pub hash: [u8; 32],
+    pub update: Update,
     pub space_rev: Tid,
     pub prev_space_rev: Option<Tid>,
     /// The registration's expiry (unix µs).
@@ -196,36 +227,95 @@ fn b64(b: &[u8]) -> J {
     json!({"$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(b)})
 }
 
-/// notifyWrite to a registered service, as the reference forwards it (the
-/// writer's notify plus the spaceRevs), naming `prev` as the spaceRev
-/// before it: "ok", "refused" (a status not worth retrying) or "error".
-pub async fn forward(app: &App, f: &Forward, prev: Option<Tid>) -> &'static str {
-    let lxm = "com.atproto.space.notifyWrite";
-    let mut body = json!({
-        "space": &*f.uri,
-        "repo": f.writer,
-        "repoRev": f.repo_rev.to_string(),
-        "data": b64(&f.hash),
-        "spaceRev": f.space_rev.to_string(),
-    });
-    if let Some(p) = prev {
-        body["prevSpaceRev"] = json!(p.to_string());
-    }
+/// How a call to a syncer's endpoint ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sent {
+    Delivered,
+    /// A status not worth retrying.
+    Refused(String),
+    Retry(String),
+}
+
+/// A POST of `body` to `{endpoint}/xrpc/{lxm}` with no auth, as the
+/// reference's `xrpc` over `safeFetch` calls an endpoint a syncer chose:
+/// (status, JSON body).
+async fn post_endpoint(app: &App, endpoint: &str, lxm: &str, body: &J) -> Result<(u16, J), String> {
+    let url = format!("{}/xrpc/{lxm}", endpoint.trim_end_matches('/'));
     let client = vlatproto::http::guarded_fanout(app.config.dev_mode);
-    let post = reqwest::Method::POST;
-    match call(app, client, &f.authority, &f.service, &f.endpoint, lxm, post, &[], Some(&body)).await {
-        Ok((s, _)) if (200..300).contains(&s) => "ok",
-        Ok((s, _)) if crate::xrpc::space::retryable_status(s) => {
-            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, status = s, "space notify forward failed");
+    let mut r =
+        client.request(reqwest::Method::POST, &url)?.timeout(CALL_TIMEOUT).json(body).send().await.map_err(|e| {
+            // the endpoint is the syncer's; the logs keep its host only
+            http_error(lxm, e)
+        })?;
+    let status = r.status().as_u16();
+    let mut buf = Vec::new();
+    while let Some(c) = r.chunk().await.map_err(|e| http_error(lxm, e))? {
+        if buf.len() + c.len() > MAX_RESPONSE {
+            return Err(format!("{lxm}: response too large"));
+        }
+        buf.extend_from_slice(&c);
+    }
+    Ok((status, serde_json::from_slice(&buf).unwrap_or(J::Null)))
+}
+
+fn outcome(r: Result<(u16, J), String>) -> Sent {
+    match r {
+        Ok((s, _)) if (200..300).contains(&s) => Sent::Delivered,
+        Ok((s, _)) if crate::xrpc::space::retryable_status(s) => Sent::Retry(format!("status {s}")),
+        Ok((s, _)) => Sent::Refused(format!("status {s}")),
+        Err(e) => Sent::Retry(e),
+    }
+}
+
+/// Reference `confirmRegistration`: before a registration is made, its
+/// endpoint must know the token as one it issued for this space and echo a
+/// random challenge.
+pub async fn confirm_registration(app: &App, space: &str, endpoint: &str, token: &str) -> Result<(), String> {
+    let challenge = super::token::new_jti();
+    let body = json!({"space": space, "token": token, "challenge": challenge});
+    match post_endpoint(app, endpoint, "com.atproto.space.confirmRegistration", &body).await {
+        Ok((200, b)) if b["challenge"].as_str() == Some(challenge.as_str()) => Ok(()),
+        Ok((s, _)) => Err(format!("status {s}")),
+        Err(e) => Err(e),
+    }
+}
+
+/// notifySpaceUpdate with `update` (a `$type`d union member).
+pub async fn notify_space_update(app: &App, space: &str, endpoint: &str, token: &str, update: J) -> Sent {
+    let body = json!({"space": space, "token": token, "update": update});
+    outcome(post_endpoint(app, endpoint, "com.atproto.space.notifySpaceUpdate", &body).await)
+}
+
+/// A forward, naming `prev` as the spaceRev before it: "ok", "refused" or
+/// "error".
+pub async fn forward(app: &App, f: &Forward, prev: Option<Tid>) -> &'static str {
+    let mut update = match &f.update {
+        Update::Write { repo_rev, hash } => json!({
+            "$type": "com.atproto.space.defs#repoWrite",
+            "repo": f.writer,
+            "repoRev": repo_rev.to_string(),
+            "data": b64(hash),
+            "spaceRev": f.space_rev.to_string(),
+        }),
+        Update::Removed => json!({
+            "$type": "com.atproto.space.defs#repoRemoved",
+            "repo": f.writer,
+            "spaceRev": f.space_rev.to_string(),
+        }),
+    };
+    if let Some(p) = prev {
+        update["prevSpaceRev"] = json!(p.to_string());
+    }
+    let log_id = crate::state::space_log_id(&f.uri);
+    match notify_space_update(app, &f.uri, &f.endpoint, &f.token, update).await {
+        Sent::Delivered => "ok",
+        Sent::Retry(e) => {
+            tracing::info!(space = %log_id, "space notify forward failed: {e}");
             "error"
         }
-        Ok((s, _)) => {
-            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, status = s, "space notify forward refused");
+        Sent::Refused(e) => {
+            tracing::info!(space = %log_id, "space notify forward refused: {e}");
             "refused"
-        }
-        Err(e) => {
-            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, "space notify forward failed: {e}");
-            "error"
         }
     }
 }
@@ -312,7 +402,7 @@ async fn served_commit(
     let mut req = vlatproto::http::guarded(app.config.dev_mode)
         .request(reqwest::Method::GET, &url)?
         .query(&[("space", space), ("repo", writer)])
-        .header(super::mac::WANT_MAC_HEADER, super::mac::format_want_mac(super::mac::MacType::Repo, &share));
+        .header(super::mac::ACCEPT_SIGNATURE, super::mac::format_request(super::mac::Profile::Commit, &share));
     for (k, v) in signed {
         req = req.header(k, v);
     }
@@ -320,7 +410,7 @@ async fn served_commit(
     if !r.status().is_success() {
         return Err(format!("getLatestCommit: {}", r.status()));
     }
-    let mac = r.headers().get(super::mac::MAC_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
+    let headers = r.headers().clone();
     let mut buf = Vec::new();
     while let Some(c) = r.chunk().await.map_err(|e| http_error("getLatestCommit", e))? {
         if buf.len() + c.len() > MAX_RESPONSE {
@@ -330,8 +420,14 @@ async fn served_commit(
     }
     let body: J = serde_json::from_slice(&buf).map_err(|_| "getLatestCommit: not JSON")?;
     let commit = super::commit::Commit::from_json(&body["commit"]).ok_or("getLatestCommit: malformed commit")?;
-    let mac = super::mac::parse_mac(mac.as_deref(), super::mac::MacType::Repo).map_err(|e| e.0.to_string())?;
-    if !super::commit::verify(&commit, space, writer, &secret, &mac) {
+    let header = |name: &str| {
+        let lines: Vec<&str> = headers.get_all(name).iter().filter_map(|v| v.to_str().ok()).collect();
+        (!lines.is_empty()).then(|| lines.join(", "))
+    };
+    if commit.repo != writer || commit.space != space {
+        return Err("getLatestCommit: a commit for another repo".into());
+    }
+    if super::mac::verify_commit(&commit, &share, &secret, &header).is_err() {
         return Err(MAC_MISMATCH.into());
     }
     Ok(commit)

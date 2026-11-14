@@ -337,17 +337,75 @@ fn space_writer() -> vlpds::space::rows::WriterRow {
         repo_rev: vlatproto::tid::Tid(0x1234_5678_9abc),
         hash: [7; 32],
         space_rev: vlatproto::tid::Tid(0x1234_5678_9abd),
+        removed: false,
     }
 }
 
-/// A notify registration (`sN`): its key and row.
+/// A registerNotify registration (`sN`): its key and row. This build only
+/// reads them, to drop them once expired.
 fn space_notify() -> Vec<u8> {
     let sid = vlpds::state::space_id(SPACE);
     let key = vlpds::state::space_notify_key(DID, &sid, "did:web:syncer.example#atproto_space_syncer");
-    let row =
-        vlpds::space::rows::NotifyRow { endpoint: "https://syncer.example".into(), expires: 1_790_000_000_000_000 };
+    let row = vlpds::space::rows::LegacyNotifyRow {
+        endpoint: "https://syncer.example".into(),
+        expires: 1_790_000_000_000_000,
+    };
     let k: BTreeMap<&str, String> =
         [("space notify sN/", hex::encode(key)), ("row", hex::encode(row.encode()))].into_iter().collect();
+    pretty(&k)
+}
+
+/// An authorizeSpaceSync registration (`sG`): its key and row.
+fn space_registration() -> Vec<u8> {
+    let sid = vlpds::state::space_id(SPACE);
+    let id = vlpds::state::registration_id("https://syncer.example", "fixture-token");
+    let row = vlpds::space::rows::RegRow {
+        endpoint: "https://syncer.example".into(),
+        token: "fixture-token".into(),
+        expires: 1_790_000_000_000_000,
+        expiry_notified: true,
+    };
+    let k: BTreeMap<&str, String> = [
+        ("space registration sG/", hex::encode(vlpds::state::space_registration_key(DID, &sid, &id))),
+        ("row", hex::encode(row.encode())),
+    ]
+    .into_iter()
+    .collect();
+    pretty(&k)
+}
+
+/// A notice owed to a registration (`sE`): its key and row.
+fn space_notice() -> Vec<u8> {
+    let sid = vlpds::state::space_id(SPACE);
+    let id = vlpds::state::registration_id("https://syncer.example", "fixture-token");
+    let row = vlpds::space::notices::NoticeRow {
+        uri: SPACE.into(),
+        endpoint: "https://syncer.example".into(),
+        token: "fixture-token".into(),
+        notice: vlpds::space::notices::expired(vlatproto::tid::Tid(0x1234_5678_9abe)),
+        attempts: 2,
+        retry_at: 1_790_000_000_000_000,
+        expires: 1_790_259_200_000_000,
+    };
+    let k: BTreeMap<&str, String> = [
+        ("space notice sE/", hex::encode(vlpds::state::space_notice_key(DID, &sid, &id))),
+        ("row", serde_json::to_string(&row).unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    pretty(&k)
+}
+
+/// A writer removed from the set (`sX`): its key and row.
+fn space_removed() -> Vec<u8> {
+    let sid = vlpds::state::space_id(SPACE);
+    let row = vlpds::space::rows::WriterRow { removed: true, ..space_writer() };
+    let k: BTreeMap<&str, String> = [
+        ("space removed writer sX/", hex::encode(vlpds::state::space_removed_key(DID, &sid, "did:plc:writer"))),
+        ("row", hex::encode(row.encode())),
+    ]
+    .into_iter()
+    .collect();
     pretty(&k)
 }
 
@@ -598,6 +656,9 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("state/space_writer.bin", space_writer().encode().to_vec()),
         ("state/space_space.json", space_space().encode().to_vec()),
         ("state/space_notify.json", space_notify()),
+        ("state/space_registration.json", space_registration()),
+        ("state/space_notice.json", space_notice()),
+        ("state/space_removed.json", space_removed()),
         ("state/space_blob_refs.json", space_blob_refs()),
         ("state/space_list.json", space_list()),
         ("control/node_lease.json", compact(&lease())),
@@ -1073,8 +1134,38 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert_eq!(vlsync_store::keys::key_slot(&key), Some(vlsync_store::slots::slot_of(DID)));
             assert!(vlpds::state::is_space_key(&key));
             let row = hex::decode(&k["row"]).unwrap();
-            let r = vlpds::space::rows::NotifyRow::decode(&row).unwrap();
+            let r = vlpds::space::rows::LegacyNotifyRow::decode(&row).unwrap();
             assert!(r.encode() == row);
+        }
+        "state/space_registration.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let key = hex::decode(&k["space registration sG/"]).unwrap();
+            assert_eq!(vlsync_store::keys::key_slot(&key), Some(vlsync_store::slots::slot_of(DID)));
+            assert!(vlpds::state::is_space_key(&key));
+            let row = hex::decode(&k["row"]).unwrap();
+            let r = vlpds::space::rows::RegRow::decode(&row).unwrap();
+            assert!(r.encode() == row);
+            assert_eq!(vlpds::state::registration_id(&r.endpoint, &r.token)[..], key[key.len() - 32..]);
+        }
+        "state/space_notice.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let key = hex::decode(&k["space notice sE/"]).unwrap();
+            assert_eq!(vlsync_store::keys::key_slot(&key), Some(vlsync_store::slots::slot_of(DID)));
+            assert!(vlpds::state::is_space_key(&key));
+            let r: vlpds::space::notices::NoticeRow = serde_json::from_str(&k["row"]).unwrap();
+            assert_eq!(serde_json::to_string(&r).unwrap(), k["row"]);
+        }
+        "state/space_removed.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let key = hex::decode(&k["space removed writer sX/"]).unwrap();
+            assert_eq!(vlsync_store::keys::key_slot(&key), Some(vlsync_store::slots::slot_of(DID)));
+            assert!(vlpds::state::is_space_key(&key));
+            let row = hex::decode(&k["row"]).unwrap();
+            let r = vlpds::space::rows::WriterRow::decode_removed(&row).unwrap();
+            assert!(r.removed && r.encode() == row);
         }
         "state/space_blob_refs.json" => {
             let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();

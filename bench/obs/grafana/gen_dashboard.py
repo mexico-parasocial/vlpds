@@ -705,21 +705,21 @@ ts("Space writes by method and result", [rate("vlpds_space_writes_total", by="op
    desc="createRecord / putRecord / deleteRecord / applyWrites into space repos. refused = a 4xx (validation, scope, an inactive account); "
         "error = a 5xx.")
 ts("Write → notify ack", quantiles("vlpds_space_notify_ack_seconds", qs=(0.5, 0.99)), "s", empty="no notifies to other authorities",
-   desc="A space write's ack to its authority's 200 for the notifyWrite. Writes into the author's own space carry the authority's "
+   desc="A space write's ack to its authority's 200 for the notifyRepoUpdate. Writes into the author's own space carry the authority's "
         "rows in the write's entry, so they send nothing and aren't counted here.")
-ts("notifyWrite outbox rows by node", [node_gauge("vlpds_space_outbox_rows")], "short", empty="no outbox rows",
+ts("notifyRepoUpdate outbox rows by node", [node_gauge("vlpds_space_outbox_rows")], "short", empty="no outbox rows",
    desc="One row per (repo, space) this node still owes its authority a notify for. Writes made while a send is in flight only "
         "move their row's rev, so the count follows the active (repo, space) pairs, not the write rate.")
-ts("notifyWrite outbox oldest row", [node_gauge("vlpds_space_outbox_oldest_seconds", agg="max")], "s", lines=[(3600, "orange")],
+ts("notifyRepoUpdate outbox oldest row", [node_gauge("vlpds_space_outbox_oldest_seconds", agg="max")], "s", lines=[(3600, "orange")],
    empty="no outbox rows",
    desc=f"Age of each node's oldest undelivered row. Retries back off from 1 min to 1 h and give up 24 h after the write. "
         f"Dashed: {rb('VlpdsSpaceOutboxBacklog')} (1 h).")
-ts("notifyWrite by hop and result", [rate(SPACE_NOTIFY, by="hop, result", legend="{{hop}} {{result}}")], "ops", empty="no notifies",
+ts("notifyRepoUpdate by hop and result", [rate(SPACE_NOTIFY, by="hop, result", legend="{{hop}} {{result}}")], "ops", empty="no notifies",
    desc="out = this node's writes to their authorities; in = notifies received as an authority; fanout = forwarded to "
         "registered syncers. ok = 200; retry = backing off; wait = the writer's account is inactive; refused / gone / "
         "expired = the row was dropped. in same_rev_unverified / same_rev_capped = a remote writer's same-rev, new-hash "
         "notify (a record takedown) its host didn't confirm, or over 3 per writer and space in 10 min: dropped, left to polls.")
-ts("notifyWrite failure ratio by hop",
+ts("notifyRepoUpdate failure ratio by hop",
    [t(f'sum by (hop) (rate({SPACE_NOTIFY}{{{I}, result!="ok"}}{RI})) / sum by (hop) (rate({SPACE_NOTIFY}{{{I}}}{RI}))', "{{hop}}")],
    "percentunit", max_=1, lines=[(0.5, "orange")], empty="no notifies",
    desc=f"Dashed: {rb('VlpdsSpaceNotifyFanoutFailing')} (fanout over 50%). A dead syncer or a remote authority that's down "
@@ -744,7 +744,7 @@ ts("Credential checks by result", [rate("vlpds_space_credential_checks_total", b
 ts("Credentials and delegations issued", [rate("vlpds_space_credentials_issued_total", by="result", legend="credentials {{result}}"),
                                          rate("vlpds_space_delegations_total", legend="delegation tokens")], "ops",
    empty="none issued",
-   desc="getSpaceCredential answers as an authority (bad_token = the delegation token didn't verify), and delegation tokens "
+   desc="authorizeSpaceSync answers as an authority (bad_token = the delegation token didn't verify), and delegation tokens "
         "minted for this node's accounts.")
 ts("Fan-out queue depth and drops", [t(f"sum(vlpds_space_fanout_queue_depth{{{I}}})", "queued"),
                                      rate("vlpds_space_fanout_dropped_total", by="reason", legend="dropped/s {{reason}}")], "short",

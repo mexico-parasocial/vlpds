@@ -45,7 +45,7 @@ export type SpaceRow = {
 type Totals = { spaces: number; deletedSpaces: number; takendown: number; members: number; writers: number; spaceRepos: number; records: number; foreignSpaces: number }
 type ListOut = { totals: Totals; count: number; spaces: SpaceRow[]; cursor?: string; truncated?: boolean; countCap: number; unreachableNodes?: string[] }
 type Writer = { did: string; handle?: string | null; repoRev: Rev; spaceRev: Rev; hash: string; local: boolean; records?: number; headRev?: Rev; takendownRecords?: number }
-type Registration = { service: string; host?: string | null; expiresAt?: string; expired: boolean }
+type Registration = { registration: string; host?: string | null; expiresAt?: string; lapsed: boolean; expiryNotified: boolean }
 type SpaceInfo = {
   space: { uri: string; authority: string; handle?: string | null; spaceType: string; skey: string; policy: string; readPolicy: string; writePolicy: string; appAccess: string; createdAt: string; deletedAt?: string | null; takendown: boolean }
   members: { did: string; handle?: string | null; read: boolean; write: boolean }[]
@@ -56,7 +56,7 @@ type SpaceInfo = {
   registrations: Registration[]
   takendownRecords: { uri: string; did: string }[]
 }
-type Audit = { id: string; at: string; actor: string; auth?: string; ip?: string; action: string; subject?: { kind: string; did: string; uri?: string }; reason?: string; detail?: { method?: string; service?: string } }
+type Audit = { id: string; at: string; actor: string; auth?: string; ip?: string; action: string; subject?: { kind: string; did: string; uri?: string }; reason?: string; detail?: { method?: string; registration?: string } }
 type SpaceRecord = { uri: string; cid: string; value: unknown; takendown: boolean }
 
 /** The slide-over for a space (old /admin/spaces/space?uri= links still land on its full page). */
@@ -517,21 +517,21 @@ function readRecords(handle: string, start: (reason: string) => void) {
   })
 }
 
-function removeRegistration(authority: string, space: string, service: string, done: () => void) {
+function removeRegistration(authority: string, space: string, r: Registration, done: () => void) {
   confirmAction({
     tone: 'warn',
     title: 'Remove this notify registration?',
     items: [
-      <span className="mono sm" style={{ overflowWrap: 'anywhere' }}>{service}</span>,
-      'The service stops getting this space’s notifies at once.',
-      'It can register again with a credential for the space: take the space down to keep it out.',
+      <span className="mono sm" style={{ overflowWrap: 'anywhere' }}>{r.host ?? r.registration}</span>,
+      'Its endpoint stops getting this space’s notifies at once.',
+      'It can register again when it next authorizes sync: take the space down to keep it out.',
     ],
     fields: [{ id: 'reason', label: 'Reason (kept in the audit log)', required: true, type: 'textarea' }],
     action: 'Remove',
     call: 'vlpds.admin.removeSpaceRegistration',
     run: (v) =>
       mutate({
-        run: () => admin('vlpds.admin.removeSpaceRegistration', { body: { did: authority, space, service, reason: String(v.reason).trim() } }),
+        run: () => admin('vlpds.admin.removeSpaceRegistration', { body: { did: authority, space, registration: r.registration, reason: String(v.reason).trim() } }),
         changes: [{ kind: 'space', id: space }],
       }).then(done),
     done: 'Registration removed',
@@ -542,7 +542,7 @@ function SpaceAudit({ space, entries }: { space: string; entries: Audit[] }) {
   const what = (e: Audit) => {
     const s = e.subject
     if (!s) return '—'
-    if (s.kind === 'space') return e.detail?.service ? `registration ${e.detail.service}` : 'the space'
+    if (s.kind === 'space') return e.detail?.registration ? `registration ${e.detail.registration.slice(0, 12)}` : 'the space'
     if (s.kind === 'spaceRepo') return `repo of ${shortDid(s.did)}`
     return s.uri?.startsWith(`${space}/`) ? s.uri.slice(space.length + 1) : (s.uri ?? s.did)
   }
@@ -691,22 +691,26 @@ registerDetail('space', {
       </Sec>
     )
     const regs = (
-      <Sec title="Notify registrations" digest={plural(d.registrations.length, 'service')} open={page || d.registrations.length > 0} flush>
+      <Sec title="Notify registrations" digest={plural(d.registrations.length, 'registration')} open={page || d.registrations.length > 0} flush>
         {d.registrations.length ? (
           <DataTable
             compact
             rows={d.registrations}
-            rowKey={(r) => r.service}
+            rowKey={(r) => r.registration}
             cols={[
-              { id: 's', label: 'Service', render: (r) => <Copy text={r.service}>{r.service.length > 32 ? `${r.service.slice(0, 32)}…` : r.service}</Copy> },
-              { id: 'h', label: 'Host', render: (r) => <span className="mono sm">{r.host ?? '—'}</span> },
-              { id: 'e', label: 'Expires', render: (r) => (r.expired ? <Chip k="idle">expired</Chip> : r.expiresAt ? ago(Date.parse(r.expiresAt)) : '—') },
+              { id: 'h', label: 'Endpoint host', render: (r) => <span className="mono sm">{r.host ?? '—'}</span> },
+              { id: 'i', label: 'Id', render: (r) => <Copy text={r.registration}>{r.registration.slice(0, 12)}</Copy> },
+              {
+                id: 'e',
+                label: 'Expires',
+                render: (r) => (r.lapsed ? <Chip k="idle">{r.expiryNotified ? 'lapsed, told' : 'lapsed'}</Chip> : r.expiresAt ? ago(Date.parse(r.expiresAt)) : '—'),
+              },
               {
                 id: 'x',
                 label: '',
                 r: true,
                 render: (r) => (
-                  <button type="button" className="cx-btn sm danger" onClick={() => removeRegistration(s.authority, s.uri, r.service, reload)}>
+                  <button type="button" className="cx-btn sm danger" onClick={() => removeRegistration(s.authority, s.uri, r, reload)}>
                     Remove…
                   </button>
                 ),
@@ -714,7 +718,7 @@ registerDetail('space', {
             ]}
           />
         ) : (
-          <Empty>No service is registered for this space’s notifies.</Empty>
+          <Empty>No endpoint is registered for this space’s notifies.</Empty>
         )}
       </Sec>
     )

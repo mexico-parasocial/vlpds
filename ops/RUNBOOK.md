@@ -1717,7 +1717,7 @@ Limits & lockouts page).
 
 ### VlpdsSpaceOutboxBacklog
 
-**Means:** a node has owed some space authority a `notifyWrite` for over an
+**Means:** a node has owed some space authority a `notifyRepoUpdate` for over an
 hour (`vlpds_space_outbox_oldest_seconds`). Every space write is durable and
 readable at its 200. The outbox only tells the authority that the repo moved,
 so syncers find the write later than they should. Each (repo, space) has one
@@ -1731,8 +1731,8 @@ resolve to an `#atproto_space_host` or `#atproto_pds` endpoint. A deactivated
 or taken-down writer's rows wait for a restore. They're left out of the age,
 so they never fire this alert.
 
-**Confirm:** the internals dashboard's Spaces row: `notifyWrite by hop and
-result` shows `out retry` (the authority is failing). The node logs `space notifyWrite retry: <why>` with the DID, space
+**Confirm:** the internals dashboard's Spaces row: `notifyRepoUpdate by hop and
+result` shows `out retry` (the authority is failing). The node logs `space notifyRepoUpdate retry: <why>` with the space
 and rev on every failed send.
 
 **Do:**
@@ -1740,7 +1740,7 @@ and rev on every failed send.
   Once it does, the next retry (at most ~1 h away) delivers the newest rev.
 - Many authorities failing at once: look at this node's outbound path (DNS,
   egress, `http::guarded` refusals in the logs).
-- A row past 24 h is dropped. The authority's `listRepos` then lags for that
+- A row past 24 h is dropped. The authority's `listWriters` then lags for that
   repo until its next write. Syncers still catch up from `listRepoOps`.
 
 ### VlpdsSpaceDigestMismatch
@@ -1770,10 +1770,10 @@ the records.
 
 **Means:** over half of the notifies this node forwards to registered syncers
 fail, at over 0.1/s, for 30 min
-(`vlpds_space_notify_total{hop="fanout"}`). Syncers register with
-`registerNotify` and are third-party services. A failed fan-out only delays a
-syncer, since it pulls from its last rev on the next notify or poll and
-`listRepos` covers gaps. Fan-out runs off the write path, so writes aren't
+(`vlpds_space_notify_total{hop="fanout"}`). Syncers register an endpoint
+when they authorize (`authorizeSpaceSync` with `notify`) and are third-party
+services. A failed fan-out only delays a syncer, since it pulls from its last
+rev on the next notify or poll and `listWriters` covers gaps. Fan-out runs off the write path, so writes aren't
 slowed by it.
 
 **Causes:** one big syncer down or refusing (the usual case on a small node),
@@ -1781,12 +1781,14 @@ or this node's egress failing.
 
 **Confirm:** the Spaces row's `Fan-out queue depth and drops` and the failure
 ratio by hop. `out` failing at the same time points at egress. The logs name
-the syncer's service id (`space notify forward failed` or `refused`, with
-`service` and `status`) per failure.
+each failure (`space notify forward failed` or `refused`, with the space and
+the status).
 
 **Do:**
-- One syncer down: nothing to do. Its registrations expire 24 h after their
-  last `registerNotify` and are pruned once they keep failing past that.
+- One syncer down: nothing to do. Its registrations lapse at the `exp` of the
+  credential that last renewed them. A lapsed one is sent one
+  `registrationExpired` notice, retried for 72 h, and dropped once that is
+  refused or given up on.
 - Egress: same as any outbound trouble (DNS, firewall, `http::guarded`
   refusals in the logs).
 

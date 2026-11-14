@@ -7,7 +7,7 @@
 //! 1. `policy`: the space's policy object.
 //! 2. Policy state, keyed like record paths (`{nsid}/{rkey}`): memberspace's
 //!    member list is the only one among the baseline policies.
-//! 3. `writer/{did}`: one per writer-set entry, `{rev, data, spaceRev}`.
+//! 3. `writer/{did}`: one per writer-set entry, `{repoRev, data, spaceRev}`.
 //!
 //! This module is the framing and the profile's checks; which policy state
 //! keys a policy defines is the importer's.
@@ -72,16 +72,16 @@ fn meta_bytes(space: &str) -> Vec<u8> {
 fn writer_value(w: &Writer) -> Vec<u8> {
     let mut b = Vec::with_capacity(80);
     cbor::write_map_head(&mut b, 3);
-    cbor::write_text(&mut b, "rev");
-    cbor::write_text(&mut b, &w.rev.to_string());
     cbor::write_text(&mut b, "data");
     cbor::write_bytes(&mut b, &w.data);
+    cbor::write_text(&mut b, "repoRev");
+    cbor::write_text(&mut b, &w.rev.to_string());
     cbor::write_text(&mut b, "spaceRev");
     cbor::write_text(&mut b, &w.space_rev.to_string());
     b
 }
 
-/// `serializeSpaceMeta`, putting each section into key order.
+/// `writeSpaceMetaStar`, putting each section into key order.
 pub fn write(a: &Archive) -> Vec<u8> {
     let mut out = Vec::new();
     star::write_header(&mut out, &meta_bytes(&a.space));
@@ -183,7 +183,7 @@ pub fn read(bytes: &[u8]) -> Result<Archive, MetaError> {
                 };
                 writers.push(Writer {
                     did: did.to_string(),
-                    rev: tid_of(get(w, "rev"), "rev")?,
+                    rev: tid_of(get(w, "repoRev"), "repoRev")?,
                     data,
                     space_rev: tid_of(get(w, "spaceRev"), "spaceRev")?,
                 });

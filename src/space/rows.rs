@@ -155,7 +155,7 @@ pub fn seq_rev(key: &[u8]) -> Option<Tid> {
     Some(Tid(u64::from_be_bytes(tail.try_into().ok()?)))
 }
 
-/// `sQ`: a writer in listRepos order, with the spaceRev sequenced just
+/// `sQ`: a writer in listWriters order, with the spaceRev sequenced just
 /// before it. That one's row may be gone (its writer wrote again), and a
 /// forward naming anything else as its prevSpaceRev could fork the chain a
 /// syncer already heard.
@@ -238,12 +238,26 @@ pub fn did_sid_head(key: &[u8]) -> Option<(&str, crate::state::SpaceId)> {
     Some((std::str::from_utf8(&body[..at]).ok()?, sid.try_into().ok()?))
 }
 
-/// `sW`: a writer's latest state as its repo host reported it.
+/// What follows `{did}\0{sid}` in a key (`sN`'s and `sD`'s registration,
+/// `sW`'s writer).
+pub fn after_sid(key: &[u8]) -> Option<&[u8]> {
+    let body = vlsync_store::keys::key_body(key).get(3..)?;
+    let at = body.iter().position(|b| *b == 0)?;
+    body.get(at + 1 + crate::state::SPACE_ID_LEN..)
+}
+
+/// `sW`: a writer's latest state as its repo host reported it; `sX`, the
+/// same row for a writer removed from the set, its last state kept (a
+/// notify must be newer than it to add it back) and `space_rev` the
+/// removal's, which is sequenced like a write so listWriters and syncers
+/// hear of it. `removed` says which family the row is in; it isn't
+/// encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterRow {
     pub repo_rev: Tid,
     pub hash: [u8; 32],
     pub space_rev: Tid,
+    pub removed: bool,
 }
 
 impl WriterRow {
@@ -257,13 +271,19 @@ impl WriterRow {
         b.into()
     }
 
+    /// An `sW` row.
     pub fn decode(v: &[u8]) -> anyhow::Result<WriterRow> {
         let mut r = Reader::new(v);
         let repo_rev = Tid(r.u64()?);
         let hash = r.take(32)?.try_into()?;
         let space_rev = Tid(r.u64()?);
         r.end()?;
-        Ok(WriterRow { repo_rev, hash, space_rev })
+        Ok(WriterRow { repo_rev, hash, space_rev, removed: false })
+    }
+
+    /// An `sX` row.
+    pub fn decode_removed(v: &[u8]) -> anyhow::Result<WriterRow> {
+        Ok(WriterRow { removed: true, ..WriterRow::decode(v)? })
     }
 }
 
@@ -287,15 +307,61 @@ impl MemberRow {
     }
 }
 
-/// `sN`: a service registered for the space's write notifications.
+/// `sG`: an endpoint registered for the space's notifications by
+/// authorizeSpaceSync, keyed by [`crate::state::registration_id`] of its
+/// endpoint and token. It's active until `expires` (its latest
+/// credential's `exp`), then lapsed: it's sent one expiry notice
+/// (`expiry_notified` once claimed) and then nothing but a deletion
+/// notice, until the syncer authorizes again.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NotifyRow {
+pub struct RegRow {
+    pub endpoint: String,
+    pub token: String,
+    /// Unix microseconds.
+    pub expires: u64,
+    pub expiry_notified: bool,
+}
+
+impl RegRow {
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(13 + self.endpoint.len() + self.token.len());
+        put_str(&mut b, &self.endpoint);
+        put_str(&mut b, &self.token);
+        b.put_u64(self.expires);
+        b.put_u8(self.expiry_notified as u8);
+        b.into()
+    }
+
+    pub fn decode(v: &[u8]) -> anyhow::Result<RegRow> {
+        let mut r = Reader::new(v);
+        let endpoint = r.str()?.to_string();
+        let token = r.str()?.to_string();
+        let expires = r.u64()?;
+        let expiry_notified = match r.u8()? {
+            0 => false,
+            1 => true,
+            f => bail!("bad registration flags {f}"),
+        };
+        r.end()?;
+        Ok(RegRow { endpoint, token, expires, expiry_notified })
+    }
+
+    pub fn lapsed(&self, now: u64) -> bool {
+        self.expires <= now
+    }
+}
+
+/// An `sN` row from registerNotify, keyed by the service it named. The
+/// wire has nothing to deliver to it (no token); it's dropped once
+/// expired, as it was then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyNotifyRow {
     pub endpoint: String,
     /// Unix microseconds.
     pub expires: u64,
 }
 
-impl NotifyRow {
+impl LegacyNotifyRow {
     pub fn encode(&self) -> Bytes {
         let mut b = Vec::with_capacity(10 + self.endpoint.len());
         put_str(&mut b, &self.endpoint);
@@ -303,12 +369,12 @@ impl NotifyRow {
         b.into()
     }
 
-    pub fn decode(v: &[u8]) -> anyhow::Result<NotifyRow> {
+    pub fn decode(v: &[u8]) -> anyhow::Result<LegacyNotifyRow> {
         let mut r = Reader::new(v);
         let endpoint = r.str()?.to_string();
         let expires = r.u64()?;
         r.end()?;
-        Ok(NotifyRow { endpoint, expires })
+        Ok(LegacyNotifyRow { endpoint, expires })
     }
 }
 
@@ -509,7 +575,7 @@ fn legacy_config(p: &Policy) -> (LegacyPolicy, LegacyPolicy, LegacyAppAccess) {
 }
 
 /// `sS`: a space this account governs. A deleted one stays as a tombstone
-/// (`deleted_at`), so getSpaceCredential can answer `SpaceDeleted`.
+/// (`deleted_at`), so authorizeSpaceSync can answer `SpaceDeleted`.
 ///
 /// A row written before space policies holds the simplespace config
 /// (`readPolicy`, `writePolicy`, `appAccess`) instead of `policy`: it
@@ -625,10 +691,18 @@ mod tests {
         }
         let o = OutboxRow { uri: "at://x".into(), repo_rev: Tid(5), hash: [3; 32] };
         assert_eq!(OutboxRow::decode(&o.encode()).unwrap(), o);
-        let n = NotifyRow { endpoint: "https://syncer.example".into(), expires: 9 };
-        assert_eq!(NotifyRow::decode(&n.encode()).unwrap(), n);
-        let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3) };
+        let n = LegacyNotifyRow { endpoint: "https://syncer.example".into(), expires: 9 };
+        assert_eq!(LegacyNotifyRow::decode(&n.encode()).unwrap(), n);
+        for expiry_notified in [false, true] {
+            let n =
+                RegRow { endpoint: "https://syncer.example".into(), token: "t".into(), expires: 9, expiry_notified };
+            assert_eq!(RegRow::decode(&n.encode()).unwrap(), n);
+        }
+        let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3), removed: false };
         assert_eq!(WriterRow::decode(&w.encode()).unwrap(), w);
+        let x = WriterRow { removed: true, ..w };
+        assert_eq!(x.encode(), w.encode(), "the family says which");
+        assert_eq!(WriterRow::decode_removed(&x.encode()).unwrap(), x);
         for prev in [None, Some(Tid(4))] {
             let q = SeqRow { prev, writer: "did:plc:w".into() };
             assert_eq!(SeqRow::decode(&q.encode()).unwrap(), q);

@@ -46,13 +46,16 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 | `sH/{did}\0{sid}` | the author | the space repo head: URI, rev, LtHash state, record count, created |
 | `sR/{did}\0{sid}{coll}/{rkey}` | the author | CID, rev and record bytes, as `R/` holds them. The source of truth |
 | `sO/{did}\0{sid}{rev}{idx}` | the author | the oplog: action, collection, rkey, CID and prev CID. Kept 7 days |
-| `sP/{did}\0{sid}` | the author | the notifyWrite outbox: URI, repoRev and data hash, one row per (repo, space) |
+| `sP/{did}\0{sid}` | the author | the notifyRepoUpdate outbox: URI, repoRev and data hash, one row per (repo, space) |
 | `sS/{auth}\0{sid}` | the authority | the space as JSON: URI, the policy (as on the wire, defaults filled in), created, and `deleted` for a tombstone. It also carries the closest `readPolicy`/`writePolicy`/`appAccess`, which an older build reads. A row from before space policies holds only those and decodes to the policy the reference's migration gives it |
 | `sM/{auth}\0{sid}{member}` | the authority | a member's read and write access. Read only under a `memberspace`, and wiped when the space changes policy |
 | `sW/{auth}\0{sid}{writer}` | the authority | writer state: repoRev, data hash, spaceRev |
-| `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listRepos` order, and the spaceRev sequenced just before it. It holds each writer's latest state only, so the row before isn't always that one |
-| `sN/{auth}\0{sid}{service}` | the authority | a notify registration: endpoint and expiry (24 h) |
-| `sD/{auth}\0{sid}{service}` | the authority | a `notifySpaceDeleted` still owed to a registered service: the space URI, endpoint, expiry, attempt count and next try |
+| `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listWriters` order, and the spaceRev sequenced just before it. It holds each writer's latest state only, so the row before isn't always that one |
+| `sX/{auth}\0{sid}{writer}` | the authority | a writer removed from the set, encoded as `sW` is. A writer is in `sW` or `sX`, never both. `listWriters` lists it as removed |
+| `sG/{auth}\0{sid}{registration id}` | the authority | a syncer's registration (the id is sha256(endpoint ‖ 0 ‖ token)): endpoint, token, expiry, and whether its expiry notice was sent |
+| `sE/{auth}\0{sid}{registration id}` | the authority | a notice owed to a registration that a send couldn't deliver: the space URI, endpoint, token, the notice, attempt count, next try and the end of the retry window |
+| `sN/{auth}\0{sid}{service}` | the authority | a registration the previous release wrote. It's kept only until its expiry, and nothing is ever sent to it |
+| `sD/{auth}\0{sid}{service}` | the authority | a deletion retry the previous release wrote. It's kept only until its expiry, and nothing is ever sent to it |
 | `sb/{did}\0{sid}{cid}\0{path}` | the author | a space record's blob ref, at the rev that wrote it. `space.listBlobs` scans it in CID order |
 | `sc/{did}\0{cid}\0{sid}{path}` | the author | the same ref, CID first, so the blob GC and `sync.getBlob` find a blob's space refs in one scan |
 | `sL/{did}\0{uri}\0{h\|s}` | the account | `listSpaces`'s index, in URI order: `h` for a repo the account holds, `s` for a live space it governs |
@@ -64,8 +67,8 @@ account both writes in and governs has both rows and is listed once. With a `did
 covers that authority's URIs only. With `spaceType` alone it seeks past each authority's other
 types, so a page reads its own rows plus about one per authority it skips.
 
-A deleted space keeps its `sS` tombstone so `getSpaceCredential` can answer `SpaceDeleted`. Its
-other host rows are swept, except the `sD` rows of services still owed a `notifySpaceDeleted`, and a
+A deleted space keeps its `sS` tombstone so `authorizeSpaceSync` can answer `SpaceDeleted`. Its
+other host rows are swept, except the `sE` rows of registrations still owed a `spaceDeleted` notice, and a
 space created again at the same URI starts fresh and drops those rows. `deleteSpace`
 and `deleteAccount` drop the `sb/` and `sc/` refs with the records.
 
