@@ -2,6 +2,9 @@
 // the few /xrpc methods they need from memory (writes stick until the dev server restarts).
 // VLPDS_MOCK_LEVEL=1 shows the sign-in providers page below feature level 2.
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 const env = (k) => (typeof process !== 'undefined' ? process.env[k] : undefined)
 const now = Date.now()
 const iso = (ago) => new Date(now - ago).toISOString()
@@ -85,6 +88,18 @@ const nodeList = () => [
   { node: 'node-c', ok: !low && providers.length !== 2, error: 'timed out' },
 ]
 
+// listSessions for stream.place, TOKIMEKI Poll, Blacksky and Graysky (testdata/oauth), rows as
+// the server computes them: regenerate with VLPDS_ROLLUP_DUMP=<dir> cargo test --lib
+// oauth::rollup::tests::dump_rows and copy <dir>/oauth-sessions.json here.
+const days = 86400_000
+const oauthSessions = JSON.parse(readFileSync(new URL('./oauth-sessions.json', import.meta.url), 'utf8')).map((x, i) => ({
+  id: `ses-mock${i}`,
+  ...x,
+  createdAt: iso([13, 3, 54, 30][i] * days),
+  updatedAt: iso([0.1, 3, 1, 6][i] * days),
+  accessExpiresAt: iso(-days / 24),
+}))
+
 let mockTicket = 1
 const fail = (status, error, message) => ({ status, body: { error, message } })
 
@@ -160,7 +175,7 @@ function handle(nsid, body, method) {
     case 'com.atproto.server.listAppPasswords':
       return { body: { passwords: [] } }
     case 'vlpds.oauth.listSessions':
-      return { body: { sessions: [] } }
+      return { body: { sessions: oauthSessions } }
     case 'vlpds.server.getSignInSecurity':
       return { body: { oauthOnly: false, blockAppPasswords: false, alerts: { password: true, appPassword: true }, alertsPerDay: 5, secondFactor: false, trustDays: 30, trustedBrowsers: [], recentSignIns: [] } }
     default:
@@ -168,12 +183,31 @@ function handle(nsid, body, method) {
   }
 }
 
+// VLPDS_MOCK_BRAND=<dir>: the branding `VLPDS_BRAND_DUMP=<dir> cargo test --lib brand::tests::dump_brand`
+// wrote, in the head (as the server renders it) and at /brand/*.
+const brandDir = env('VLPDS_MOCK_BRAND')
+const DEFAULT_ICON = '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />'
+
 export function vlpdsMock() {
   return {
     name: 'vlpds-mock',
     apply: 'serve',
+    transformIndexHtml(html, ctx) {
+      if (env('VLPDS_MOCK') !== '1' || !brandDir) return html
+      const path = ctx.originalUrl ?? ctx.path ?? '/'
+      if (path.startsWith('/admin') || path.startsWith('/docs')) return html
+      return html.replace(DEFAULT_ICON, readFileSync(join(brandDir, 'brand', 'head.txt'), 'utf8'))
+    },
     configureServer(server) {
       if (env('VLPDS_MOCK') !== '1') return
+      if (brandDir)
+        server.middlewares.use('/brand', (req, res) => {
+          const name = (req.url ?? '').split('?')[0].replace(/^\//, '')
+          const types = { logo: 'image/png', favicon: 'image/png', 'brand.css': 'text/css' }
+          if (!types[name]) return ((res.statusCode = 404), res.end())
+          res.setHeader('content-type', types[name])
+          res.end(readFileSync(join(brandDir, 'brand', name)))
+        })
       server.middlewares.use('/xrpc', (req, res) => {
         const nsid = (req.url ?? '').split('?')[0].replace(/^\//, '')
         let raw = ''

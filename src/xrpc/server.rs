@@ -684,7 +684,9 @@ pub(super) async fn mail_permit(
 
 pub(super) fn deliver(app: &App, permit: MailPermit, to: &str, email: crate::mail::Email<'_>) {
     debug_assert_eq!(permit.0, email.purpose());
-    let r = email.render(&app.config.email_branding, &app.public_url);
+    let c = &app.config;
+    let branding = c.brand.email(c.email_logo_url.clone(), c.email_disable_confirmation_link, &app.public_url);
+    let r = email.render(&branding, &app.public_url);
     let mail = Mail {
         to: to.to_string(),
         subject: r.subject,
@@ -1356,10 +1358,10 @@ pub(super) async fn session_info(app: &App, a: &Account, include_email: bool) ->
 async fn describe_server(State(app): AppState) -> Json<J> {
     // As the reference: unset links and contact fields are omitted.
     let mut links = serde_json::Map::new();
-    if let Some(u) = &app.config.privacy_policy_url {
+    if let Some(u) = &app.config.brand.privacy_policy_url {
         links.insert("privacyPolicy".into(), json!(u));
     }
-    if let Some(u) = &app.config.terms_of_service_url {
+    if let Some(u) = &app.config.brand.terms_of_service_url {
         links.insert("termsOfService".into(), json!(u));
     }
     let mut contact = serde_json::Map::new();
@@ -2459,6 +2461,7 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
 
 const WRONG_PDS: &str = "DID document atproto_pds service endpoint does not match PDS public url";
 const WRONG_SIGNING_KEY: &str = "DID document verification method does not match expected signing key";
+const WRONG_KEM_KEY: &str = "DID document verification method does not match expected KEM key";
 
 /// The reference's assertValidDidDocumentForService. With PLC registration
 /// on, a did:plc is checked against the directory, which must also keep the
@@ -2481,6 +2484,12 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
         if data["verificationMethods"]["atproto"] != format!("did:key:{}", a.signing_pubkey).as_str() {
             return Err(invalid_request(WRONG_SIGNING_KEY));
         }
+        // the KEM key the account holds here must be the published one (Nov 24 alpha)
+        if let Some(kem) = &a.kem_pubkey {
+            if data["verificationMethods"][crate::plc::KEM_METHOD] != format!("did:key:{kem}").as_str() {
+                return Err(invalid_request(WRONG_KEM_KEY));
+            }
+        }
         return Ok(());
     }
     if !has_external_did(a) {
@@ -2494,6 +2503,14 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
     }
     if vlatproto::did_resolver::signing_key_multibase(&doc).as_deref() != Some(a.signing_pubkey.as_str()) {
         return Err(invalid_request(WRONG_SIGNING_KEY));
+    }
+    if let Some(kem) = &a.kem_pubkey {
+        use vlatproto::did_resolver::{has_method, method_multibase};
+        // a did:web's owner publishes its key: one that lists none yet is let through
+        let unlisted_web = a.did.starts_with("did:web:") && !has_method(&doc, crate::plc::KEM_METHOD);
+        if !unlisted_web && method_multibase(&doc, crate::plc::KEM_METHOD).as_deref() != Some(kem.as_str()) {
+            return Err(invalid_request(WRONG_KEM_KEY));
+        }
     }
     Ok(())
 }

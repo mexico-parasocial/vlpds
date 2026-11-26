@@ -10,7 +10,8 @@ use crate::oauth::scopes::{is_atproto_did, is_atproto_oauth_scope};
 use crate::oauth::store::{self, AuthParams, Device, DeviceAccount, RequestData, Session};
 use crate::oauth::util::{self as ou, now_secs};
 use crate::oauth::{
-    lexicon, ui, OAuthError, ACCESS_TOKEN_TTL, AUTHENTICATION_MAX_AGE, AUTHORIZATION_INACTIVITY_TIMEOUT, PAR_EXPIRES_IN,
+    lexicon, rollup, ui, OAuthError, ACCESS_TOKEN_TTL, AUTHENTICATION_MAX_AGE, AUTHORIZATION_INACTIVITY_TIMEOUT,
+    PAR_EXPIRES_IN,
 };
 use axum::http::request::Parts;
 use axum::http::{HeaderName, HeaderValue};
@@ -565,7 +566,9 @@ async fn validate_authorization_request(
         }
     }
     // every include: scope must resolve to a permission set
-    lexicon::permission_sets_for_scope(app, &scope).await.map_err(|e| OAuthError::invalid_scope(&e))?;
+    for (_, set) in lexicon::permission_sets_for_scope(app, &scope).await {
+        set.map_err(|e| OAuthError::invalid_scope(&e))?;
+    }
     Ok(AuthParams {
         client_id: client.id.clone(),
         response_type,
@@ -724,7 +727,7 @@ fn html(app: &App, status: StatusCode, body: String, form_action: &[String], set
     let mut r = (status, body).into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp(form_action)).unwrap());
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp(&app.config.brand, form_action)).unwrap());
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -737,7 +740,7 @@ fn html(app: &App, status: StatusCode, body: String, form_action: &[String], set
 }
 
 pub(super) fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response {
-    html(app, status, ui::error(title, msg), &[], None)
+    html(app, status, ui::error(&app.config.brand, title, msg), &[], None)
 }
 
 fn server_error_page(app: &App, title: &str, msg: &str) -> Response {
@@ -760,9 +763,18 @@ fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, Strin
     pairs.push(("iss".into(), issuer(app)));
     if params.response_mode.as_deref() == Some("form_post") {
         let form_action: Vec<String> = redirect_source(&params.redirect_uri).into_iter().collect();
-        let mut r = html(app, StatusCode::OK, ui::form_post(&params.redirect_uri, &pairs), &form_action, None);
+        let mut r = html(
+            app,
+            StatusCode::OK,
+            ui::form_post(&app.config.brand, &params.redirect_uri, &pairs),
+            &form_action,
+            None,
+        );
         let h = r.headers_mut();
-        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp_form_post(&form_action)).unwrap());
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_str(&ui::csp_form_post(&app.config.brand, &form_action)).unwrap(),
+        );
         // out of the back/forward cache, so going "back" never re-posts the
         // response (as the reference does)
         h.append(header::SET_COOKIE, HeaderValue::from_static("bfCacheBypass=1; Path=/; Max-Age=1; SameSite=Lax"));
@@ -942,6 +954,7 @@ fn login_page(app: &App, flow: &Flow, identifier: &str, error: Option<&str>, sta
     let name = server_name(app);
     let pk = passwordless_ui(app, &passkey_binding(&flow.device.id, &flow.id, None));
     let body = ui::login(
+        &app.config.brand,
         Some(&flow.ctx(&csrf, &name)),
         &ui::LoginForm {
             action: "/oauth/authorize/sign-in",
@@ -955,7 +968,7 @@ fn login_page(app: &App, flow: &Flow, identifier: &str, error: Option<&str>, sta
         "",
     );
     let mut r = flow.page(app, body);
-    set_passkey_csp(&mut r, &flow.form_action());
+    set_passkey_csp(app, &mut r, &flow.form_action());
     *r.status_mut() = status;
     r
 }
@@ -983,9 +996,9 @@ async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
     if !required {
         return approve_without_consent(app, flow, did).await;
     }
-    let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
+    let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await;
     let names = match app.config.spaces {
-        true => Some(space_names(app, &flow.req.params.scope, &sets, true).await),
+        true => Some(space_names(app, &flow.req.params.scope, &lexicon::resolved(&sets), true).await),
         false => None,
     };
     // what the screen shows is exactly what the token will carry
@@ -996,10 +1009,16 @@ async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
             return server_error_page(app, "Authorization failed", &e.description);
         }
     }
-    let rows = ui::describe_scopes(&flow.req.params.scope, &sets, names.as_ref());
+    let rows = rollup::rows(&rollup::Request {
+        scope: &flow.req.params.scope,
+        sets: &sets,
+        client_id: &flow.client.id,
+        loopback: flow.client.loopback,
+        names: names.as_ref(),
+    });
     let csrf = flow.csrf(app);
     let name = server_name(app);
-    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &flow.req.params.scope, &rows);
+    let body = ui::consent(&app.config.brand, &flow.ctx(&csrf, &name), did, &acct.handle, &rows);
     flow.page(app, body)
 }
 
@@ -1007,14 +1026,14 @@ async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
 /// its bare writing grants take the collections their types declare now.
 async fn approve_without_consent(app: &App, mut flow: Flow, did: &str) -> Response {
     if app.config.spaces {
-        let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
-        let names = space_names(app, &flow.req.params.scope, &sets, false).await;
+        let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await;
+        let names = space_names(app, &flow.req.params.scope, &lexicon::resolved(&sets), false).await;
         flow.req.space_collections = (!names.decls.is_empty()).then(|| space_collections(&names));
     }
     issue_code(app, flow, did).await
 }
 
-fn space_collections(n: &ui::SpaceNames) -> std::collections::BTreeMap<String, Vec<String>> {
+fn space_collections(n: &rollup::SpaceNames) -> std::collections::BTreeMap<String, Vec<String>> {
     n.decls.iter().map(|(t, d)| (t.clone(), d.collections.clone())).collect()
 }
 
@@ -1029,7 +1048,7 @@ async fn space_names(
     scope: &str,
     sets: &[(crate::oauth::scopes::IncludeScope, J)],
     screen: bool,
-) -> ui::SpaceNames {
+) -> rollup::SpaceNames {
     use crate::oauth::scopes::Permission;
     const MAX_LOOKUPS: usize = 16;
     let mut perms: Vec<Permission> = scope.split(' ').filter_map(Permission::parse).collect();
@@ -1056,7 +1075,10 @@ async fn space_names(
         h.map(|h| (did, h))
     }));
     let (decls, handles) = tokio::join!(decls, handles);
-    ui::SpaceNames { decls: decls.into_iter().flatten().collect(), handles: handles.into_iter().flatten().collect() }
+    rollup::SpaceNames {
+        decls: decls.into_iter().flatten().collect(),
+        handles: handles.into_iter().flatten().collect(),
+    }
 }
 
 /// `RequestManager.setAuthorized`.
@@ -1165,7 +1187,7 @@ async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<Has
 fn chooser_page(app: &App, flow: &Flow, accounts: &[(String, String)]) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
-    flow.page(app, ui::chooser(&flow.ctx(&csrf, &name), accounts))
+    flow.page(app, ui::chooser(&app.config.brand, &flow.ctx(&csrf, &name), accounts))
 }
 
 fn form_fields(body: &[u8]) -> HashMap<String, String> {
@@ -1699,6 +1721,7 @@ fn code_page(app: &App, flow: &Flow, p: &Pending, error: Option<LoginError>) -> 
     });
     let pk = passkey_ui(app, &passkey_binding(&flow.device.id, &flow.id, Some(&p.did)), &p.passkeys);
     let body = ui::login(
+        &app.config.brand,
         Some(&flow.ctx(&csrf, &name)),
         &ui::LoginForm {
             action: "/oauth/authorize/sign-in",
@@ -1712,7 +1735,7 @@ fn code_page(app: &App, flow: &Flow, p: &Pending, error: Option<LoginError>) -> 
         "",
     );
     let mut r = flow.page(app, body);
-    set_passkey_csp(&mut r, &flow.form_action());
+    set_passkey_csp(app, &mut r, &flow.form_action());
     if error.is_some() {
         *r.status_mut() = StatusCode::UNAUTHORIZED;
     }
@@ -1720,9 +1743,11 @@ fn code_page(app: &App, flow: &Flow, p: &Pending, error: Option<LoginError>) -> 
 }
 
 /// The sign-in pages run one fixed script, allowed by its hash.
-fn set_passkey_csp(r: &mut Response, form_action: &[String]) {
-    r.headers_mut()
-        .insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp_passkey(form_action)).unwrap());
+fn set_passkey_csp(app: &App, r: &mut Response, form_action: &[String]) {
+    r.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_str(&ui::csp_passkey(&app.config.brand, form_action)).unwrap(),
+    );
 }
 
 async fn authorize_sign_in(
@@ -1776,6 +1801,7 @@ fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, st
     let domains = app.handle_domains.names();
     let domain = domains.iter().find(|d| **d == v.domain).unwrap_or(&domains[0]);
     let body = ui::signup(
+        &app.config.brand,
         &flow.ctx(&csrf, &name),
         &ui::SignupForm {
             handle: &v.handle,
@@ -1894,7 +1920,11 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
         return login_page(&app, &flow, "", Some("Please sign in again"), StatusCode::UNAUTHORIZED);
     }
     let mut flow = flow;
-    match granted_scope(&flow.req.params.scope, consent_scopes(&body).as_deref()) {
+    let granted = match consent_rows(&body) {
+        Some(ticked) => rollup::granted_scope(&flow.req.params.scope, &ticked),
+        None => Some(flow.req.params.scope.clone()),
+    };
+    match granted {
         Some(scope) => {
             let narrowed =
                 scope.split(' ').count() < flow.req.params.scope.split(' ').filter(|s| !s.is_empty()).count();
@@ -1910,36 +1940,19 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
     issue_code(&app, flow, &did).await
 }
 
-/// Every `scope` field: one per ticked checkbox, or a space-separated list.
-/// None when the form has none (grant as requested).
-fn consent_scopes(body: &[u8]) -> Option<Vec<String>> {
+/// The grant keys of the ticked rows (each `row` field holds a row's keys,
+/// space-separated). None when the form has none: grant as requested. The
+/// reference's `setAuthorized` scope override, by row: the scopes come from
+/// the stored request, so a post can only remove them, never add one, and
+/// one missing the identity row is refused.
+fn consent_rows(body: &[u8]) -> Option<Vec<String>> {
     let mut out: Option<Vec<String>> = None;
     for (k, v) in ou::parse_form(std::str::from_utf8(body).unwrap_or("")) {
-        if k == "scope" {
+        if k == "row" {
             out.get_or_insert_with(Vec::new).extend(v.split(' ').filter(|s| !s.is_empty()).map(String::from));
         }
     }
     out
-}
-
-/// The reference's `setAuthorized` scope override: the form can only remove
-/// scopes, never add them. None if a required scope was removed, so a forged
-/// post can't get a token without one.
-fn granted_scope(requested: &str, ticked: Option<&[String]>) -> Option<String> {
-    let mut granted: Vec<&str> = requested
-        .split(' ')
-        .filter(|s| !s.is_empty())
-        .filter(|s| ticked.is_none_or(|t| t.iter().any(|x| x == s)))
-        .collect();
-    if !ui::REQUIRED_SCOPES.iter().all(|r| granted.contains(r)) {
-        return None;
-    }
-    // the spec: transition:chat.bsky "depends on and does not function
-    // without" transition:generic, so it goes when generic is refused
-    if requested.split(' ').any(|s| s == "transition:generic") && !granted.contains(&"transition:generic") {
-        granted.retain(|s| *s != "transition:chat.bsky");
-    }
-    Some(granted.join(" "))
 }
 
 async fn token(
@@ -2451,6 +2464,7 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
         };
         let handle = pending.as_ref().map(|p| p.handle.as_str()).or(hint.as_ref().map(|h| h.handle.as_str()));
         let body = ui::login(
+            &app.config.brand,
             None,
             &ui::LoginForm {
                 action: "/oauth/account/sign-in",
@@ -2464,7 +2478,7 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
             &csrf,
         );
         let mut r = html(&app, StatusCode::OK, body, &[], cookie);
-        set_passkey_csp(&mut r, &[]);
+        set_passkey_csp(&app, &mut r, &[]);
         return r;
     }
     let mut rows = Vec::new();
@@ -2485,7 +2499,13 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
         rows.push(ui::AccountRow { did, handle, sessions: list, methods });
     }
     let notice = q.get("notice").and_then(|c| AccountNotice::from_code(c)).map(|n| (n.message(), n.is_error()));
-    html(&app, StatusCode::OK, ui::account_page(&csrf, &rows, notice, hinted.as_deref()), &[], cookie)
+    html(
+        &app,
+        StatusCode::OK,
+        ui::account_page(&app.config.brand, &csrf, &rows, notice, hinted.as_deref()),
+        &[],
+        cookie,
+    )
 }
 
 /// `/oauth/account?login_hint=`: the DID of an active account here, shown by
@@ -2554,6 +2574,7 @@ pub(super) async fn federated_signup_page(
     let render = |device_id: &str, ctx: Option<&ui::Ctx>| {
         let csrf = csrf_token(app, device_id, &format!("fedsignup\0{ticket}"));
         ui::federated_signup(
+            &app.config.brand,
             ctx,
             &ui::FederatedSignup {
                 ticket,
@@ -3004,19 +3025,30 @@ async fn xrpc_list_sessions(State(app): AppState, Auth(creds): Auth) -> XResult<
     let did = full_session(&creds)?;
     let mut sessions = store::list_sessions(&app, &did).await.map_err(|e| XrpcError::internal(e.description))?;
     sessions.sort_by_key(|s| -s.updated_at);
-    let out: Vec<J> = sessions
-        .iter()
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "clientId": s.client_id,
-                "scope": s.scope,
-                "createdAt": rfc3339(s.created_at),
-                "updatedAt": rfc3339(s.updated_at),
-                "accessExpiresAt": rfc3339(s.expires_at),
-            })
-        })
-        .collect();
+    let mut out: Vec<J> = Vec::with_capacity(sessions.len());
+    for s in &sessions {
+        // what was granted, from the copies of its sets already held: a
+        // list of apps never waits on a publisher
+        let sets = lexicon::permission_sets_cached_only(&app, &s.scope).await;
+        let loopback = rollup::is_loopback(&s.client_id);
+        let rows = rollup::rows(&rollup::Request {
+            scope: &s.scope,
+            sets: &sets,
+            client_id: &s.client_id,
+            loopback,
+            names: app.config.spaces.then_some(&rollup::SpaceNames::default()),
+        });
+        out.push(json!({
+            "id": s.id,
+            "clientId": s.client_id,
+            "name": rollup::client_label(&s.client_id, loopback),
+            "scope": s.scope,
+            "rows": rows,
+            "createdAt": rfc3339(s.created_at),
+            "updatedAt": rfc3339(s.updated_at),
+            "accessExpiresAt": rfc3339(s.expires_at),
+        }));
+    }
     Ok(Json(json!({"sessions": out})))
 }
 
